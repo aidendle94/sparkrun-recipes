@@ -1,0 +1,3 @@
+model: deepseek-ai/DeepSeek-V4.1-Flash
+engine: vllm
+status: pending-port

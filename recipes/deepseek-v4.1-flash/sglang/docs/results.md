@@ -1,0 +1,164 @@
+# Results
+
+Measurements of this stack on the author's four DGX Sparks, taken on 2026-09-17, and the facts of the production
+boots. Every number says what it is (one run, a range over runs, or a range over boots). Nothing here is a projection.
+
+Units: tok/s throughout; GiB (2^30 bytes) for memory, which is how `free -g` and SGLang's memory log count;
+GB (10^9 bytes) for files. "M tokens" is millions of KV-cache tokens.
+
+## Configuration measured
+
+| item | value |
+|---|---|
+| nodes | 4 × DGX Spark (GB10, 128 GB unified memory, arm64), one container per node |
+| fabric | switched RoCE, two ConnectX-7 functions per node; NCCL over RoCE v2, buffers trimmed (1 MiB, no LL128, 8 channels) |
+| image | this repository's Dockerfile on `lmsysorg/sglang:dev-dsv41` (the digest in [upstream.md](upstream.md)) |
+| parallelism | TP4 / EP4, the launcher's `--tp 4 --ep-size 4 --nnodes 4` |
+| launcher defaults | chunked prefill 2,048 tokens, DSpark block 5, memory fraction 0.80, 8 running requests, 524,288 context, KV pool auto-sized, MXFP8 backend `b12x`, RDMA collectives on (all-reduce ≤ 1 MB, all-gather shard ≤ 16 MB), Engram store with 64 threads and next-chunk prefetch on |
+| prompts | `bench/needle.py` (unique random-word filler, salted per run, one needle at depth 0.5; prefill tok/s = prompt tokens / time to first token), `bench/prefill_repetitive.py` (one word repeated, unique tag, same needle), a three-regime single-stream decode probe (counting / code / prose; `bench/decode_bench.py` is its current form) and a prose-story request at 1–4 concurrent streams |
+| sampling | greedy, thinking off per request, 400 completion tokens for the decode regimes |
+| baseline | the author's previous vLLM deployment of the same checkpoint on the same nodes, same prompts, measured the same day; its prefill figures are ranges over its best boots |
+
+The needle was found in every run listed here and the counting probe was exact.
+
+## Prefill
+
+| input | launcher defaults (chunk 2,048, persistent pool, prefetch) | chunk 1,024, per-call threads, no prefetch | previous vLLM deployment |
+|---|---|---|---|
+| unique random words, 32K, needle at 0.5 | **3,068** (10.7 s) | 2,245 (14.5 s) | 2,094–2,362 (14.2–15.5 s) |
+| unique random words, 128K | **2,580** (51.1 s) | 2,077 (63.3 s) | 2,152 (60.5 s) |
+| repetitive filler, 32K | **4,063** | 3,404 | 2,652 |
+| repetitive filler, 128K | **3,435** | 2,868 | 2,550 |
+
+One run per cell, one boot per column, both columns with RDMA collectives on. Seconds are time to first token.
+The gain from the left column over the middle one is +37% at 32K and +24% at 128K on unique text; the Engram gather
+sits on the critical path of every chunk, and the next section shows where the time went.
+
+## Decode
+
+| regime | launcher defaults | chunk 1,024, per-call threads | previous vLLM deployment |
+|---|---|---|---|
+| counting, one stream | 94.4 | 94.5 | 93.0 |
+| code, one stream | 67.8 | 67.9 | 66.6 |
+| prose, one stream | 32.4 | 32.6 | 31.3 |
+| prose story, 1 / 2 / 3 / 4 streams, aggregate | 30.0 / 49.6 / 62.2 / 72.3 | 30.0 / 47.0 / 58.9 / 74.3 | 30.0 / – / – / 69.6 |
+
+One run of the probe per cell. Decode is unchanged between the two configurations
+within noise: a decode step gathers of the order of a hundred owned Engram rows per layer per rank, and after the
+RDMA collectives went in the step is dominated by the model itself. Both configurations run DSpark block 5, like the
+vLLM baseline.
+
+## Engram gather cost
+
+Per layer, rank 0, from the row store's own timer (cumulative gather nanoseconds, read every stats period).
+Ranges are the spread seen over one boot each.
+
+| phase | per-call thread spawn, chunk 1,024 | persistent pool + next-chunk prefetch, chunk 2,048 |
+|---|---|---|
+| prefill, per call (one chunk) | 10.9–15.9 ms | 7.7–9.9 ms |
+| prefill, per prompt token | 10.7–15.5 µs | 3.8–4.8 µs |
+| decode step, per call | 1.17–1.38 ms | 0.86–1.09 ms |
+
+Per prompt token the gather became 2.5–3× cheaper: the pool removes 64 thread spawns per call, the prefetch has the
+next chunk's rows in the page cache when the host-function node runs (it still copies them; only the page faults are
+gone), and the larger chunk halves the number of calls.
+
+## NCCL versus RDMA collectives
+
+Same configuration otherwise (chunk 1,024, per-call threads, no prefetch), two consecutive boots.
+
+| bench | NCCL | RDMA (b12x one-shot runtime) |
+|---|---|---|
+| decode counting / code / prose, one stream | 86.2 / 59.5 / 30.9 | 94.5 / 67.9 / 32.6 |
+| prose story, 1 / 2 / 3 / 4 streams, aggregate | 29.9 / 43.2 / 51.7 / 66.0 | 30.0 / 47.0 / 58.9 / 74.3 |
+| prefill 32K / 128K unique, time to first token | 14.0 s / 63.1 s | 14.5 s / 63.3 s |
+| prefill 32K / 128K repetitive | 3,329 / 2,770 | 3,404 / 2,868 |
+
+Single-stream decode +6–14%, four streams +13%, from moving the roughly eighty tensor-parallel all-reduces and the
+logits all-gather of each step off NCCL. Prefill is unchanged by construction: its 64 MB all-reduces stay on NCCL.
+The runtime's log line on this fabric reads `world=4 hcas=<two devices> gid_index=3 max_size=1048576`.
+
+## Memory
+
+| what | value |
+|---|---|
+| free for the KV pool after weights, per rank, memory fraction 0.80 | 7.2 GiB and 9.0 GiB on the two production boots (SGLang's `DSV4 memory calculation` line; its "GB" are GiB) |
+| KV pool, auto-sized | 4.26 M and 5.43 M tokens on the two production boots (it depends on the page cache at boot); 4.4–5.8 M over the earlier boots |
+| KV pool, previous vLLM deployment | 3.42 M tokens (pinned) |
+| host memory floor during a 128K prefill, every node, chunk 2,048 | 11–14 GiB free (`free -g`, sampled every 15 s) |
+| the same with chunk 1,024 | 16–20 GiB free |
+| host memory at idle, production, per node | 19–21 GiB free |
+
+The OOM guard on the author's nodes fires at 2.4 GiB free; larger chunks than 2,048 are untested.
+
+## Two Engram designs, measured against each other
+
+Both serve the rows from the same node-local copies; they differ in *when* the rows move. `SPARK_ENGRAM_MODE` selects
+one (launcher knob `ENGRAM_MODE`).
+
+| | host-node (default, `engram_store` + `engram_rows.c`) | staged (`engram_staged`, ported from the author's vLLM implementation) |
+|---|---|---|
+| mechanism | a host-function node inside the CUDA graph gathers each layer's rows through the C store while the GPU waits | a hook before every forward hashes the batch on the GPU, syncs once, gathers both layers' rows with a Python thread pool and stages them; the model reads them by position |
+| prefill 32K / 128K, unique text | **3,068 / 2,580 tok/s** | 2,639 / 2,071 tok/s |
+| prefill 32K / 128K, repetitive filler | 4,063 / 3,435 tok/s | 4,157 / 3,478 tok/s |
+| decode counting / code / prose (single stream, `bench/decode_bench.py`, best of 2) | 101 / 82 / 35 tok/s | **110 / 89 / 38 tok/s** |
+| dependencies | gcc at image build (the C store) | none beyond the base image |
+
+Same nodes, same day (2026-09-21), one boot each. The staged design loses the CPU/GPU overlap on prefill: the sync
+before each 2,048-token chunk waits for the previous chunk, then the gather and the launch of the next chunk's kernels
+run with the GPU idle. On decode the graph replays cost little to launch and the pre-step staging is cheaper than two
+in-graph host nodes. The host-node figures are from the production boot of the previous C pool (a thread per call);
+the persistent pool cuts the in-graph stall from ~1.3 ms to under 0.1 ms per layer per step.
+
+## production-1.1 validation boot (2026-09-21 08:40–08:53)
+
+The image published as `production-1.1` (this tree: clean-room hooks, the persistent-pool C store at ABI 2, both Engram
+modes) booted on the test port with the launcher defaults; production ran the previous image meanwhile.
+
+| | production-1.1 | previous boots of the host-node design |
+|---|---|---|
+| boot to healthy | 563 s | 582–604 s |
+| KV pool | 6,604,544 tokens (10.9 GiB free per rank after weights) | 4.2–5.4 M |
+| count to 20 | exact | exact |
+| prefill 32K unique text | **9.8 s · 3,308 tok/s** | 10.7 s · 3,068 |
+| prefill 128K unique text | 59.3 s · 2,208 tok/s | 51.1 s · 2,580 |
+| prefill 32K / 128K repetitive filler | 3,470 / 3,380 tok/s | 4,063 / 3,435 |
+| decode counting / code / prose (`bench/decode_bench.py`) | **107 / 87 / 36 tok/s** | 101 / 82 / 35 (previous pool, same day) |
+| Engram gather, per layer per call | prefill 7.2–13.4 ms; decode 0.74–0.79 ms | prefill 7.7–9.9 ms; decode 0.86–1.09 ms |
+| host memory floor during the 128K prefill | 13–16 GB free per node | 11–14 GB |
+
+Reading: decode gained 5–6 % from the pool (the in-graph stall per step is shorter). The 32K needle is the best on this
+fleet, the 128K needle and the 32K filler are 14–15 % below the best previous boot while the 128K filler is level; the
+cold-row gather of the fixed-stripe pool is slower in the first minute of a long prefill (13 ms per call against 10)
+and the rest is boot-to-boot swing (GB10 clock state), which this stack shows at ±10–15 % on prefill. A dynamic
+chunk queue in the pool is the next thing to try for cold rows.
+
+## Bring-up
+
+Seven boots of this stack, in order. The first three were fix-one-thing boots and no benchmark numbers were kept for
+them; from boot 4 on the numbers are from the run logs.
+
+| boot | configuration | what broke | what fixed it |
+|---|---|---|---|
+| 1 | first overlay, stock SM120 paths | model construction failed with "Only dense CPU tensors can be pinned": the pinned staging buffers were created under the CUDA default-device context the model is built in | the Engram hook allocates its host staging with an explicit CPU device; the zero-size parameters stay on the model device |
+| 2 | + pinned staging on the CPU | CUDA-graph capture failed with a `schedule_meta` mismatch: V4.1's ratio-1/2 indexer sources call the DeepGEMM kernel, which needs a plan SGLang does not build on SM120 | `overlay/indexer_schedule.py` builds the plan for those two ratios |
+| 3 | + indexer plan | the server's warm-up prefill was rejected by the SM12x sparse-MLA kernel: the ratio-2 KV source comes in 128-token pages (`extra_page_block_size=128`) | `overlay/sm120_prefill_pages.py` re-pages that source to 64-token pages. From this boot on, FlashInfer's `b12x` MXFP8 kernel logged one warning for the K = 576 projections and `overlay/mxfp8_kernel.py` kept those shapes on the stock kernel, as designed |
+| 4 | chunk 2,048, NCCL, per-call gather threads | 32K prefill 2,774 tok/s (11.8 s); the 128K prefill took every node to zero free within a minute, the OOM guard killed two ranks and the other two hung in the TP all-reduce | `overlay/prefill_flush.py` returns the allocator cache after long chunks; chunk back to 1,024 for the next boot |
+| 5 | chunk 1,024, NCCL, per-call threads; first working boot | nothing; 604 s to healthy, 32K prefill 2,333 (14.0 s), 128K 2,087 (63.1 s), decode 86.2 / 59.5 / 30.9, host floor 16–20 GiB. Decode below the vLLM baseline, the step dominated by NCCL all-reduces | `overlay/roce_collectives.py`: the TP group's small collectives as one-shot RDMA writes |
+| 6 | + RDMA collectives | nothing; 584 s to healthy, decode 94.5 / 67.9 / 32.6. The now-instrumented Engram gather cost 11 ms per layer per 1,024-token chunk and 1.3 ms per decode step, spent largely on spawning 64 threads per call and on page faults | a persistent worker pool in `engram_rows.c` and `overlay/engram_prefetch.py`; chunk 2,048 again, now safe |
+| 7 | + pool, prefetch, chunk 2,048 = the launcher defaults | nothing; 583 s to healthy, prefill 3,068 / 2,580, gather 3.8–4.8 µs per prompt token, host floor 11–14 GiB | shipped as production |
+
+## Production boots
+
+`launch/production.sh` on port 8210 with the published image, 2026-09-17 evening.
+
+| fact | first boot | second boot |
+|---|---|---|
+| time to healthy | 582 s | 582 s |
+| KV pool | 4,263,680 tokens | 5,426,688 tokens |
+| thinking | off by default | on by default (`--default-chat-template-kwargs '{"thinking":true}'`); `"thinking": false` per request still overrides |
+| checks | aliases listed on `/v1/models`, counting exact, an image described, a tool call with its round trip, 32K salted needle found in 9.9 s = 3,318 tok/s | the same checks |
+| host memory at idle | 19–21 GiB free per node | 19–21 GiB free per node |
+
+The KV pool differs between the two boots because SGLang sizes it from the memory it finds free at boot, which the
+page cache affects; `KVTOK` (`--max-total-tokens`) pins it.

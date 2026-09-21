@@ -1,0 +1,24 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  static:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: shell syntax
+        run: |
+          set -e; for f in $(git ls-files '*.sh'); do bash -n "$f"; done
+      - name: python syntax
+        run: |
+          set -e; python3 -m py_compile $(git ls-files '*.py')
+      - name: no site-specific values or secrets in the tree
+        run: |
+          set -e
+          ! git ls-files -z | xargs -0 grep -IlE 'hf_[A-Za-z0-9]{25,}|sk-or-v1-|gh[ops]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{12}|BEGIN (RSA|OPENSSH|EC) PRIVATE|10\.0\.[01]\.[0-9]+|192\.168\.[0-9]+\.[0-9]+|/home/[a-z]+/' -- . ':!fleet/README.md' || { echo "private material found"; exit 1; }
+          ! git ls-files | grep -E '(^|/)launch/fleet\.env$'
+      - name: C row store test (DeepSeek-V4.1 SGLang recipe)
+        run: |
+          set -e; cd recipes/deepseek-v4.1-flash/sglang
+          pip install --quiet numpy
+          gcc -O2 -std=gnu11 -shared -fPIC -pthread -Wall -Wextra -o overlay/libengram_rows.so overlay/engram_rows.c
+          python3 tests/test_engram_rows.py

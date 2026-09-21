@@ -1,0 +1,17 @@
+# Machine-readable summary of this recipe (the blog's recipe cards and performance panels can be generated from it).
+model: deepseek-ai/DeepSeek-V4.1-Flash
+engine: sglang
+engine_base: lmsysorg/sglang@sha256:4a5d132a06a77c8331e15845f2e925adc788b00105097ad55409afa3f4fa4860   # dev-dsv41, 2026-09-11
+image: aidendle94/sparkrun-sglang-dsv41-gb10:production-1.1
+status: production            # production | validated | experimental | archived
+nodes: 4 x NVIDIA DGX Spark (GB10, 128 GB), switched RoCE fabric, TP4/EP4
+context_length: 524288
+measured: 2026-09-21
+numbers:
+  prefill_tok_s: {32k_unique: 3308, 128k_unique: 2208, 32k_filler: 3470, 128k_filler: 3380}
+  decode_tok_s:  {counting: 107, code: 87, prose: 36}      # single stream, bench/decode_bench.py, best of 2
+  kv_pool_tokens: 6604544                                  # auto-sized at memory fraction 0.80, varies per boot
+  boot_to_healthy_s: 508
+features: [images, tools, thinking, dspark, rdma_collectives, engram_from_nvme]
+blog: https://aidenle.dev/recipes/deepseek-v4-1-flash-sglang-4x-dgx-spark
+license: MIT

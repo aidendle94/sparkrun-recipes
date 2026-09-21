@@ -1,0 +1,8 @@
+**/launch/fleet.env
+**/__pycache__/
+*.pyc
+*.log
+*.bak
+*.bak-*
+**/overlay/libengram_rows.so
+**/bench/out/

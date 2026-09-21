@@ -1,0 +1,3 @@
+model: zai-org/GLM-5.3-Flash
+engine: vllm
+status: pending-port

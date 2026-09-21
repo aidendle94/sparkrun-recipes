@@ -1,0 +1,5 @@
+sparkrun-recipes — Copyright (c) 2026 Aiden Le. MIT License (see LICENSE).
+
+Each recipe directory carries its own NOTICE listing the third-party material it includes or adapts;
+license texts referenced by those notices are in licenses/. The shared benches in bench/ are covered by
+recipes/deepseek-v4.1-flash/sglang/NOTICE (tonyd2wild, MIT, for the request loops).

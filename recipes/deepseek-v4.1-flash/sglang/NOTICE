@@ -1,0 +1,37 @@
+DeepSeek-V4.1-Flash on 4x NVIDIA DGX Spark with SGLang
+Copyright (c) 2026 Aiden Le. Licensed under the MIT License (see LICENSE).
+
+This repository is an overlay on the unmodified SGLang image lmsysorg/sglang:dev-dsv41. The overlay code, the
+launcher, the watchdog, the decode bench, the row-partition tool and the documentation were written for this
+repository; the third-party material below is included or adapted under its own licence.
+
+Redistributed unmodified (vendor/, and baked into the published image at /opt/dsv41-spark/vendor):
+  - b12x 1.3.0, the PyPI wheel, and a source snapshot of github.com/local-inference-lab/b12x at
+    b58f34eaf978277621efced6678e6713fd7122e4. Apache License 2.0 (LICENSE in the archive). Both archives also hold
+    two files under the BSD-3-Clause licence, kept with their notices: b12x/_lib/dense_gemm.py (NVIDIA CORPORATION &
+    AFFILIATES) and b12x/attention/_shared/contiguous/forward.py (Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay
+    Thakkar, Pradeep Ramani, Tri Dao). The snapshot is the byte-identical public archive; it keeps upstream's own
+    development notes, which we do not use.
+    Only b12x/comm/roce and b12x/comm/__init__.py are installed from the snapshot. Checksums in vendor/README.md.
+
+Adapted third-party code (modified for this repository; the original notices apply to those parts):
+  - overlay/roce_collectives.py: a port to SGLang's GroupCoordinator of the vLLM adapter b12x_roce_all_reduce.py by
+    Jason (@original-el8), github.com/local-inference-lab/vllm pull request 597. Copyright contributors to the vLLM
+    project. Apache License 2.0.
+  - overlay/sm120_prefill_pages.py: the page re-split follows SGLang's _split_kv_pages_to_64 and calls SGLang's Triton
+    kernels. overlay/served_aliases.py: the two route handlers mirror SGLang's http_server.py originals.
+    Copyright SGLang Team. Apache License 2.0.
+  - overlay/engram_staged.py: ported from the author's vLLM Engram-on-disk implementation, which builds on the
+    tonyd2wild/Kai MIT disk path of DeepSeek-V4.1-Flash-vLLM-DGX-Spark (Copyright (c) 2026 Tech2wild, MIT License) and on
+    vLLM's engram.py (Copyright contributors to the vLLM project, Apache License 2.0).
+  - tools/engram_local.py and bench/needle.py: from github.com/tonyd2wild/DeepSeek-V4.1-Flash-vLLM-DGX-Spark
+    (tools/engram_local.py, bench/v41needle.py) with small changes; bench/prefill_repetitive.py and bench/decode_bench.py
+    reuse that file's request body and streaming loop. Copyright (c) 2026 Tech2wild. MIT License.
+
+Not part of this repository: SGLang (Apache-2.0), FlashInfer (Apache-2.0), DeepGEMM (MIT), PyTorch (BSD-3-Clause),
+NVIDIA CUDA components (NVIDIA EULA). They come from the base image lmsysorg/sglang:dev-dsv41, which the published
+overlay image carries unmodified under its own licences. The model weights (deepseek-ai/DeepSeek-V4.1-Flash) are not
+included anywhere.
+
+The Apache License 2.0 text is in licenses/Apache-2.0.txt; the MIT text in LICENSE is also the permission notice for
+the Tech2wild-copyrighted parts named above.
