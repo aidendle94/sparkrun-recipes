@@ -58,6 +58,8 @@ ENV_ROWS = "SPARK_ENGRAM_ROWS"
 ENV_THREADS = "SPARK_ENGRAM_THREADS"
 ENV_MAX_IDS = "SPARK_ENGRAM_MAX_IDS"
 ENV_STATS = "SPARK_ENGRAM_STATS_SECONDS"
+ENV_EARLY_VERIFY = "SPARK_ENGRAM_EARLY_VERIFY"   # 1: on eager steps also gather inline and compare byte for byte
+ENV_EARLY = "SPARK_ENGRAM_EARLY"   # 1 (default): start each layer's host gather on a side stream as soon as the hash ids exist
 
 MANIFEST_NAME = "engram-local.json"
 INDEX_NAME = "model.safetensors.index.json"
@@ -470,9 +472,12 @@ class _RowStore:
         calls, owned, zeroed, ns = (a - b for a, b in zip(now, self._last_stats))
         self._last_stats = now
         mean_us = ns / calls / 1000.0 if calls else 0.0
+        early, fallback = _EARLY_COUNTS.pop(self.layer_id, (0, 0))
+        verified, differing = _VERIFY_COUNTS.pop(self.layer_id, (0, 0))
         logger.info(
-            "engram layer %d: %d lookups, %d owned rows, %d zeroed rows, %.0f us mean gather per lookup",
-            self.layer_id, calls, owned, zeroed, mean_us,
+            "engram layer %d: %d lookups, %d owned rows, %d zeroed rows, %.0f us mean gather per lookup, "
+            "%d staged early, %d early mismatches, %d verified byte-identical of %d",
+            self.layer_id, calls, owned, zeroed, mean_us, early, fallback, verified - differing, verified,
         )
 
 
@@ -647,6 +652,27 @@ def owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
             "raise it so that chunked-prefill tokens x hash columns fit"
         )
     w_dev, s_dev, positions = store.device_staging(indices.device)
+    pending = getattr(self, "_spark_pending", None)
+    if pending is not None:
+        self._spark_pending = None
+        key, done = pending
+        torch.cuda.current_stream(indices.device).wait_event(done)   # always join the side stream
+        e, f = _EARLY_COUNTS.get(store.layer_id, (0, 0))
+        if key == (indices.data_ptr(), tuple(indices.shape), tuple(indices.stride())):   # the very view that was staged
+            _EARLY_COUNTS[store.layer_id] = (e + 1, f)
+            out = self._empty(indices)
+            _SGL.engram_gather(w_dev.data_ptr(), s_dev.data_ptr(), positions[:n], out.view(-1, self.dim), self.dim,
+                               _SGL.block_size, row_lo=0, row_hi=store.capacity)
+            if os.environ.get(ENV_EARLY_VERIFY, "0") == "1" and not torch.cuda.is_current_stream_capturing():
+                staged = out.clone()
+                ref = owned_rows(self, indices)          # the inline path, same buffers, after the staged result was read
+                ok = torch.equal(staged, ref)
+                v, bad = _VERIFY_COUNTS.get(store.layer_id, (0, 0))
+                _VERIFY_COUNTS[store.layer_id] = (v + 1, bad + (0 if ok else 1))
+                if not ok:
+                    logger.error("engram layer %d: early-staged rows differ from the inline gather (%d ids)", store.layer_id, n)
+            return out
+        _EARLY_COUNTS[store.layer_id] = (e, f + 1)
     ids = indices.reshape(-1)
     if ids.dtype != torch.int64:
         ids = ids.to(torch.int64)
@@ -720,6 +746,93 @@ class _Borrowed:
         self.block_size = int(module.FP8_BLOCK_SIZE)
 
 
+# ----------------------------------------------------------------------------------------------------------
+# Early staging: the hash ids of a step exist before layer 0 runs, so each Engram layer's host gather can start
+# right away on a side stream and overlap the layers before it. Only the host part moves (ids to the host, the
+# C gather as a host-function node, rows back to the GPU); the dequantize, the TP all-reduce and the projection
+# stay on the main stream at the layer, so no collective ever runs on the side stream.
+# ----------------------------------------------------------------------------------------------------------
+
+_ENGRAM_LAYERS: list = []          # (layer_hash_index, EngramEmbedding) in construction order
+_EARLY_COUNTS: dict = {}           # layer id -> (staged early and used, staged but mismatched)
+_VERIFY_COUNTS: dict = {}          # layer id -> (byte comparisons, differences)
+_SIDE_STREAMS: dict = {}
+
+
+def _early_enabled() -> bool:
+    return os.environ.get(ENV_EARLY, "1") == "1"
+
+
+def _side_stream(device: torch.device) -> torch.cuda.Stream:
+    st = _SIDE_STREAMS.get(device)
+    if st is None:
+        st = torch.cuda.Stream(device=device)
+        _SIDE_STREAMS[device] = st
+    return st
+
+
+def _stage_early(emb, indices: torch.Tensor) -> None:
+    """Start ``emb``'s host gather for ``indices`` on the side stream; ``owned_rows`` finishes it at the layer."""
+    store = getattr(emb, "_spark_store", None)
+    n = indices.numel()
+    if store is None or emb.rows == 0 or n == 0 or n > store.capacity:
+        return
+    old = getattr(emb, "_spark_pending", None)
+    if old is not None:   # a newer step supersedes an unconsumed gather: join it, never hand it to a later lookup
+        torch.cuda.current_stream(indices.device).wait_event(old[1])
+        emb._spark_pending = None
+    if store.w_dev is None and torch.cuda.is_current_stream_capturing():
+        return   # device staging is created on the first eager call; never allocate it under capture
+    w_dev, s_dev, _ = store.device_staging(indices.device)   # made on the main stream, lives for the process
+    main = torch.cuda.current_stream(indices.device)
+    side = _side_stream(indices.device)
+    side.wait_stream(main)
+    with torch.cuda.stream(side):
+        ids = indices.reshape(-1)
+        if ids.dtype != torch.int64 or not ids.is_contiguous():
+            ids = ids.to(torch.int64).contiguous()
+        ids.record_stream(side)
+        cudart = _cudart()
+        h = side.cuda_stream
+        cudart.memcpy_async(store.ids_host.data_ptr(), ids.data_ptr(), n * 8, _MEMCPY_D2H, h)
+        cudart.launch_host_func(h, _GATHER_FN, ctypes.addressof(store.work_for(n)))
+        cudart.memcpy_async(w_dev.data_ptr(), store.w_host.data_ptr(), n * ROW_BYTES, _MEMCPY_H2D, h)
+        cudart.memcpy_async(s_dev.data_ptr(), store.s_host.data_ptr(), n * SCALE_BYTES, _MEMCPY_H2D, h)
+        done = torch.cuda.Event()
+        done.record(side)
+    emb._spark_pending = ((indices.data_ptr(), tuple(indices.shape), tuple(indices.stride())), done)
+
+
+def _wrap_engram_modules(module) -> None:
+    """Register each Engram layer's hash-column index, and start the early gathers from the hasher's forward."""
+    eng = module.Engram
+    if not getattr(eng.__init__, "_spark_wrapped", False):
+        stock_init = eng.__init__
+
+        @functools.wraps(stock_init)
+        def engram_init(self, *args, **kwargs) -> None:
+            stock_init(self, *args, **kwargs)
+            _ENGRAM_LAYERS.append((int(self.layer_hash_index), self.embed))
+
+        engram_init._spark_wrapped = True
+        eng.__init__ = engram_init
+    hasher = module.EngramHasher
+    if getattr(hasher.forward, "_spark_wrapped", False):
+        return
+    stock_forward = hasher.forward
+
+    @functools.wraps(stock_forward)
+    def forward(self, input_ids, forward_batch):
+        hash_ids = stock_forward(self, input_ids, forward_batch)
+        if _ENGRAM_LAYERS and hash_ids.dim() == 3 and hash_ids.shape[0] > 0 and hash_ids.is_cuda:
+            for hidx, emb in _ENGRAM_LAYERS:
+                _stage_early(emb, hash_ids[:, hidx])
+        return hash_ids
+
+    forward._spark_wrapped = True
+    hasher.forward = forward
+
+
 def install(module) -> None:
     """Install the hook into the executed ``sglang.srt.layers.engram`` module (called once by sitecustomize).
 
@@ -737,9 +850,11 @@ def install(module) -> None:
         cls.__init__ = embedding_init
         cls._owned_rows = owned_rows
     _wrap_hasher(module)
+    if _early_enabled():
+        _wrap_engram_modules(module)
     logger.info(
-        "engram_store installed: Engram rows of layers %s come from %s through %s",
-        sorted(ranges), model_dir, Path(LIB._name).name,
+        "engram_store installed: Engram rows of layers %s come from %s through %s; early staging %s",
+        sorted(ranges), model_dir, Path(LIB._name).name, "on" if _early_enabled() else "off",
     )
 
 

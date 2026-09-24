@@ -133,6 +133,128 @@ cold-row gather of the fixed-stripe pool is slower in the first minute of a long
 and the rest is boot-to-boot swing (GB10 clock state), which this stack shows at ±10–15 % on prefill. A dynamic
 chunk queue in the pool is the next thing to try for cold rows.
 
+## Concurrency (2026-09-22)
+
+tonyd2wild's fixed-prompt bench (prompt set v1, eight categories, counting ceiling excluded), aggregate and mean
+per-stream tok/s. The 8-request cap was the launcher default until this sweep; the KV pool allows far more.
+
+| streams | cap 8, block 5 (production until 2026-09-22) | **cap 16, block 5 (default since)** | cap 16, block 3 | vLLM production-1.0 (2026-09-10) |
+|---|---|---|---|---|
+| 1 | 55.0 / 61.3 | | | 52.8 / 58.6 |
+| 4 | 137.5 / 39.9 | 130.1 / 38.8 | 123.2 / 36.6 | 146.5 / 43.1 |
+| 6 | 172.6 / 33.4 | | | 185.2 / 35.7 |
+| 8 | | **207.7 / 30.2** | 206.2 / 29.5 | |
+| 12 | | **272.6 / 27.9** | 262.3 / 25.8 | |
+| 16 | | **329.4 / 25.3** | 309.1 / 22.9 | |
+
+Decode is bound by reading the MoE weights, so a larger batch amortizes each read: 16 streams deliver 1.9x the
+aggregate of the old ceiling at 25 tok/s per stream. Block 3 wins only on prose (16.2 vs 14.7 tok/s per stream at 16)
+and loses everywhere else. Host memory held 12 GB free or more on every node at 16 streams.
+
+## Outside the MoE: decode-step breakdown and early Engram staging (2026-09-23)
+
+`overlay/step_timers.py` (SPARK_STEP_TIMERS=1) records capture-safe CUDA events around attention, MoE and Engram inside the
+decode graphs. Per target-verify step, rank 0 (all ranks within 1 %):
+
+| per step | 1 stream (6 tokens) | 8 streams (48) | 16 streams (96) |
+|---|---|---|---|
+| target graph | 54-57 ms | 140 ms | 157 ms |
+| MoE | 32 | 90 | 102 |
+| attention (43 layers, with the indexer) | 15 | 35 | 33 |
+| Engram (2 layers) | 4.4-7.0 | 9.0 | 12.2 |
+| rest of the graph | 3 | 6 | 10 |
+| draft graph | 4.3 | 8.2 | 10.5 |
+
+The Engram lookups stalled the GPU while the host gathered rows, although the ids of a step exist before layer 0 runs.
+Early staging (`SPARK_ENGRAM_EARLY=1`, default since production-1.2) starts both layers' host gathers on a side stream as
+soon as the hasher has produced the ids; the dequantize, the TP all-reduce and the projection stay at the layer, so no
+collective runs on the side stream. Engram time per single-stream step fell to 1.8-3.9 ms. Verified with
+`SPARK_ENGRAM_EARLY_VERIFY=1`: every staged gather on eager steps compared against the inline one, byte-identical on all
+four ranks (0 differences), and 12/12 greedy answers identical to the previous production.
+
+| fixed prompt set, aggregate / per stream (tok/s) | before (cap 16) | early staging (production-1.2) |
+|---|---|---|
+| 1 stream | 55.0 / 61.3 | **57.2 / 63.6** |
+| 8 streams | 207.7 / 30.2 | **211.2 / 30.9** |
+| 16 streams | 329.4 / 25.3 | **337.4 / 25.7** |
+| single-stream decode, counting / code / prose | 105 / 88 / 35 | **110 / 94 / 37** |
+
+The same window found that a request for prompt-token log-probabilities (e.g. `/v1/completions` with `echo` and
+`logprobs`) raised inside the model under decoder bounded replay and stopped the whole server; `overlay/request_guard.py`
+now answers such requests with HTTP 400 and the server keeps serving (tested live).
+
+## MoE kernel: b12x versus the stock CUTLASS kernel (2026-09-23)
+
+The b12x fused MoE gave the author's vLLM stack +9 % single-stream decode, so it was tried here. One MoE layer with
+V4.1's dimensions (384 experts, top-6, hidden 5120), synthetic weights, head GPU, median of 40 runs, microseconds:
+
+| tokens | same weights (96 experts x 2304): CUTLASS | b12x | per-rank work: CUTLASS, experts EP4 (production) | b12x, experts TP4 (576-wide slices) |
+|---|---|---|---|---|
+| 6 | 2,892 | 4,239 | **849** | 2,605 |
+| 24 | 6,807 | 7,908 | **3,191** | 4,416 |
+| 48 | 7,919 | 8,809 | **4,375** | 6,391 |
+| 96 | 8,427 | 9,349 | **6,819** | 8,713 |
+| 512 | 9,282 | 10,331 | **8,648** | 10,835 |
+| 2,048 | 13,320 | 12,950 | **9,536** | 12,309 |
+
+Outputs agreed to 1.3-2.7 % relative error (MXFP8 activation rounding). At decode sizes the stock kernel already reads
+the expert weights at ~250 GB/s against the GB10's ~273 GB/s peak, so there is nothing for a different kernel to win,
+and the expert-parallel layout the stock path uses beats b12x's tensor-parallel slices by 1.3-3x. The b12x route was
+dropped; its fleet boots also showed that repacking 576-wide slices needs a padded copy that does not fit the
+headroom. `tools/moe_microbench.py` in this repository reproduces the table.
+
+## Attention: compressor overlap in verify (2026-09-23)
+
+38 of the 43 attention layers (compression ratio 1 or 2) run a compressor and, for ratio 2, an indexer before the
+sparse attention. SGLang can start them on a side stream in parallel with the Q/KV projections ("early sources"), but
+in speculative verify only with FlashInfer's CuTe-DSL MXFP8 GEMMs, which do not exist for SM12x, because other backends
+share one GEMM workspace. With the workspace made per stream and the gate lifted (the b12x dense GEMMs take no
+workspace at all), outputs stayed identical (12/12 greedy, 32K needle passed), but nothing got faster:
+
+| per verify step, rank 0 | 1 stream | 8 streams | 16 streams |
+|---|---|---|---|
+| attention, before / overlap | 14.7 / 14.8 ms | 35 / 34.0 ms | 33 / 32.3 ms |
+| aggregate tok/s, production-1.2 / overlap | 57.2 / 57.6 | 211.2 / 203.1 | 337.4 / 333.0 |
+
+The GEMMs on both streams read weights from the same memory, so running them together splits the bandwidth rather
+than adding to it, and the extra side-stream work delayed Engram's staged gathers (Engram 3.9 -> 10.6 ms per
+single-stream step). The overlap was not kept.
+
+## Attention: where the time goes, and wo_a in MXFP8 (2026-09-23, not adopted)
+
+`SPARK_STEP_TIMERS_ATTN=1` (with `SPARK_STEP_TIMERS=1`) splits the attention time of a verify step, rank 0 (all ranks
+within 5 %):
+
+| per verify step | 1 stream (6 tokens) | 8 streams (48) | 16 streams (96) |
+|---|---|---|---|
+| attention | 15.2 ms | 32.8 | 34.2 |
+| Q/KV projections | 4.6 | 5.2 | 5.7 |
+| compressor | 0.25 | 0.3 | 0.3 |
+| indexer | 0.5 | 3.1 | 6.3 |
+| attention kernel | 2.2 | 9.6 | 5.0 |
+| output: inverse RoPE, wo_a, wo_b, TP all-reduce | 7.7 | 14.6 | 16.9 |
+
+The output path was the largest piece. SGLang runs `wo_a` in FP8 only through DeepGEMM's `fp8_einsum` with 128x128
+block scales; this checkpoint's are 32x32, so it dequantizes `wo_a` to BF16 at load, which doubles its bytes and
+sends more than eight rows to a cuBLAS BF16 `bmm`. An experimental hook requantized it to MXFP8 at load (exact: the
+checkpoint's scales are powers of two, and every one of the 40 layers verified bit for bit) and ran each head group on
+the same dense MXFP8 GEMM as `wo_b`, releasing 0.62 GB of BF16 weight per rank. Output path: 7.7 -> 6.6 ms
+(1 stream), 14.6 -> 12.5 (8), 16.9 -> 14.3 (16).
+
+| aggregate / per stream (tok/s) | production-1.2 | wo_a MXFP8 |
+|---|---|---|
+| 1 stream | 57.2 / 63.6 | **58.8 / 65.9** |
+| 8 streams | 211.2 / 30.9 | 210.2 / 30.7 |
+| 16 streams | 337.4 / 25.7 | **339.8 / 26.4** |
+| single-stream decode, counting / code / prose | 110 / 94 / 37 | **112.7 / 96.4 / 39.1** |
+
+The activation into `wo_a` is now quantized per 1x32 segment, as for every other dense projection, so greedy answers
+are no longer identical to BF16 `wo_a` (5/12 identical; the rest diverge at near-ties into equally fluent, correct
+text, and the same 5/12 on two separate boots). The 32K needle passes, and speculative acceptance, which drops when
+the target's distribution drifts from the one the draft was trained on, did not fall (mean accept length 3.56 against
+3.49 on BF16 `wo_a`). The gain (about 3 % single-stream) was judged not worth giving up BF16 numerics in this
+projection, so `wo_a` stays BF16 and the hook is not part of the overlay.
+
 ## Bring-up
 
 Seven boots of this stack, in order. The first three were fix-one-thing boots and no benchmark numbers were kept for

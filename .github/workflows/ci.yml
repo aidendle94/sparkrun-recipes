@@ -5,17 +5,29 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the leak check scans the whole history, not only HEAD
       - name: shell syntax
         run: |
           set -e; for f in $(git ls-files '*.sh'); do bash -n "$f"; done
       - name: python syntax
         run: |
           set -e; python3 -m py_compile $(git ls-files '*.py')
-      - name: no site-specific values or secrets in the tree
+      - name: no site-specific values or secrets in the tree or its history
+        env:
+          # tokens, private keys, private IPv4 ranges, home paths (/home/alice and /home/bob are the documented placeholders)
+          LEAK_RE: 'hf_[A-Za-z0-9]{25,}|sk-or-[A-Za-z0-9-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|dckr_pat_[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{12}|BEGIN [A-Z ]*PRIVATE KEY|\b10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b|\b192\.168\.[0-9]{1,3}\.[0-9]{1,3}\b|\b172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}\b|/home/(?!alice\b|bob\b)[a-z][a-z0-9_-]*'
         run: |
+          # git grep exits 0 on a match, 1 on none and >1 on an error; only "none" passes. -l prints file names, never values.
+          set +e
+          git grep -IlP "$LEAK_RE" -- . ':!.github/workflows/ci.yml'
+          rc=$?
           set -e
-          ! git ls-files -z | xargs -0 grep -IlE 'hf_[A-Za-z0-9]{25,}|sk-or-v1-|gh[ops]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{12}|BEGIN (RSA|OPENSSH|EC) PRIVATE|10\.0\.[01]\.[0-9]+|192\.168\.[0-9]+\.[0-9]+|/home/[a-z]+/' -- . ':!fleet/README.md' || { echo "private material found"; exit 1; }
-          ! git ls-files | grep -E '(^|/)launch/fleet\.env$'
+          if [ $rc -ne 1 ]; then echo "private material in the tree (files above), or the check failed (rc=$rc)"; exit 1; fi
+          # every commit ever pushed, since removing a file later does not unpublish it
+          hits=$(git log --all -p --format='commit %H' -- . ':!.github/workflows/ci.yml' | grep -cP "^[+-].*($LEAK_RE)" || true)
+          if [ "$hits" != "0" ]; then echo "private material in the history ($hits lines); list with: git log --all -p | grep -nP \"\$LEAK_RE\""; exit 1; fi
+          if git ls-files | grep -qE '(^|/)launch/fleet\.env$'; then echo "launch/fleet.env is tracked"; exit 1; fi
       - name: C row store test (DeepSeek-V4.1 SGLang recipe)
         run: |
           set -e; cd recipes/deepseek-v4.1-flash/sglang

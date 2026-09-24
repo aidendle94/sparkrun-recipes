@@ -1,16 +1,20 @@
 #!/bin/bash
 # launch-sgl-dsv41.sh — DeepSeek-V4.1-Flash with SGLang (TP4/EP4) on four DGX Sparks over a switched RoCE fabric.
 # One container per node, host networking, RDMA passthrough. Image: the Dockerfile in this repo on lmsysorg/sglang:dev-dsv41
-# (published as aidendle94/sparkrun-sglang-dsv41-gb10:production-1.1; production.sh selects it). Engram rows come from
+# (published as aidendle94/sparkrun-sglang-dsv41-gb10:production-1.2; production.sh selects it). Engram rows come from
 # node-local NVMe (tools/engram_local.py) or, on the node that holds the checkpoint, straight from the shards.
 #   ./launch-sgl-dsv41.sh [--dry-run|--stop]
 # Site facts — nodes, users, home directories, network devices, model paths — come from launch/fleet.env: copy
 # fleet.env.example and fill it in. The copy is git-ignored and the launcher refuses to run without it.
-# env: PORT (8888) IMAGE (sglang-dsv41-spark:local = a local build; production.sh uses the published tag) DIST_PORT (20100) CHUNK (2048) MAXREQ (8) KVTOK (0 = let SGLang size it) CTX (524288) MEMFRAC (0.80) SPEC_K (5)
+# env: PORT (8888) IMAGE (sglang-dsv41-spark:local = a local build; production.sh uses the published tag) DIST_PORT (20100) CHUNK (2048) MAXREQ (16) KVTOK (0 = let SGLang size it) CTX (524288) MEMFRAC (0.80) SPEC_K (5)
 #      NCCL_TRIM (1: 1 MiB buffers, no LL128, 8 channels) MXFP8 (b12x|auto|cutlass) SERVED (deepseek-v4.1-flash)
 #      ROCE_AR (1|0: b12x one-shot RDMA collectives for the TP group; ROCE_AR_MAX 1MB, ROCE_AG_MAX 16MB, ROCE_HCA, ROCE_SPIN)
 #      SERVED_ALIASES (comma-separated extra model ids listed by /v1/models; SGLang serves one name)
 #      THINKING_DEFAULT (1|0: thinking on unless a request passes "thinking": false; effort max via SGLANG_DSV41_REASONING_EFFORT)
+#      ENGRAM_EARLY (1|0: start the Engram host gathers on a side stream as soon as the hash ids exist)
+#      ENGRAM_EARLY_VERIFY (0|1: on eager steps also gather inline and compare byte for byte; diagnosis only)
+#      STEP_TIMERS (0|1: per-graph decode-step timing in the log, for diagnosis windows; see overlay/step_timers.py)
+#      STEP_TIMERS_ATTN (0|1: with STEP_TIMERS=1, also split attention into projections, compressor, indexer, kernel, output)
 #      ENGRAM_MODE (hostnode|staged: Engram rows gathered inside the graph by the C store, or staged before each forward
 #      by the pure-Python port; see docs/design.md) ENGRAM_PREFETCH (1|0: scheduler-side next-chunk row prefetch) EXTRA_ARGS (appended to sglang.launch_server)
 #      NCCL_EXTRA (extra docker -e flags) FLEET_ENV (path of the fleet file)
@@ -28,7 +32,7 @@ MODEL_HOST_RANK="${MODEL_HOST_RANK:-}"; MODEL_REPO_HOST="${MODEL_REPO_HOST:-$MOD
 HEAD=${NODES[0]}; PORT=${PORT:-8888}; DIST_PORT=${DIST_PORT:-20100}; NAME=sgldsv41
 ip -o addr 2>/dev/null | grep -q " $HEAD/" || { echo "ABORT: this node does not carry the rank-0 fabric address $HEAD (NODES[0] in $FLEET_ENV); run the launcher on rank 0" >&2; exit 1; }
 IMAGE="${IMAGE:-${PRODUCTION_IMAGE:-sglang-dsv41-spark:local}}"   # env > fleet.env > production.sh > local build
-CHUNK="${CHUNK:-2048}"; MAXREQ="${MAXREQ:-8}"; KVTOK="${KVTOK:-0}"; CTX="${CTX:-524288}"; MEMFRAC="${MEMFRAC:-0.80}"; SPEC_K="${SPEC_K:-5}"
+CHUNK="${CHUNK:-2048}"; MAXREQ="${MAXREQ:-16}"; KVTOK="${KVTOK:-0}"; CTX="${CTX:-524288}"; MEMFRAC="${MEMFRAC:-0.80}"; SPEC_K="${SPEC_K:-5}"
 NCCL_TRIM="${NCCL_TRIM:-1}"; MXFP8="${MXFP8:-b12x}"; SERVED="${SERVED:-deepseek-v4.1-flash}"; SERVED_ALIASES="${SERVED_ALIASES:-}"; THINKING_DEFAULT="${THINKING_DEFAULT:-1}"   # aliases come from fleet.env or the environment
 ROCE_AR="${ROCE_AR:-1}"; ROCE_AR_MAX="${ROCE_AR_MAX:-1MB}"; ROCE_AG_MAX="${ROCE_AG_MAX:-16MB}"; ROCE_HCA="${ROCE_HCA:-$RDMA_HCAS}"; ROCE_SPIN="${ROCE_SPIN:-300000000}"
 # Engram row partition: every rank reads one contiguous range of each table — from its node-local sparse copy (the
@@ -64,7 +68,7 @@ run_cmd() {  # rank -> the docker run command (single-quoted JSON survives the r
   printf '%s' "mkdir -p $cache; docker run -d --name $NAME --restart no --network host --ipc host --cap-add IPC_LOCK --gpus all \
  --shm-size 32g --memory 112g --memory-swap 112g --ulimit memlock=-1:-1 --ulimit stack=67108864 --device /dev/infiniband:/dev/infiniband --oom-score-adj 500 \
  -v $repo:/models/repo:ro -v $cache:/root/.cache $engram \
- -e SPARK_ENGRAM_MODE=${ENGRAM_MODE:-hostnode} -e SPARK_ENGRAM_PREFETCH=${ENGRAM_PREFETCH:-1} -e SPARK_ENGRAM_THREADS=64 -e SPARK_ENGRAM_MAX_IDS=$(( (CHUNK > MAXREQ * 8 ? CHUNK : MAXREQ * 8) * 32 )) -e SPARK_MXFP8_BACKEND=$MXFP8 \
+ -e SPARK_ENGRAM_EARLY=${ENGRAM_EARLY:-1} -e SPARK_ENGRAM_EARLY_VERIFY=${ENGRAM_EARLY_VERIFY:-0} -e SPARK_STEP_TIMERS=${STEP_TIMERS:-0} -e SPARK_STEP_TIMERS_ATTN=${STEP_TIMERS_ATTN:-0} -e SPARK_ENGRAM_MODE=${ENGRAM_MODE:-hostnode} -e SPARK_ENGRAM_PREFETCH=${ENGRAM_PREFETCH:-1} -e SPARK_ENGRAM_THREADS=64 -e SPARK_ENGRAM_MAX_IDS=$(( (CHUNK > MAXREQ * 8 ? CHUNK : MAXREQ * 8) * 32 )) -e SPARK_MXFP8_BACKEND=$MXFP8 \
  -e SPARK_SERVED_ALIASES=$SERVED_ALIASES -e SPARK_ROCE_AR=$ROCE_AR -e SPARK_ROCE_AR_MAX=$ROCE_AR_MAX -e SPARK_ROCE_AG_MAX=$ROCE_AG_MAX -e B12X_ROCE_HCA=$ROCE_HCA -e B12X_ROCE_GID_INDEX=$gid -e B12X_ROCE_SPIN_LIMIT=$ROCE_SPIN \
  -e SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=0 -e SGLANG_FLASHINFER_MOE_FUSED_FINALIZE=0 -e SGLANG_DSV41_REASONING_EFFORT=100 \
  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e HOST_IP=${NODES[$r]} \

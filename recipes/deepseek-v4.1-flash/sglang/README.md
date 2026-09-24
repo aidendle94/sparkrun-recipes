@@ -3,7 +3,7 @@
 This repository serves the [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
 checkpoint on four NVIDIA DGX Spark nodes with SGLang, behind one OpenAI-compatible endpoint. The engine is the
 SGLang team's own DeepSeek-V4.1 image, `lmsysorg/sglang:dev-dsv41`, unmodified. On top of it sits an MIT-licensed
-overlay of eight Python import hooks and one C library that supply what a Spark needs and the stock image does
+overlay of ten Python import hooks and one C library that supply what a Spark needs and the stock image does
 not have: the model's Engram tables read from node-local NVMe inside the CUDA graph (they do not fit next to the
 weights in 128 GB of unified memory), kernels and schedules that work on the GB10's SM12x architecture, and RDMA
 collectives that make a four-node tensor-parallel decode step fast. Nothing model-specific is forked; the same
@@ -19,15 +19,17 @@ different kernels and schedules from the datacenter Blackwell parts.
 
 ## What you get
 
-Measured 2026-09-17 on four Sparks over a switched RoCE fabric with the launcher defaults. Conditions, boot-by-boot
-numbers and the comparison baseline are in [docs/results.md](docs/results.md).
+Measured on four Sparks over a switched RoCE fabric with the launcher defaults: prefill and the vLLM comparison on
+2026-09-17, decode and concurrency on the production-1.2 image on 2026-09-23. Conditions, boot-by-boot numbers and
+the comparison baseline are in [docs/results.md](docs/results.md).
 
 | what | this stack | the author's previous vLLM deployment, same checkpoint, same nodes |
 |---|---|---|
 | prefill, 32K / 128K prompt of unique text (tok/s) | 3,068 / 2,580 | 2,094–2,362 / 2,152 |
 | prefill, 32K / 128K prompt of repetitive text (tok/s) | 4,063 / 3,435 | 2,652 / 2,550 |
-| decode, one stream, counting / code / prose (tok/s) | 94 / 68 / 32 | 93 / 67 / 31 |
+| decode, one stream, counting / code / prose (tok/s) | 110 / 94 / 37 | 93 / 67 / 31 |
 | decode, four prose streams, aggregate (tok/s) | 72 | 70 |
+| aggregate at 1 / 8 / 16 concurrent streams, fixed prompt set (tok/s) | 57 / 211 / 337 (64 / 31 / 26 per stream) | 185 at 6 streams |
 | KV pool | 4.3–5.4 M tokens on the two production boots, auto-sized at each boot (4.4–5.8 M over earlier boots) | 3.42 M tokens |
 | context length | 524,288 tokens | |
 | boot to healthy | about 10 min (582–604 s over five boots) | |
@@ -59,7 +61,7 @@ says otherwise.
 
 ```bash
 # 1. The image, on every node (arm64). Pull the published build...
-docker pull aidendle94/sparkrun-sglang-dsv41-gb10:production-1.1
+docker pull aidendle94/sparkrun-sglang-dsv41-gb10:production-1.2
 #    ...or build it on each node from this repository, then put IMAGE=sglang-dsv41-spark:local in launch/fleet.env
 #    so the launcher, relaunch.sh and the watchdog all use it.
 docker build -t sglang-dsv41-spark:local .
@@ -77,7 +79,7 @@ python3 tools/engram_local.py /path/to/snapshot ~/dsv41-engram-local 1:<lo>:<hi>
 #    Optional CPU check, on a node that now has a row copy: the hooks bind to this image's SGLang (no GPU).
 #    It must end with HOOKS CPU TEST PASS.
 docker run --rm -v ~/dsv41-engram-local:/engram-local:ro -e SPARK_ENGRAM_DIR=/engram-local \
-  --entrypoint python3 aidendle94/sparkrun-sglang-dsv41-gb10:production-1.1 /opt/dsv41-spark/tests/test_hooks_cpu.py
+  --entrypoint python3 aidendle94/sparkrun-sglang-dsv41-gb10:production-1.2 /opt/dsv41-spark/tests/test_hooks_cpu.py
 
 # 5. Print the four docker run commands without starting anything. This already needs ssh to every rank:
 #    the RoCE-v2 GID index is probed on each node.
@@ -126,7 +128,8 @@ armed watchdog.
 
 Tuning knobs are environment variables read by `launch/launch-sgl-dsv41.sh` and listed in its header: `CHUNK`
 (prefill chunk, 2,048), `SPEC_K` (DSpark block, 5), `MEMFRAC` (0.80), `KVTOK` (0 = let SGLang size the KV pool),
-`MAXREQ` (8), `CTX` (524,288), `MXFP8`, `ROCE_AR`, `THINKING_DEFAULT`, `ENGRAM_PREFETCH`, `EXTRA_ARGS`. Thinking is
+`MAXREQ` (16 running requests), `CTX` (524,288), `MXFP8`, `ROCE_AR`, `THINKING_DEFAULT`, `ENGRAM_MODE`, `ENGRAM_EARLY`,
+`ENGRAM_PREFETCH`, `STEP_TIMERS`, `EXTRA_ARGS`. Thinking is
 on by default at maximum reasoning effort; a request turns it off with `"chat_template_kwargs": {"thinking": false}`.
 
 ## How it works
@@ -147,6 +150,8 @@ and the image runs stock SGLang.
 | `overlay/prefill_flush.py` | `sglang.srt.model_executor.model_runner` | After a prefill chunk whose longest sequence is at least `SPARK_PREFILL_FLUSH_TOKENS` (8,192), returns PyTorch's cached allocator blocks to the driver. | The indexer's transient buffers grow with the prefix and the caching allocator cannot reuse smaller freed blocks, so reserved memory grows with the square of the prompt. On a Spark that is host memory; a 128K prompt drove all four nodes to zero free. |
 | `overlay/roce_collectives.py` | `sglang.srt.distributed.parallel_state` and `model_runner` | Gives the tensor-parallel group a one-shot RDMA runtime (b12x, Apache-2.0, vendored): each small all-reduce or all-gather is one RDMA write per peer, replayable in CUDA graphs. Tensors above 1 MB (16 MB per all-gather shard) and every other group stay on NCCL. A health check after every forward turns a stalled peer into an error instead of a hang. | A decode step issues about eighty all-reduces of 48–400 KB; as NCCL kernels each costs about 100 µs in graph replay on this fabric, as an RDMA write about 21 µs. |
 | `overlay/served_aliases.py` | `sglang.srt.entrypoints.http_server` | Lists the names in `SPARK_SERVED_ALIASES` on `/v1/models` and answers `/v1/models/{id}` for them. | SGLang serves exactly one model name; clients that ask for another id get a 404 from the listing endpoints. |
+| `overlay/request_guard.py` | `sglang.srt.managers.tokenizer_manager` | Answers a request for prompt-token log-probabilities (for example `/v1/completions` with `echo` and `logprobs`) with HTTP 400. | Under V4.1's decoder sliding-window bounded replay such a request raises inside the model and stops the whole server. |
+| `overlay/step_timers.py` | `sglang.srt.models.deepseek_v4`, `deepseek_v2`, `layers.engram`, the V4 attention backend | Off unless `SPARK_STEP_TIMERS` is set: capture-safe CUDA events around attention, MoE and Engram inside the decode graphs (mode 1), or the GPU-timeline gaps between graphs without any synchronisation (mode 2). | Diagnosis only; this is how the decode-step breakdown in `docs/results.md` was measured. |
 
 Environment variables the hooks read (all prefixed `SPARK_`; the launcher sets them from its knobs):
 
@@ -158,11 +163,16 @@ Environment variables the hooks read (all prefixed `SPARK_`; the launcher sets t
 | `SPARK_ENGRAM_MAX_IDS` | 262,144 | ids one lookup may carry; the launcher derives it from `CHUNK` and `MAXREQ` |
 | `SPARK_ENGRAM_STATS_SECONDS` | 60 | period of the per-layer gather statistics line (0 = off) |
 | `SPARK_ENGRAM_PREFETCH` | 1 | next-chunk row prefetch from the scheduler |
+| `SPARK_ENGRAM_EARLY` | 1 | start each Engram layer's host gather on a side stream as soon as the step's hash ids exist, overlapping the layers before it |
+| `SPARK_ENGRAM_EARLY_VERIFY` | 0 | on eager steps also gather inline and compare byte for byte (diagnosis) |
+| `SPARK_ENGRAM_MODE` | `hostnode` | `staged` selects the pure-Python staged implementation (below) |
 | `SPARK_MXFP8_BACKEND` | `b12x` | FlashInfer MXFP8 backend for the dense projections; `cutlass` or empty = stock |
 | `SPARK_PREFILL_FLUSH_TOKENS` | 8,192 | longest sequence that triggers the allocator flush after a prefill chunk (0 = off) |
 | `SPARK_ROCE_AR`, `SPARK_ROCE_AR_MAX` | 0, 1MB | RDMA all-reduce route on/off, largest tensor routed (the launcher turns it on) |
 | `SPARK_ROCE_AG`, `SPARK_ROCE_AG_MAX` | 1, 16MB | RDMA all-gather route, largest per-rank shard routed |
 | `SPARK_SERVED_ALIASES` | empty | extra model ids for `/v1/models` |
+| `SPARK_STEP_TIMERS` | 0 | 1: per-block decode-step timing, sampled every `SPARK_STEP_TIMERS_EVERY` (100) replays; 2: gaps between graphs |
+| `SPARK_STEP_TIMERS_ATTN` | 0 | with mode 1, also split attention into projections, compressor, indexer, kernel and output |
 
 A second Engram implementation ships alongside: `SPARK_ENGRAM_MODE=staged` (launcher `ENGRAM_MODE=staged`) stages the
 rows before every forward from a pre-forward hook instead of gathering them inside the graph. It is a port of the
@@ -204,6 +214,8 @@ overlay/sm120_prefill_pages.py  64-token pages for the ratio-2 KV source in the 
 overlay/prefill_flush.py      allocator flush after long prefill chunks (hook)
 overlay/roce_collectives.py   one-shot RDMA collectives for the TP group + fail-stop health check (hook)
 overlay/served_aliases.py     extra model ids on /v1/models (hook)
+overlay/request_guard.py      rejects prompt-logprob requests that would stop the server under bounded replay (hook)
+overlay/step_timers.py        per-graph decode-step timing for diagnosis windows (hook, off unless SPARK_STEP_TIMERS=1)
 launch/fleet.env.example      the site file, every line documented; copy to launch/fleet.env (git-ignored)
 launch/launch-sgl-dsv41.sh    the four-node launcher: preflight, GID probe, free-GPU wait, docker run per rank, --dry-run, --stop
 launch/production.sh          the production profile: published image, port 8210
