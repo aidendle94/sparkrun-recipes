@@ -61,7 +61,7 @@ says otherwise.
 
 ```bash
 # 1. The image, on every node (arm64). Pull the published build...
-docker pull aidendle94/sparkrun-sglang-dsv41-gb10:production-1.2
+docker pull aidendle94/sparkrun-sglang-dsv41-gb10:production-1.3
 #    ...or build it on each node from this repository, then put IMAGE=sglang-dsv41-spark:local in launch/fleet.env
 #    so the launcher, relaunch.sh and the watchdog all use it.
 docker build -t sglang-dsv41-spark:local .
@@ -79,7 +79,7 @@ python3 tools/engram_local.py /path/to/snapshot ~/dsv41-engram-local 1:<lo>:<hi>
 #    Optional CPU check, on a node that now has a row copy: the hooks bind to this image's SGLang (no GPU).
 #    It must end with HOOKS CPU TEST PASS.
 docker run --rm -v ~/dsv41-engram-local:/engram-local:ro -e SPARK_ENGRAM_DIR=/engram-local \
-  --entrypoint python3 aidendle94/sparkrun-sglang-dsv41-gb10:production-1.2 /opt/dsv41-spark/tests/test_hooks_cpu.py
+  --entrypoint python3 aidendle94/sparkrun-sglang-dsv41-gb10:production-1.3 /opt/dsv41-spark/tests/test_hooks_cpu.py
 
 # 5. Print the four docker run commands without starting anything. This already needs ssh to every rank:
 #    the RoCE-v2 GID index is probed on each node.

@@ -286,10 +286,24 @@ Driver out-of-memory events during the stress, summed over the four ranks, with 
 |---|---|---|
 | no fix (production-1.2) | 13 | 3.9-13.4 / 3.5-4.9 |
 | checkpoint drop only | 2 | 14.0-15.2 / 3.9-12.3 |
+| checkpoint drop + Engram row budget (production-1.3), 20 prompts instead of 12 | **0** | 14.8-15.8 / 13.0-17.8 |
 
-With only the checkpoint dropped the Engram rows still ate 9-11 GB of free memory during the stress; the row budget
-addresses that part. The single-stream decode and the fixed-prompt bench were unchanged (110.5 / 93.3 / 37.0 tok/s;
-57.3 / 207.7 / 333.8 tok/s at 1 / 8 / 16 streams).
+With only the checkpoint dropped the Engram rows still ate 9-11 GB of free memory during the stress. With the budget,
+ranks 1-3 released their rows 10-15 times in the five minutes of the stress, 42-66 GB per rank in total, which is the
+page cache the stress would otherwise have left behind; the peak stayed at 4.3-4.9 GB (the check runs every 5 s) and
+MemFree never went below 13 GB. The prefills were not slower (15.2 s per 48K prompt, against 18.3 s without the fix
+and 16.0 s with the checkpoint drop alone), and the per-lookup gather times during the bench matched the run without
+the budget within 5-14 %. Decode and the fixed-prompt bench:
+
+| | single stream, counting / code / prose | aggregate at 1 / 8 / 16 streams (tok/s) |
+|---|---|---|
+| production-1.2 (2026-09-23) | 110 / 94 / 37 | 57.2 / 211.2 / 337.4 |
+| checkpoint drop only | 110.5 / 93.3 / 37.0 | 57.3 / 207.7 / 333.8 |
+| production-1.3 | 108.2 / 93.3 / 37.0 | 57.2 / 199.0 / 328.3 |
+
+The 8-stream figure of the same unchanged code has ranged from 199 to 211 tok/s across this week's windows, and the
+budget was idle during the bench (no releases on ranks 1-3), so the 1.3 row is read as run-to-run spread; a cost of a
+few percent at 8 streams cannot be excluded from one run.
 
 ## Bring-up
 
