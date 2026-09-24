@@ -16,7 +16,7 @@
 | origin | the build the SGLang team's DeepSeek-V4.1 integration pull request (#38798) tells users to run |
 
 The tag is a moving tag. The Dockerfile's `BASE` pins the digest above, so a rebuild reproduces the same base; the
-published overlay image `aidendle94/sparkrun-sglang-dsv41-gb10:production-1.3` is the Dockerfile built on it.
+published overlay image `aidendle94/sparkrun-sglang-dsv41-gb10:production-1.4` is the Dockerfile built on it.
 
 ## What moved upstream after the image was cut (state on 2026-09-17)
 

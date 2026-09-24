@@ -11,11 +11,16 @@ unchanged by the split (page p, offset o -> page 2p + o // 64, offset o % 64 kee
 kernels, called from the module) with the scratch buffers made persistent and per source — SGLang,
 Copyright SGLang Team, Apache License 2.0 (see NOTICE).
 
+Environment:
+  SPARK_SM120_REAL_HEADS   1: decode-sized attention runs on the rank's real query heads, not padded to 64 (default 0)
+
 MIT License, Copyright (c) 2026 Aiden Le.
 """
 from __future__ import annotations
 
 import logging
+
+import os
 
 import torch
 import triton
@@ -88,3 +93,23 @@ def install(module) -> None:
 
     module._flash_mla_sm120_prefill = prefill
     logger.info("SM12x: ratio-2 KV source re-paged to 64-token pages for the sparse prefill kernel")
+
+
+def install_real_heads(module) -> None:
+    """sglang.srt.models.deepseek_v4: on SM12x, give the sparse decode kernel the rank's real query heads.
+
+    For batches of at most 64 query tokens (every verify step up to 10 streams) the model pads each rank's heads to 64
+    before attention, because FlashMLA's fp8 sparse decode kernel for datacenter Blackwell only exists for 64 and 128
+    heads. On SM12x the same call goes to FlashInfer's decode_dsv4 kernel, which is built for 8, 16, 32, 64 and 128
+    heads; at attention TP 4 the padding makes it attend 64 heads where 16 are real, four times the work (a 48-token
+    verify step spent 9.6 ms in the attention kernel, a 96-token one, which already runs unpadded, 5.0 ms). The model
+    decides the pad from its own imported copy of SM120_DECODE_MAX_TOKENS ("above it the heads stay unpadded");
+    setting that copy below any batch size keeps the heads real for every batch, while the kernel module's copy (64)
+    still sends decode-sized batches to the split-KV decode kernel with its scratch.
+    """
+    if os.environ.get("SPARK_SM120_REAL_HEADS", "0") != "1":
+        return
+    if not hasattr(module, "SM120_DECODE_MAX_TOKENS"):
+        raise RuntimeError("sm120 real heads: deepseek_v4 no longer imports SM120_DECODE_MAX_TOKENS; re-check the pad logic")
+    module.SM120_DECODE_MAX_TOKENS = -1
+    logger.info("SM12x: sparse decode attention on the rank's real heads (no pad to 64)")

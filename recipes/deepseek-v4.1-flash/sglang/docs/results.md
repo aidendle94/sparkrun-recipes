@@ -305,6 +305,46 @@ The 8-stream figure of the same unchanged code has ranged from 199 to 211 tok/s 
 budget was idle during the bench (no releases on ranks 1-3), so the 1.3 row is read as run-to-run spread; a cost of a
 few percent at 8 streams cannot be excluded from one run.
 
+## production-1.4: real attention heads on SM12x, and a YOCO-style prefill cut (2026-09-24)
+
+**Decode.** Up to 64 query tokens (every verify step up to 10 streams) SGLang pads each rank's 16 attention heads to
+64 before the sparse decode kernel, because datacenter FlashMLA only has 64- and 128-head builds. On SM12x the call goes
+to FlashInfer's `decode_dsv4`, which is built for 8, 16, 32, 64 and 128 heads, so the pad quadrupled the work: a
+48-token verify step spent 9.6 ms in the attention kernel, a 96-token one (already unpadded, on the prefill kernel)
+5.0 ms. `SPARK_SM120_REAL_HEADS=1` keeps the real heads (`overlay/sm120_prefill_pages.py`). A first attempt that moved
+SGLang's decode/prefill kernel switch instead crashed graph capture: FlashInfer's paged prefill kernel refuses 64 tokens
+or fewer and routes them to `decode_dsv4`, which needs caller scratch the prefill wrapper does not pass.
+
+| attention kernel per verify step (rank 0) | 1 stream (6 tokens) | 8 streams (48) | 16 streams (96) |
+|---|---|---|---|
+| padded to 64 heads | 2.16 ms | 9.58 | 5.03 |
+| real heads | 1.61 | **3.39** | 4.17 |
+
+**Prefill.** V4.1 builds its long-range KV only at the kv_source layers (2, 8, 14, 20); SGLang's decoder SWA bounded
+replay runs the later 22 layers on each chunk's last 128 tokens only. Decode reads those layers' window KV for the
+prompt's last 128 positions alone, so for every chunk that ends before them the tail pass is unread work: timed at 80 ms
+of a 550-580 ms 2,048-token chunk (14 %). `SPARK_LATE_TAIL_SKIP=1` (`overlay/late_tail.py`) runs one token through the
+late layers on such chunks and leaves every chunk that holds one of the last 128 positions exactly as SGLang runs it.
+The late section fell to 32-38 ms per chunk (a one-token pass through 22 layers is launch- and collective-bound in
+eager mode), the chunk to 523-529 ms.
+
+| | production-1.3 | production-1.4 |
+|---|---|---|
+| 32K / 128K needle, time to first token | 9.1 / 52.2 s | 8.8 / 45.9 s |
+| 12 unique 48K-token prompts with 8 decode streams (stress) | 174 s | 167 s |
+| aggregate at 1 / 8 / 16 streams (tok/s) | 57.2 / 199.0 / 328.3 | 55.8 / **220.3** / 331.3 |
+
+The single-stream figure is within the week's spread (54-59 tok/s); the real-heads kernel measured 20 % faster at one
+stream in the timer run.
+
+**Outputs.** Greedy answers are not identical to 1.3's: the 16-head kernel orders its floating-point work differently
+from the 64-head one, and the prefill cut changes which prompt positions DSpark's draft sees, which changes the verify
+batches. The divergent answers were checked by hand: the same facts in different words. All eight long prompts (4K-47K
+tokens, including final chunks of 4 and 59 tokens) answered the fact buried in them correctly, both needles passed, and
+the stress run had no failures and no driver out-of-memory event. A cross-boot comparison turned out to be a poor
+identity test: a boot with only the prefill cut, which cannot touch single-chunk prompts, still changed one of twelve
+short answers against the production boot.
+
 ## Bring-up
 
 Seven boots of this stack, in order. The first three were fix-one-thing boots and no benchmark numbers were kept for

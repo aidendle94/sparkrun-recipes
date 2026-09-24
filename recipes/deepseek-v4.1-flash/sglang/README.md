@@ -3,7 +3,7 @@
 This repository serves the [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
 checkpoint on four NVIDIA DGX Spark nodes with SGLang, behind one OpenAI-compatible endpoint. The engine is the
 SGLang team's own DeepSeek-V4.1 image, `lmsysorg/sglang:dev-dsv41`, unmodified. On top of it sits an MIT-licensed
-overlay of eleven Python import hooks and one C library that supply what a Spark needs and the stock image does
+overlay of twelve Python import hooks and one C library that supply what a Spark needs and the stock image does
 not have: the model's Engram tables read from node-local NVMe inside the CUDA graph (they do not fit next to the
 weights in 128 GB of unified memory), kernels and schedules that work on the GB10's SM12x architecture, and RDMA
 collectives that make a four-node tensor-parallel decode step fast. Nothing model-specific is forked; the same
@@ -61,7 +61,7 @@ says otherwise.
 
 ```bash
 # 1. The image, on every node (arm64). Pull the published build...
-docker pull aidendle94/sparkrun-sglang-dsv41-gb10:production-1.3
+docker pull aidendle94/sparkrun-sglang-dsv41-gb10:production-1.4
 #    ...or build it on each node from this repository, then put IMAGE=sglang-dsv41-spark:local in launch/fleet.env
 #    so the launcher, relaunch.sh and the watchdog all use it.
 docker build -t sglang-dsv41-spark:local .
@@ -79,7 +79,7 @@ python3 tools/engram_local.py /path/to/snapshot ~/dsv41-engram-local 1:<lo>:<hi>
 #    Optional CPU check, on a node that now has a row copy: the hooks bind to this image's SGLang (no GPU).
 #    It must end with HOOKS CPU TEST PASS.
 docker run --rm -v ~/dsv41-engram-local:/engram-local:ro -e SPARK_ENGRAM_DIR=/engram-local \
-  --entrypoint python3 aidendle94/sparkrun-sglang-dsv41-gb10:production-1.3 /opt/dsv41-spark/tests/test_hooks_cpu.py
+  --entrypoint python3 aidendle94/sparkrun-sglang-dsv41-gb10:production-1.4 /opt/dsv41-spark/tests/test_hooks_cpu.py
 
 # 5. Print the four docker run commands without starting anything. This already needs ssh to every rank:
 #    the RoCE-v2 GID index is probed on each node.
@@ -151,6 +151,7 @@ and the image runs stock SGLang.
 | `overlay/roce_collectives.py` | `sglang.srt.distributed.parallel_state` and `model_runner` | Gives the tensor-parallel group a one-shot RDMA runtime (b12x, Apache-2.0, vendored): each small all-reduce or all-gather is one RDMA write per peer, replayable in CUDA graphs. Tensors above 1 MB (16 MB per all-gather shard) and every other group stay on NCCL. A health check after every forward turns a stalled peer into an error instead of a hang. | A decode step issues about eighty all-reduces of 48–400 KB; as NCCL kernels each costs about 100 µs in graph replay on this fabric, as an RDMA write about 21 µs. |
 | `overlay/served_aliases.py` | `sglang.srt.entrypoints.http_server` | Lists the names in `SPARK_SERVED_ALIASES` on `/v1/models` and answers `/v1/models/{id}` for them. | SGLang serves exactly one model name; clients that ask for another id get a 404 from the listing endpoints. |
 | `overlay/page_cache_release.py` | `sglang.srt.model_executor.model_runner` | Right after each model runner has allocated its KV pool, drops the checkpoint files from the page cache (`posix_fadvise(DONTNEED)`, no privileges). | Every rank reads the checkpoint at boot and never again, but the kernel kept 12–17 GB of it cached per node. On a Spark the GPU driver allocates from the same memory and fails instead of evicting cache; when such a failure hit cuBLAS, a rank died mid-prefill and the fleet hung (twice, see `docs/results.md`). |
+| `overlay/late_tail.py` | `sglang.srt.managers.scheduler`, the V4 attention backend | With `SPARK_LATE_TAIL_SKIP=1` (production profile) the layers after the last kv_source layer run on one token for prefill chunks that end before the prompt's last 128 tokens; chunks holding any of those run exactly as SGLang runs them. | V4.1 caches its long-range KV only at layers 2, 8, 14 and 20 (YOCO-style); decode reads the later layers' window state only for the last 128 prompt positions, so their pass over earlier chunks was 14 % of every chunk and unread. |
 | `overlay/request_guard.py` | `sglang.srt.managers.tokenizer_manager` | Answers a request for prompt-token log-probabilities (for example `/v1/completions` with `echo` and `logprobs`) with HTTP 400. | Under V4.1's decoder sliding-window bounded replay such a request raises inside the model and stops the whole server. |
 | `overlay/step_timers.py` | `sglang.srt.models.deepseek_v4`, `deepseek_v2`, `layers.engram`, the V4 attention backend | Off unless `SPARK_STEP_TIMERS` is set: capture-safe CUDA events around attention, MoE and Engram inside the decode graphs (mode 1), or the GPU-timeline gaps between graphs without any synchronisation (mode 2). | Diagnosis only; this is how the decode-step breakdown in `docs/results.md` was measured. |
 
@@ -169,6 +170,7 @@ Environment variables the hooks read (all prefixed `SPARK_`; the launcher sets t
 | `SPARK_ENGRAM_EARLY_VERIFY` | 0 | on eager steps also gather inline and compare byte for byte (diagnosis) |
 | `SPARK_ENGRAM_MODE` | `hostnode` | `staged` selects the pure-Python staged implementation (below) |
 | `SPARK_MXFP8_BACKEND` | `b12x` | FlashInfer MXFP8 backend for the dense projections; `cutlass` or empty = stock |
+| `SPARK_LATE_TAIL_SKIP`, `SPARK_SM120_REAL_HEADS` | 0, 0 (1, 1 in `launch/production.sh`) | the prefill tail cut (`late_tail.py`) and decode attention on the rank's real 16 heads instead of padded to 64 (`sm120_prefill_pages.py`) |
 | `SPARK_PAGE_CACHE_RELEASE` | 1 | drop the checkpoint's page cache after the KV pool is allocated (0 = keep it) |
 | `SPARK_PREFILL_FLUSH_TOKENS` | 8,192 | longest sequence that triggers the allocator flush after a prefill chunk (0 = off) |
 | `SPARK_ROCE_AR`, `SPARK_ROCE_AR_MAX` | 0, 1MB | RDMA all-reduce route on/off, largest tensor routed (the launcher turns it on) |
@@ -219,6 +221,7 @@ overlay/mxfp8_kernel.py       FlashInfer MXFP8 backend selection with per-shape 
 overlay/indexer_schedule.py   DeepGEMM plan for the ratio-1/2 indexers on SM120 (hook)
 overlay/sm120_prefill_pages.py  64-token pages for the ratio-2 KV source in the sparse prefill (hook)
 overlay/prefill_flush.py      allocator flush after long prefill chunks (hook)
+overlay/late_tail.py          prefill: late layers only where decode reads them; prefill timers (hook)
 overlay/page_cache_release.py drops the checkpoint's page cache once the KV pool is allocated (hook)
 overlay/roce_collectives.py   one-shot RDMA collectives for the TP group + fail-stop health check (hook)
 overlay/served_aliases.py     extra model ids on /v1/models (hook)

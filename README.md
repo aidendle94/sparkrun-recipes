@@ -6,7 +6,7 @@ and the measured numbers. Everything here is MIT; third-party material is listed
 
 | recipe | status | image | headline |
 |---|---|---|---|
-| [`deepseek-v4.1-flash/sglang`](recipes/deepseek-v4.1-flash/sglang/) | production | `aidendle94/sparkrun-sglang-dsv41-gb10:production-1.3` | prefill 3,308 tok/s at 32K, decode 110 / 94 / 37 tok/s, 337 tok/s at 16 streams, 524K context |
+| [`deepseek-v4.1-flash/sglang`](recipes/deepseek-v4.1-flash/sglang/) | production | `aidendle94/sparkrun-sglang-dsv41-gb10:production-1.4` | 128K prompt in 46 s, 220 / 331 tok/s at 8 / 16 streams, 524K context |
 | [`deepseek-v4.1-flash/vllm`](recipes/deepseek-v4.1-flash/vllm/) | pending port | `aidendle94/sparkrun-vllm-dsv41-gb10:production-1.2` | DCP4, RoCE collectives, 3.42M-token KV pool at 500K |
 | [`glm-5.3-flash/vllm`](recipes/glm-5.3-flash/vllm/) | pending port | `aidendle94/sparkrun-vllm-glm53-gb10:production-1.2` | FP8, DFlash2, 90 tok/s structured output |
 | [`deepseek-v4-flash/vllm`](recipes/deepseek-v4-flash/vllm/) | pending port | `aidendle94/sparkrun-vllm-ds4-gb10:production-3.76.1` / `:production-3.73-vision` | DSpark, prefix caching, vision profile |

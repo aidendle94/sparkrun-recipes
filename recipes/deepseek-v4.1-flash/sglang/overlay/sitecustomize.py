@@ -53,14 +53,15 @@ HOOKS: dict[str, list[tuple[str, str]]] = {
     "sglang.srt.model_executor.model_runner": [
         ("prefill_flush", "install"),
         ("page_cache_release", "install"),
+        ("late_tail", "install_runner"),
         ("roce_collectives", "install_health"),
     ] + ([("engram_staged", "install_runner")] if _ENGRAM_STAGED else []),
     "sglang.srt.distributed.parallel_state": [("roce_collectives", "install")],
-    "sglang.srt.managers.scheduler": [("engram_prefetch", "install")],
+    "sglang.srt.managers.scheduler": [("engram_prefetch", "install"), ("late_tail", "install_scheduler")],
     "sglang.srt.entrypoints.http_server": [("served_aliases", "install")],
     "sglang.srt.managers.tokenizer_manager": [("request_guard", "install")],
-    "sglang.srt.models.deepseek_v4": [("step_timers", "install_v4")],
-    "sglang.srt.layers.attention.deepseek_v4_backend": [("step_timers", "install_attn_backend")],
+    "sglang.srt.models.deepseek_v4": [("step_timers", "install_v4"), ("sm120_prefill_pages", "install_real_heads")],
+    "sglang.srt.layers.attention.deepseek_v4_backend": [("step_timers", "install_attn_backend"), ("late_tail", "install_backend")],
     "sglang.srt.models.deepseek_v2": [("step_timers", "install_v2")],
 }
 
