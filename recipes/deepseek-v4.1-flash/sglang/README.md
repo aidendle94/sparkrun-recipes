@@ -61,7 +61,7 @@ says otherwise.
 
 ```bash
 # 1. The image, on every node (arm64). Pull the published build...
-docker pull aidendle94/sparkrun-sglang-dsv41-gb10:production-1.4
+docker pull aidendle94/sparkrun-sglang-dsv41-gb10:production-1.5
 #    ...or build it on each node from this repository, then put IMAGE=sglang-dsv41-spark:local in launch/fleet.env
 #    so the launcher, relaunch.sh and the watchdog all use it.
 docker build -t sglang-dsv41-spark:local .
@@ -79,7 +79,7 @@ python3 tools/engram_local.py /path/to/snapshot ~/dsv41-engram-local 1:<lo>:<hi>
 #    Optional CPU check, on a node that now has a row copy: the hooks bind to this image's SGLang (no GPU).
 #    It must end with HOOKS CPU TEST PASS.
 docker run --rm -v ~/dsv41-engram-local:/engram-local:ro -e SPARK_ENGRAM_DIR=/engram-local \
-  --entrypoint python3 aidendle94/sparkrun-sglang-dsv41-gb10:production-1.4 /opt/dsv41-spark/tests/test_hooks_cpu.py
+  --entrypoint python3 aidendle94/sparkrun-sglang-dsv41-gb10:production-1.5 /opt/dsv41-spark/tests/test_hooks_cpu.py
 
 # 5. Print the four docker run commands without starting anything. This already needs ssh to every rank:
 #    the RoCE-v2 GID index is probed on each node.
@@ -170,7 +170,8 @@ Environment variables the hooks read (all prefixed `SPARK_`; the launcher sets t
 | `SPARK_ENGRAM_EARLY_VERIFY` | 0 | on eager steps also gather inline and compare byte for byte (diagnosis) |
 | `SPARK_ENGRAM_MODE` | `hostnode` | `staged` selects the pure-Python staged implementation (below) |
 | `SPARK_MXFP8_BACKEND` | `b12x` | FlashInfer MXFP8 backend for the dense projections; `cutlass` or empty = stock |
-| `SPARK_LATE_TAIL_SKIP`, `SPARK_SM120_REAL_HEADS` | 0, 0 (1, 1 in `launch/production.sh`) | the prefill tail cut (`late_tail.py`) and decode attention on the rank's real 16 heads instead of padded to 64 (`sm120_prefill_pages.py`) |
+| `SPARK_LATE_TAIL_SKIP`, `SPARK_LATE_TAIL_SKIP_ALL`, `SPARK_SM120_REAL_HEADS` | 0, 0, 0 (1, 1, 1 in `launch/production.sh`) | prefill: the late layers are skipped on chunks that end before the prompt's last 128 tokens (`late_tail.py`); decode: attention on the rank's real 16 heads instead of padded to 64 (`sm120_prefill_pages.py`) |
+| `SPARK_WO_A_W8A16` | 0 | experimental, not adopted: `wo_a` with exact FP8 weights and BF16 activations (`wo_a_w8a16.py`); measured slower at 8 streams |
 | `SPARK_PAGE_CACHE_RELEASE` | 1 | drop the checkpoint's page cache after the KV pool is allocated (0 = keep it) |
 | `SPARK_PREFILL_FLUSH_TOKENS` | 8,192 | longest sequence that triggers the allocator flush after a prefill chunk (0 = off) |
 | `SPARK_ROCE_AR`, `SPARK_ROCE_AR_MAX` | 0, 1MB | RDMA all-reduce route on/off, largest tensor routed (the launcher turns it on) |
@@ -222,6 +223,7 @@ overlay/indexer_schedule.py   DeepGEMM plan for the ratio-1/2 indexers on SM120 
 overlay/sm120_prefill_pages.py  64-token pages for the ratio-2 KV source in the sparse prefill (hook)
 overlay/prefill_flush.py      allocator flush after long prefill chunks (hook)
 overlay/late_tail.py          prefill: late layers only where decode reads them; prefill timers (hook)
+overlay/wo_a_w8a16.py         W8A16 wo_a Triton kernel with a boot self-check (hook; off, measured and not adopted)
 overlay/page_cache_release.py drops the checkpoint's page cache once the KV pool is allocated (hook)
 overlay/roce_collectives.py   one-shot RDMA collectives for the TP group + fail-stop health check (hook)
 overlay/served_aliases.py     extra model ids on /v1/models (hook)

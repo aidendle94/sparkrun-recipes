@@ -345,6 +345,35 @@ the stress run had no failures and no driver out-of-memory event. A cross-boot c
 identity test: a boot with only the prefill cut, which cannot touch single-chunk prompts, still changed one of twelve
 short answers against the production boot.
 
+## production-1.5: the late layers skipped outright; W8A16 wo_a measured and not adopted (2026-09-24)
+
+**Prefill.** In 1.4 a chunk that ends before the prompt's last 128 tokens still ran the 22 late layers on one token, and
+that pass cost 32-38 ms per chunk: each layer launches its kernels and joins its collectives whatever the token count.
+`SPARK_LATE_TAIL_SKIP_ALL=1` skips them when every request of the chunk is such a chunk (the one tail row then carries
+the last kv_source layer's state into the discarded logits and into DSpark's captured rows for that one position, which
+the draft never attends to). The late section fell to 3.5-4.3 ms per chunk. Checks on the candidate: all eight long
+prompts (4K-47K tokens) answered their buried fact correctly, both needles passed, the stress run had no failures and no
+driver out-of-memory event.
+
+**W8A16 `wo_a`.** Exact FP8 weights with BF16 activations and FP32 accumulation, in a Triton kernel (`overlay/wo_a_w8a16.py`):
+the boot self-check matched the BF16 reference (relative error 0.0000) but timed it slower on every size, and the bench
+agreed where it mattered:
+
+| per layer, warm cache | W8A16 kernel | BF16 bmm |
+|---|---|---|
+| 6 tokens | 40 us | 21 us |
+| 48 tokens | 58 us | 19 us |
+| 96 tokens | 82 us | 39 us |
+| 2,048 tokens | 1,466 us | 592 us |
+
+| aggregate tok/s, 1 / 8 / 16 streams | production-1.4 | with W8A16 |
+|---|---|---|
+| fixed prompt set | 55.8 / 220.3 / 331.3 | 57.6 / 208.3 / 329.5 |
+
+Halving the weight bytes does not pay for decoding them in the kernel on this part; the hook ships off.
+
+Production-1.5 (W8A16 off), salted needles on the serving fleet: 32K in 8.0 s and 128K in 45.0 s to first token (1.4: 8.8 / 45.9 s; 1.3: 9.1 / 52.2 s).
+
 ## Bring-up
 
 Seven boots of this stack, in order. The first three were fix-one-thing boots and no benchmark numbers were kept for

@@ -1,7 +1,7 @@
 #!/bin/bash
 # launch-sgl-dsv41.sh — DeepSeek-V4.1-Flash with SGLang (TP4/EP4) on four DGX Sparks over a switched RoCE fabric.
 # One container per node, host networking, RDMA passthrough. Image: the Dockerfile in this repo on lmsysorg/sglang:dev-dsv41
-# (published as aidendle94/sparkrun-sglang-dsv41-gb10:production-1.4; production.sh selects it). Engram rows come from
+# (published as aidendle94/sparkrun-sglang-dsv41-gb10:production-1.5; production.sh selects it). Engram rows come from
 # node-local NVMe (tools/engram_local.py) or, on the node that holds the checkpoint, straight from the shards.
 #   ./launch-sgl-dsv41.sh [--dry-run|--stop]
 # Site facts — nodes, users, home directories, network devices, model paths — come from launch/fleet.env: copy
@@ -15,6 +15,8 @@
 #      ENGRAM_EARLY_VERIFY (0|1: on eager steps also gather inline and compare byte for byte; diagnosis only)
 #      PAGE_CACHE_RELEASE (1|0: drop the checkpoint's page cache after the KV pool is allocated; see overlay/page_cache_release.py)
 #      LATE_TAIL_SKIP (0|1: run the late layers only over the prompt positions decode reads) LATE_TAIL_TIMERS (0|1: time them)
+#      LATE_TAIL_SKIP_ALL (0|1: with LATE_TAIL_SKIP, skip the late layers entirely on chunks no request needs them for)
+#      WO_A_W8A16 (0|1: attention output projection wo_a with exact FP8 weights, BF16 activations; see overlay/wo_a_w8a16.py)
 #      SM120_REAL_HEADS (0|1: decode-sized attention on the rank's 16 real heads instead of padded to 64)
 #      STEP_TIMERS (0|1: per-graph decode-step timing in the log, for diagnosis windows; see overlay/step_timers.py)
 #      STEP_TIMERS_ATTN (0|1: with STEP_TIMERS=1, also split attention into projections, compressor, indexer, kernel, output)
@@ -71,7 +73,7 @@ run_cmd() {  # rank -> the docker run command (single-quoted JSON survives the r
   printf '%s' "mkdir -p $cache; docker run -d --name $NAME --restart no --network host --ipc host --cap-add IPC_LOCK --gpus all \
  --shm-size 32g --memory 112g --memory-swap 112g --ulimit memlock=-1:-1 --ulimit stack=67108864 --device /dev/infiniband:/dev/infiniband --oom-score-adj 500 \
  -v $repo:/models/repo:ro -v $cache:/root/.cache $engram \
- -e SPARK_ENGRAM_EARLY=${ENGRAM_EARLY:-1} -e SPARK_ENGRAM_EARLY_VERIFY=${ENGRAM_EARLY_VERIFY:-0} -e SPARK_PAGE_CACHE_RELEASE=${PAGE_CACHE_RELEASE:-1} -e SPARK_LATE_TAIL_SKIP=${LATE_TAIL_SKIP:-0} -e SPARK_LATE_TAIL_TIMERS=${LATE_TAIL_TIMERS:-0} -e SPARK_SM120_REAL_HEADS=${SM120_REAL_HEADS:-0} -e SPARK_STEP_TIMERS=${STEP_TIMERS:-0} -e SPARK_STEP_TIMERS_ATTN=${STEP_TIMERS_ATTN:-0} -e SPARK_ENGRAM_MODE=${ENGRAM_MODE:-hostnode} -e SPARK_ENGRAM_PREFETCH=${ENGRAM_PREFETCH:-1} -e SPARK_ENGRAM_THREADS=64 -e SPARK_ENGRAM_MAX_IDS=$(( (CHUNK > MAXREQ * 8 ? CHUNK : MAXREQ * 8) * 32 )) -e SPARK_MXFP8_BACKEND=$MXFP8 \
+ -e SPARK_ENGRAM_EARLY=${ENGRAM_EARLY:-1} -e SPARK_ENGRAM_EARLY_VERIFY=${ENGRAM_EARLY_VERIFY:-0} -e SPARK_PAGE_CACHE_RELEASE=${PAGE_CACHE_RELEASE:-1} -e SPARK_LATE_TAIL_SKIP=${LATE_TAIL_SKIP:-0} -e SPARK_LATE_TAIL_SKIP_ALL=${LATE_TAIL_SKIP_ALL:-0} -e SPARK_WO_A_W8A16=${WO_A_W8A16:-0} -e SPARK_LATE_TAIL_TIMERS=${LATE_TAIL_TIMERS:-0} -e SPARK_SM120_REAL_HEADS=${SM120_REAL_HEADS:-0} -e SPARK_STEP_TIMERS=${STEP_TIMERS:-0} -e SPARK_STEP_TIMERS_ATTN=${STEP_TIMERS_ATTN:-0} -e SPARK_ENGRAM_MODE=${ENGRAM_MODE:-hostnode} -e SPARK_ENGRAM_PREFETCH=${ENGRAM_PREFETCH:-1} -e SPARK_ENGRAM_THREADS=64 -e SPARK_ENGRAM_MAX_IDS=$(( (CHUNK > MAXREQ * 8 ? CHUNK : MAXREQ * 8) * 32 )) -e SPARK_MXFP8_BACKEND=$MXFP8 \
  -e SPARK_SERVED_ALIASES=$SERVED_ALIASES -e SPARK_ROCE_AR=$ROCE_AR -e SPARK_ROCE_AR_MAX=$ROCE_AR_MAX -e SPARK_ROCE_AG_MAX=$ROCE_AG_MAX -e B12X_ROCE_HCA=$ROCE_HCA -e B12X_ROCE_GID_INDEX=$gid -e B12X_ROCE_SPIN_LIMIT=$ROCE_SPIN \
  -e SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=0 -e SGLANG_FLASHINFER_MOE_FUSED_FINALIZE=0 -e SGLANG_DSV41_REASONING_EFFORT=100 \
  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e HOST_IP=${NODES[$r]} \

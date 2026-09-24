@@ -2,7 +2,7 @@
 """CPU check that the overlay's import hooks bind to the SGLang modules (run inside the image, no GPU).
 
     docker run --rm -v <engram-dir>:/engram-local:ro -e SPARK_ENGRAM_DIR=/engram-local \
-        --entrypoint python3 aidendle94/sparkrun-sglang-dsv41-gb10:production-1.4 \
+        --entrypoint python3 aidendle94/sparkrun-sglang-dsv41-gb10:production-1.5 \
         /opt/dsv41-spark/tests/test_hooks_cpu.py
 
 The Engram directory only needs its manifest (or SPARK_ENGRAM_ROWS in the environment) and the table

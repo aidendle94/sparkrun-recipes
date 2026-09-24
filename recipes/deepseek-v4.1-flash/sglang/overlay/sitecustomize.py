@@ -60,7 +60,8 @@ HOOKS: dict[str, list[tuple[str, str]]] = {
     "sglang.srt.managers.scheduler": [("engram_prefetch", "install"), ("late_tail", "install_scheduler")],
     "sglang.srt.entrypoints.http_server": [("served_aliases", "install")],
     "sglang.srt.managers.tokenizer_manager": [("request_guard", "install")],
-    "sglang.srt.models.deepseek_v4": [("step_timers", "install_v4"), ("sm120_prefill_pages", "install_real_heads")],
+    "sglang.srt.models.deepseek_v4": [("step_timers", "install_v4"), ("sm120_prefill_pages", "install_real_heads"),
+                                      ("late_tail", "install_model"), ("wo_a_w8a16", "install")],
     "sglang.srt.layers.attention.deepseek_v4_backend": [("step_timers", "install_attn_backend"), ("late_tail", "install_backend")],
     "sglang.srt.models.deepseek_v2": [("step_timers", "install_v2")],
 }

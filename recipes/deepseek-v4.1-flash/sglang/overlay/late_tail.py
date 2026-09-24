@@ -23,6 +23,8 @@ SPARK_LATE_TAIL_TIMERS=1 times each prefill forward and its late-layer section w
 forward, prefill only) and logs the sums every SPARK_STEP_TIMERS_SECONDS (60).
 
   SPARK_LATE_TAIL_SKIP     1 cuts the late layers' tail as above (default 0)
+  SPARK_LATE_TAIL_SKIP_ALL 1 (with SKIP): when every request of a chunk is cut, skip the late layers instead of running
+                           them on one token (their one-token pass costs about 30 ms per chunk in eager mode)
   SPARK_LATE_TAIL_TIMERS   1 logs prefill forward time and late-layer time per chunk (default 0)
 
 MIT License, Copyright (c) 2026 Aiden Le.
@@ -46,6 +48,10 @@ def _skip() -> bool:
     return os.environ.get("SPARK_LATE_TAIL_SKIP", "0") == "1"
 
 
+def _skip_all() -> bool:
+    return os.environ.get("SPARK_LATE_TAIL_SKIP_ALL", "0") == "1"
+
+
 def _timers() -> bool:
     return os.environ.get("SPARK_LATE_TAIL_TIMERS", "0") == "1"
 
@@ -67,10 +73,12 @@ def install_scheduler(module) -> None:
         except Exception:  # noqa: BLE001 - without the record the layout simply stays SGLang's
             info = None
         _TLS.reqs = info
+        _TLS.skip_late = False
         try:
             return stock(self, batch, *args, **kwargs)
         finally:
             _TLS.reqs = None
+            _TLS.skip_late = False
 
     cls.run_batch = run_batch
 
@@ -109,6 +117,9 @@ def install_backend(module) -> None:
                 # value decode reads, stay exactly as stock); a chunk entirely before them runs one token, whose
                 # output nothing reads.
                 tails.append(t if s > need_from else 1)
+            # Every request of the batch is a chunk decode never reads the late layers of: skip them entirely
+            # (install_model); the one tail row per request then carries the last kv_source layer's state.
+            _TLS.skip_late = _skip_all() and all(s <= prompt_len - tail_len for (prompt_len, _), s in zip(info, seq_lens_cpu))
             _STATS["chunks"] += 1
             _STATS["tokens_before"] += sum(default)
             _STATS["tokens_after"] += sum(tails)
@@ -139,6 +150,37 @@ def install_backend(module) -> None:
             return out
 
         cls.enter_late_layer_tail, cls.exit_late_layer_tail = enter_late_layer_tail, exit_late_layer_tail
+
+
+def install_model(module) -> None:
+    """sglang.srt.models.deepseek_v4: with SPARK_LATE_TAIL_SKIP_ALL=1, the target's late layers pass their inputs through
+    when the batch's layout decided that no request needs them (every request is a chunk ending before the prompt's last
+    128 tokens). The late layers are tagged on the target model only; the DSpark draft's layers are never skipped. Each
+    such chunk still has one tail row per request, which now carries the last kv_source layer's state into the final
+    norm, the logits of a chunked request (discarded) and the draft's captured rows for that one position."""
+    if not (_skip() and _skip_all()):
+        return
+    model_cls, layer_cls = module.DeepseekV4Model, module.DeepseekV4DecoderLayer
+    init = model_cls.__init__
+
+    def __init__(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        start = getattr(self, "late_layer_start", None)
+        if start is not None:
+            for layer in self.layers[start:]:
+                layer._spark_late = True
+            logger.info("late layers %d.. skipped for prefill chunks that end before the prompt's last 128 tokens", start)
+
+    model_cls.__init__ = __init__
+    stock = layer_cls.forward_hc_pre_from_prev
+
+    def forward_hc_pre_from_prev(self, *args, **kwargs):
+        if getattr(self, "_spark_late", False) and getattr(_TLS, "skip_late", False):
+            _STATS["skipped_layers"] = _STATS.get("skipped_layers", 0) + 1
+            return kwargs["hidden_states"], kwargs["prev_pre"]
+        return stock(self, *args, **kwargs)
+
+    layer_cls.forward_hc_pre_from_prev = forward_hc_pre_from_prev
 
 
 _T = {"n": 0, "fwd": 0.0, "tail": 0.0, "tokens": 0, "last": time.monotonic()}
@@ -174,10 +216,10 @@ def install_runner(module) -> None:
         now = time.monotonic()
         if now - _T["last"] >= period and _T["n"]:
             logger.info("late tail timers: %d prefill forwards, %d tokens, mean forward %.1f ms, mean late-layer section "
-                        "%.1f ms (%.0f %%); tails cut in %d of %d chunks, late-layer tokens %d -> %d",
+                        "%.1f ms (%.0f %%); tails cut in %d of %d chunks, late-layer tokens %d -> %d, late layer calls skipped %d",
                         _T["n"], _T["tokens"], _T["fwd"] / _T["n"], _T["tail"] / _T["n"],
                         100.0 * _T["tail"] / max(_T["fwd"], 1e-9), _STATS["cut"], _STATS["chunks"],
-                        _STATS["tokens_before"], _STATS["tokens_after"])
+                        _STATS["tokens_before"], _STATS["tokens_after"], _STATS.get("skipped_layers", 0))
             _T.update(n=0, fwd=0.0, tail=0.0, tokens=0, last=now)
         return out
 
