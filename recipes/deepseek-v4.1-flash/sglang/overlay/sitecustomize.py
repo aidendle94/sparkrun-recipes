@@ -52,6 +52,7 @@ HOOKS: dict[str, list[tuple[str, str]]] = {
     "sglang.kernels.ops.attention.flash_mla_sm120": [("sm120_prefill_pages", "install")],
     "sglang.srt.model_executor.model_runner": [
         ("prefill_flush", "install"),
+        ("page_cache_release", "install"),
         ("roce_collectives", "install_health"),
     ] + ([("engram_staged", "install_runner")] if _ENGRAM_STAGED else []),
     "sglang.srt.distributed.parallel_state": [("roce_collectives", "install")],

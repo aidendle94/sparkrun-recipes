@@ -255,6 +255,42 @@ the target's distribution drifts from the one the draft was trained on, did not 
 3.49 on BF16 `wo_a`). The gain (about 3 % single-stream) was judged not worth giving up BF16 numerics in this
 projection, so `wo_a` stays BF16 and the hook is not part of the overlay.
 
+## Rank crashes under long prefills: the page cache (2026-09-24)
+
+Twice (2026-09-22 01:18 and 2026-09-24 05:42) rank 1 died during a burst of long prefills with
+`CUBLAS_STATUS_INTERNAL_ERROR` in the ratio-1/2 compressor's BF16 GEMM, and the other three ranks hung in the next
+collective until the watchdog relaunched the fleet (13 minutes of downtime the second time). Seconds before each crash
+the kernel logged `NVRM: ... Out of memory [NV_ERR_NO_MEMORY] ... _memdescAllocInternal`. The kernel logs showed the
+same driver message dozens to hundreds of times on every node since 09-17, nearly all harmless: PyTorch's allocator
+answers a failed allocation by emptying its cache and retrying, cuBLAS allocating for itself does not.
+
+On a Spark the GPU allocates from the host's 128 GB, and the driver fails an allocation instead of evicting the page
+cache; the kernel reclaims cache only when free memory reaches its watermarks (high = 1.5 GB). The cgroup limit was not
+involved (the containers never reached it; GPU memory is not charged to them). Measured with `mincore`, two files filled
+the free memory, both ours:
+
+- the checkpoint, read once at boot: 15.5 GB of it still cached on rank 0, 16.6 GB on rank 1, 12 GB on rank 3;
+- the Engram rows, read during every prefill and never released: 12-14 GB after twelve 48K-token prompts.
+
+Free memory sat at 2-6 GB on a serving node. Two fixes, both in the overlay: `page_cache_release` drops the checkpoint
+from the page cache right after the KV pool is allocated (MemFree on rank 0 at that point: 5.0 -> 24.7 GB; the pool
+keeps the size the engine chose), and the row store keeps its cached rows under `SPARK_ENGRAM_CACHE_GB` (4 GB by
+default): a thread measures them with `mincore` every 5 s and above the budget unmaps and drops the whole shard (the
+kernel keeps file data in large folios and skips any folio reaching outside a range, so a range-limited drop left pages
+behind in testing).
+
+`bench/long_prefill_stress.py` replays the load (four clients, twelve unique 48K-token prompts, eight decode streams).
+Driver out-of-memory events during the stress, summed over the four ranks, with MemFree at its start and end:
+
+| configuration | driver OOM events | MemFree at start / end of the stress (GB, per rank) |
+|---|---|---|
+| no fix (production-1.2) | 13 | 3.9-13.4 / 3.5-4.9 |
+| checkpoint drop only | 2 | 14.0-15.2 / 3.9-12.3 |
+
+With only the checkpoint dropped the Engram rows still ate 9-11 GB of free memory during the stress; the row budget
+addresses that part. The single-stream decode and the fixed-prompt bench were unchanged (110.5 / 93.3 / 37.0 tok/s;
+57.3 / 207.7 / 333.8 tok/s at 1 / 8 / 16 streams).
+
 ## Bring-up
 
 Seven boots of this stack, in order. The first three were fix-one-thing boots and no benchmark numbers were kept for

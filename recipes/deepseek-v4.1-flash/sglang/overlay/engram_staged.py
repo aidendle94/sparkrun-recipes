@@ -55,6 +55,9 @@ Environment (SPARK_ENGRAM_DIR is the master switch; nothing here runs without it
                               = tokens x hash columns); a larger lookup is an error.
   SPARK_ENGRAM_STATS_SECONDS  period of the per-layer INFO line (default 60, 0 disables):
                               stagings, owned / zeroed rows, mean stage time per step.
+  SPARK_ENGRAM_CACHE_GB       page-cache budget of the row spans per process (default 4; 0 = unbounded): above it
+                              the cached rows are dropped and read from NVMe again when needed (see engram_store).
+  SPARK_ENGRAM_CACHE_SECONDS  how often the budget is checked (default 5).
 
 Ported from the author's vLLM Engram-on-disk implementation, which builds on
 tonyd2wild and Kai's MIT DeepSeek-V4.1-Flash-vLLM-DGX-Spark disk path (Copyright (c)
@@ -63,6 +66,7 @@ Apache-2.0). MIT License, Copyright (c) 2026 Aiden Le.
 """
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import mmap
@@ -322,6 +326,38 @@ class RowStore:
         self.stat_owned = 0
         self.stat_zeroed = 0
         self.stat_seconds = 0.0
+
+    def _spans(self):
+        pg = mmap.PAGESIZE
+        for base, length in ((self.w_base, self.rows * ROW_BYTES), (self.s_base, self.rows * SCALE_BYTES)):
+            lo = base // pg * pg
+            hi = min((base + length + pg - 1) // pg * pg, len(self.mm))
+            if hi > lo:
+                yield lo, hi - lo
+
+    def resident(self) -> int:
+        """Bytes of this rank's row spans in the page cache (mincore through a private mapping of the same file)."""
+        total = 0
+        for off, length in self._spans():
+            addr = _LIBC.mmap(None, length, mmap.PROT_READ, mmap.MAP_SHARED, self.fd, off)
+            if addr in (None, ctypes.c_void_p(-1).value):
+                continue
+            try:
+                vec = ctypes.create_string_buffer(length // mmap.PAGESIZE)
+                if _LIBC.mincore(addr, length, vec) == 0:
+                    total += int((np.frombuffer(vec.raw, dtype=np.uint8) & 1).sum()) * mmap.PAGESIZE
+            finally:
+                _LIBC.munmap(addr, length)
+        return total
+
+    def release(self) -> None:
+        """Drop the shard from this process's mapping, then its page cache. Whole file: the kernel keeps file data in
+        large folios and skips any folio reaching outside a DONTNEED range (engram_rows.c explains more)."""
+        try:
+            self.mm.madvise(mmap.MADV_DONTNEED)
+        except (AttributeError, OSError):
+            pass
+        os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_DONTNEED)
 
     def jobs(self, ids: np.ndarray, w_out: np.ndarray, s_out: np.ndarray):
         """Read jobs for global ids -> rows into w_out [n, 256] / s_out [n, 8]; the
@@ -588,10 +624,36 @@ def _owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
     return out
 
 
+_LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
+_LIBC.mmap.restype = ctypes.c_void_p
+_LIBC.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
+_LIBC.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+_LIBC.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
+_CACHE = {"releases": 0, "peak": 0}
+
+
+def _cache_loop(budget: int, period: float) -> None:
+    """Keep the row spans' page cache under the budget (the reason is in engram_store's docstring)."""
+    while True:
+        time.sleep(period)
+        try:
+            stores = [store for _, store in list(STORES)]
+            resident = sum(store.resident() for store in stores)
+            _CACHE["peak"] = max(_CACHE["peak"], resident)
+            if resident > budget:
+                for store in stores:
+                    store.release()
+                _CACHE["releases"] += 1
+        except Exception as exc:  # noqa: BLE001 - the governor must never take the server down
+            logger.warning("Engram page-cache governor stopped: %s", exc)
+            return
+
+
 def _stats_loop(period: float) -> None:
     last = {}
     while True:
         time.sleep(period)
+        logger.info("Engram page cache: peak %.2f GB since start, %d releases", _CACHE["peak"] / (1 << 30), _CACHE["releases"])
         for layer_id, store in list(STORES):
             prev = last.get(layer_id, (0, 0, 0, 0, 0.0))
             cur = (store.stat_calls, store.stat_inline, store.stat_owned, store.stat_zeroed, store.stat_seconds)
@@ -653,6 +715,12 @@ def install(module) -> None:
         _STATS_THREAD = threading.Thread(target=_stats_loop, args=(float(period),),
                                          daemon=True, name="engram-stats")
         _STATS_THREAD.start()
+    budget = int(float(os.environ.get("SPARK_ENGRAM_CACHE_GB", "4")) * (1 << 30))
+    cache_period = float(os.environ.get("SPARK_ENGRAM_CACHE_SECONDS", "5"))
+    if budget > 0 and cache_period > 0 and not _CACHE.get("started"):
+        _CACHE["started"] = True
+        threading.Thread(target=_cache_loop, args=(budget, cache_period), daemon=True, name="engram-cache").start()
+        logger.info("Engram page-cache budget %.1f GB, checked every %.0f s", budget / (1 << 30), cache_period)
     logger.info("Engram rows from %s: EngramEmbedding reads staged rows by position (threads %d, capacity %d)",
                 engram_dir(), threads(), capacity())
 

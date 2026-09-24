@@ -30,6 +30,10 @@ Environment (SPARK_ENGRAM_DIR is the master switch: nothing here is installed wi
   SPARK_ENGRAM_MAX_IDS        ids one lookup may carry (default 262144); sizes the pinned and device staging.
                               Chunked-prefill tokens times hash columns per layer must fit.
   SPARK_ENGRAM_STATS_SECONDS  interval of the per-layer gather statistics log line (default 60; 0 disables).
+  SPARK_ENGRAM_CACHE_GB       page-cache budget for this rank's row spans (default 4; 0 = unbounded). On a Spark the
+                              cache competes with GPU allocations, which fail instead of evicting it; above the budget
+                              the cached rows are dropped (engram_rows_release) and read from NVMe again when needed.
+  SPARK_ENGRAM_CACHE_SECONDS  how often the budget is checked (default 5).
 
 MIT License, Copyright (c) 2026 Aiden Le.
 """
@@ -59,6 +63,8 @@ ENV_THREADS = "SPARK_ENGRAM_THREADS"
 ENV_MAX_IDS = "SPARK_ENGRAM_MAX_IDS"
 ENV_STATS = "SPARK_ENGRAM_STATS_SECONDS"
 ENV_EARLY_VERIFY = "SPARK_ENGRAM_EARLY_VERIFY"   # 1: on eager steps also gather inline and compare byte for byte
+ENV_CACHE_GB = "SPARK_ENGRAM_CACHE_GB"   # page-cache budget of the row spans per process (GB, default 4; 0 = unbounded)
+ENV_CACHE_SECONDS = "SPARK_ENGRAM_CACHE_SECONDS"   # how often the budget is checked (default 5)
 ENV_EARLY = "SPARK_ENGRAM_EARLY"   # 1 (default): start each layer's host gather on a side stream as soon as the hash ids exist
 
 MANIFEST_NAME = "engram-local.json"
@@ -67,10 +73,12 @@ WEIGHT_DTYPE = "F8_E4M3"
 SCALE_DTYPE = "F8_E8M0"
 ROW_BYTES = 256  # fp8 payload bytes per row: the table dim, fixed by the C library
 SCALE_BYTES = 8  # e8m0 exponents per row: one per 32-value block
-ABI_VERSION = 2
+ABI_VERSION = 3
 DEFAULT_THREADS = 64
 DEFAULT_MAX_IDS = 262144
 DEFAULT_STATS_SECONDS = 60.0
+DEFAULT_CACHE_GB = 4.0
+DEFAULT_CACHE_SECONDS = 5.0
 
 # cudaMemcpyKind values of the CUDA runtime API.
 _MEMCPY_H2D = 1
@@ -114,6 +122,10 @@ def _load_library() -> ctypes.CDLL:
     lib.engram_rows_stats.restype = None
     lib.engram_rows_close.argtypes = [ctypes.c_void_p]
     lib.engram_rows_close.restype = None
+    lib.engram_rows_resident.argtypes = [ctypes.c_void_p]
+    lib.engram_rows_resident.restype = u64
+    lib.engram_rows_release.argtypes = [ctypes.c_void_p]
+    lib.engram_rows_release.restype = None
     version = lib.engram_rows_abi_version()
     if version != ABI_VERSION:
         raise ImportError(f"{path} reports ABI version {version}; this module needs {ABI_VERSION} (rebuild it)")
@@ -484,12 +496,49 @@ class _RowStore:
 _STATS_STARTED = False
 
 
+_CACHE = {"releases": 0, "released_bytes": 0, "peak": 0}
+
+
+def _start_cache_governor() -> None:
+    """Keep the page cache of the row spans under SPARK_ENGRAM_CACHE_GB (see engram_rows_release in the C file).
+
+    Every SPARK_ENGRAM_CACHE_SECONDS the thread asks each store how much of its row spans is cached; above the budget
+    it releases all of them. The next rows a lookup needs are then read from NVMe again (the scheduler-side prefetch
+    re-warms each coming prefill chunk), which costs far less than a rank whose GPU allocation fails.
+    """
+    budget = int(_env_float(ENV_CACHE_GB, DEFAULT_CACHE_GB) * (1 << 30))
+    period = _env_float(ENV_CACHE_SECONDS, DEFAULT_CACHE_SECONDS)
+    if budget <= 0 or period <= 0:
+        logger.info("engram page-cache budget off")
+        return
+
+    def loop() -> None:
+        while True:
+            time.sleep(period)
+            try:
+                stores = list(_ROW_STORES)
+                resident = sum(LIB.engram_rows_resident(st.ptr) for st in stores)
+                _CACHE["peak"] = max(_CACHE["peak"], resident)
+                if resident > budget:
+                    for st in stores:
+                        LIB.engram_rows_release(st.ptr)
+                    _CACHE["releases"] += 1
+                    _CACHE["released_bytes"] += resident
+            except Exception as exc:  # noqa: BLE001 - the governor must never take the server down
+                logger.warning("engram page-cache governor stopped: %s", exc)
+                return
+
+    threading.Thread(target=loop, daemon=True, name="spark-engram-cache").start()
+    logger.info("engram page-cache budget %.1f GB, checked every %.0f s", budget / (1 << 30), period)
+
+
 def _start_stats_thread() -> None:
     """One daemon thread per process logs every store's gather statistics at the configured interval."""
     global _STATS_STARTED
     if _STATS_STARTED:
         return
     _STATS_STARTED = True
+    _start_cache_governor()
     interval = _env_float(ENV_STATS, DEFAULT_STATS_SECONDS)
     if interval <= 0:
         return
@@ -497,6 +546,8 @@ def _start_stats_thread() -> None:
     def loop() -> None:
         while True:
             time.sleep(interval)
+            logger.info("engram page cache: peak %.2f GB since start, %d releases (%.1f GB released)",
+                        _CACHE["peak"] / (1 << 30), _CACHE["releases"], _CACHE["released_bytes"] / (1 << 30))
             for store in list(_ROW_STORES):
                 try:
                     store.log_stats()

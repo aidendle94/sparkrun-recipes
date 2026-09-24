@@ -11,7 +11,7 @@
 // ids gets every read in flight before the copies start. Rows outside [row_lo, row_hi) are
 // written as zeros, which is what the TP all-reduce expects from a rank that does not own them.
 //
-// Worker pool (ABI version 2). Spawning a thread per call cost about 1.3 ms for a decode
+// Worker pool (since ABI version 2; ABI 3 adds engram_rows_resident/engram_rows_release, below). Spawning a thread per call cost about 1.3 ms for a decode
 // lookup of ~80 rows, nearly all of it in pthread_create/join of 64 threads, so the workers are
 // now started once by engram_rows_open and stopped and joined by engram_rows_close; a gather
 // never creates a thread. Dispatch goes through per-worker mailboxes, not through a shared
@@ -326,6 +326,48 @@ uint64_t engram_rows_prefetch(Store *s, const int64_t *ids, uint64_t n) {
   return advise_rows(s, ids, n);
 }
 
+// Page-cache bound (ABI 3). The rows this rank reads stay in the page cache after the gather, and every long prefill
+// adds more (about 24 KB per prompt token per rank, measured). On a Spark that cache sits in the memory the GPU driver
+// allocates from, and the driver fails an allocation rather than wait for the kernel to evict it, so the cache must
+// be kept small by its owner. `resident` reports how many bytes of this rank's two row spans are cached;
+// `release` drops the file's cache: first the process's own page-table entries (a file page that is still mapped
+// cannot be evicted), then the cache. It covers the whole file, not only the spans: the kernel keeps file data in
+// large folios and skips a folio that reaches outside a DONTNEED range, so a span-limited drop can leave pages behind.
+// The file is Engram rows only (a node-local copy, or one of the two Engram shards of the checkpoint), so nothing else
+// is dropped. Both are safe while a gather runs: a row it touches afterwards is simply faulted in again.
+static void owned_spans(const Store *s, uint64_t span[2][2]) {
+  const uint64_t pg = (uint64_t)sysconf(_SC_PAGESIZE);
+  const uint64_t w0 = s->weight_off + s->row_lo * W_BYTES, w1 = s->weight_off + s->row_hi * W_BYTES;
+  const uint64_t s0 = s->scale_off + s->row_lo * S_BYTES, s1 = s->scale_off + s->row_hi * S_BYTES;
+  span[0][0] = w0 / pg * pg; span[0][1] = (w1 + pg - 1) / pg * pg;
+  span[1][0] = s0 / pg * pg; span[1][1] = (s1 + pg - 1) / pg * pg;
+  for (int k = 0; k < 2; k++)
+    if (span[k][1] > s->map_len) span[k][1] = s->map_len;
+}
+
+uint64_t engram_rows_resident(Store *s) {
+  if (!s || !s->map || s->row_hi <= s->row_lo) return 0;
+  const uint64_t pg = (uint64_t)sysconf(_SC_PAGESIZE);
+  uint64_t span[2][2], total = 0;
+  owned_spans(s, span);
+  for (int k = 0; k < 2; k++) {
+    if (span[k][1] <= span[k][0]) continue;
+    const uint64_t len = span[k][1] - span[k][0], npages = len / pg;
+    unsigned char *vec = (unsigned char *)malloc(npages);
+    if (!vec) return 0;
+    if (mincore(s->map + span[k][0], len, vec) == 0)
+      for (uint64_t i = 0; i < npages; i++) total += vec[i] & 1;
+    free(vec);
+  }
+  return total * pg;
+}
+
+void engram_rows_release(Store *s) {
+  if (!s || !s->map || s->map == MAP_FAILED) return;
+  madvise(s->map, s->map_len, MADV_DONTNEED);
+  posix_fadvise(s->fd, 0, 0, POSIX_FADV_DONTNEED);
+}
+
 void engram_rows_stats(Store *s, uint64_t out[4]) {
   out[0] = atomic_load_explicit(&s->calls, memory_order_relaxed);
   out[1] = atomic_load_explicit(&s->rows_owned, memory_order_relaxed);
@@ -333,4 +375,4 @@ void engram_rows_stats(Store *s, uint64_t out[4]) {
   out[3] = atomic_load_explicit(&s->nanos, memory_order_relaxed);
 }
 
-int engram_rows_abi_version(void) { return 2; }
+int engram_rows_abi_version(void) { return 3; }

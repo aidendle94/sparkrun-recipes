@@ -13,6 +13,7 @@
 #      THINKING_DEFAULT (1|0: thinking on unless a request passes "thinking": false; effort max via SGLANG_DSV41_REASONING_EFFORT)
 #      ENGRAM_EARLY (1|0: start the Engram host gathers on a side stream as soon as the hash ids exist)
 #      ENGRAM_EARLY_VERIFY (0|1: on eager steps also gather inline and compare byte for byte; diagnosis only)
+#      PAGE_CACHE_RELEASE (1|0: drop the checkpoint's page cache after the KV pool is allocated; see overlay/page_cache_release.py)
 #      STEP_TIMERS (0|1: per-graph decode-step timing in the log, for diagnosis windows; see overlay/step_timers.py)
 #      STEP_TIMERS_ATTN (0|1: with STEP_TIMERS=1, also split attention into projections, compressor, indexer, kernel, output)
 #      ENGRAM_MODE (hostnode|staged: Engram rows gathered inside the graph by the C store, or staged before each forward
@@ -68,7 +69,7 @@ run_cmd() {  # rank -> the docker run command (single-quoted JSON survives the r
   printf '%s' "mkdir -p $cache; docker run -d --name $NAME --restart no --network host --ipc host --cap-add IPC_LOCK --gpus all \
  --shm-size 32g --memory 112g --memory-swap 112g --ulimit memlock=-1:-1 --ulimit stack=67108864 --device /dev/infiniband:/dev/infiniband --oom-score-adj 500 \
  -v $repo:/models/repo:ro -v $cache:/root/.cache $engram \
- -e SPARK_ENGRAM_EARLY=${ENGRAM_EARLY:-1} -e SPARK_ENGRAM_EARLY_VERIFY=${ENGRAM_EARLY_VERIFY:-0} -e SPARK_STEP_TIMERS=${STEP_TIMERS:-0} -e SPARK_STEP_TIMERS_ATTN=${STEP_TIMERS_ATTN:-0} -e SPARK_ENGRAM_MODE=${ENGRAM_MODE:-hostnode} -e SPARK_ENGRAM_PREFETCH=${ENGRAM_PREFETCH:-1} -e SPARK_ENGRAM_THREADS=64 -e SPARK_ENGRAM_MAX_IDS=$(( (CHUNK > MAXREQ * 8 ? CHUNK : MAXREQ * 8) * 32 )) -e SPARK_MXFP8_BACKEND=$MXFP8 \
+ -e SPARK_ENGRAM_EARLY=${ENGRAM_EARLY:-1} -e SPARK_ENGRAM_EARLY_VERIFY=${ENGRAM_EARLY_VERIFY:-0} -e SPARK_PAGE_CACHE_RELEASE=${PAGE_CACHE_RELEASE:-1} -e SPARK_STEP_TIMERS=${STEP_TIMERS:-0} -e SPARK_STEP_TIMERS_ATTN=${STEP_TIMERS_ATTN:-0} -e SPARK_ENGRAM_MODE=${ENGRAM_MODE:-hostnode} -e SPARK_ENGRAM_PREFETCH=${ENGRAM_PREFETCH:-1} -e SPARK_ENGRAM_THREADS=64 -e SPARK_ENGRAM_MAX_IDS=$(( (CHUNK > MAXREQ * 8 ? CHUNK : MAXREQ * 8) * 32 )) -e SPARK_MXFP8_BACKEND=$MXFP8 \
  -e SPARK_SERVED_ALIASES=$SERVED_ALIASES -e SPARK_ROCE_AR=$ROCE_AR -e SPARK_ROCE_AR_MAX=$ROCE_AR_MAX -e SPARK_ROCE_AG_MAX=$ROCE_AG_MAX -e B12X_ROCE_HCA=$ROCE_HCA -e B12X_ROCE_GID_INDEX=$gid -e B12X_ROCE_SPIN_LIMIT=$ROCE_SPIN \
  -e SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=0 -e SGLANG_FLASHINFER_MOE_FUSED_FINALIZE=0 -e SGLANG_DSV41_REASONING_EFFORT=100 \
  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e HOST_IP=${NODES[$r]} \

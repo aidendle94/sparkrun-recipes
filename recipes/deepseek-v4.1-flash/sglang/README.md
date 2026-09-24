@@ -3,7 +3,7 @@
 This repository serves the [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
 checkpoint on four NVIDIA DGX Spark nodes with SGLang, behind one OpenAI-compatible endpoint. The engine is the
 SGLang team's own DeepSeek-V4.1 image, `lmsysorg/sglang:dev-dsv41`, unmodified. On top of it sits an MIT-licensed
-overlay of ten Python import hooks and one C library that supply what a Spark needs and the stock image does
+overlay of eleven Python import hooks and one C library that supply what a Spark needs and the stock image does
 not have: the model's Engram tables read from node-local NVMe inside the CUDA graph (they do not fit next to the
 weights in 128 GB of unified memory), kernels and schedules that work on the GB10's SM12x architecture, and RDMA
 collectives that make a four-node tensor-parallel decode step fast. Nothing model-specific is forked; the same
@@ -150,6 +150,7 @@ and the image runs stock SGLang.
 | `overlay/prefill_flush.py` | `sglang.srt.model_executor.model_runner` | After a prefill chunk whose longest sequence is at least `SPARK_PREFILL_FLUSH_TOKENS` (8,192), returns PyTorch's cached allocator blocks to the driver. | The indexer's transient buffers grow with the prefix and the caching allocator cannot reuse smaller freed blocks, so reserved memory grows with the square of the prompt. On a Spark that is host memory; a 128K prompt drove all four nodes to zero free. |
 | `overlay/roce_collectives.py` | `sglang.srt.distributed.parallel_state` and `model_runner` | Gives the tensor-parallel group a one-shot RDMA runtime (b12x, Apache-2.0, vendored): each small all-reduce or all-gather is one RDMA write per peer, replayable in CUDA graphs. Tensors above 1 MB (16 MB per all-gather shard) and every other group stay on NCCL. A health check after every forward turns a stalled peer into an error instead of a hang. | A decode step issues about eighty all-reduces of 48–400 KB; as NCCL kernels each costs about 100 µs in graph replay on this fabric, as an RDMA write about 21 µs. |
 | `overlay/served_aliases.py` | `sglang.srt.entrypoints.http_server` | Lists the names in `SPARK_SERVED_ALIASES` on `/v1/models` and answers `/v1/models/{id}` for them. | SGLang serves exactly one model name; clients that ask for another id get a 404 from the listing endpoints. |
+| `overlay/page_cache_release.py` | `sglang.srt.model_executor.model_runner` | Right after each model runner has allocated its KV pool, drops the checkpoint files from the page cache (`posix_fadvise(DONTNEED)`, no privileges). | Every rank reads the checkpoint at boot and never again, but the kernel kept 12–17 GB of it cached per node. On a Spark the GPU driver allocates from the same memory and fails instead of evicting cache; when such a failure hit cuBLAS, a rank died mid-prefill and the fleet hung (twice, see `docs/results.md`). |
 | `overlay/request_guard.py` | `sglang.srt.managers.tokenizer_manager` | Answers a request for prompt-token log-probabilities (for example `/v1/completions` with `echo` and `logprobs`) with HTTP 400. | Under V4.1's decoder sliding-window bounded replay such a request raises inside the model and stops the whole server. |
 | `overlay/step_timers.py` | `sglang.srt.models.deepseek_v4`, `deepseek_v2`, `layers.engram`, the V4 attention backend | Off unless `SPARK_STEP_TIMERS` is set: capture-safe CUDA events around attention, MoE and Engram inside the decode graphs (mode 1), or the GPU-timeline gaps between graphs without any synchronisation (mode 2). | Diagnosis only; this is how the decode-step breakdown in `docs/results.md` was measured. |
 
@@ -162,11 +163,13 @@ Environment variables the hooks read (all prefixed `SPARK_`; the launcher sets t
 | `SPARK_ENGRAM_THREADS` | 64 | gather threads of the row store |
 | `SPARK_ENGRAM_MAX_IDS` | 262,144 | ids one lookup may carry; the launcher derives it from `CHUNK` and `MAXREQ` |
 | `SPARK_ENGRAM_STATS_SECONDS` | 60 | period of the per-layer gather statistics line (0 = off) |
+| `SPARK_ENGRAM_CACHE_GB`, `SPARK_ENGRAM_CACHE_SECONDS` | 4, 5 | page-cache budget of this rank's Engram rows and how often it is checked; above it the rows are dropped and read from NVMe again when needed (0 = unbounded) |
 | `SPARK_ENGRAM_PREFETCH` | 1 | next-chunk row prefetch from the scheduler |
 | `SPARK_ENGRAM_EARLY` | 1 | start each Engram layer's host gather on a side stream as soon as the step's hash ids exist, overlapping the layers before it |
 | `SPARK_ENGRAM_EARLY_VERIFY` | 0 | on eager steps also gather inline and compare byte for byte (diagnosis) |
 | `SPARK_ENGRAM_MODE` | `hostnode` | `staged` selects the pure-Python staged implementation (below) |
 | `SPARK_MXFP8_BACKEND` | `b12x` | FlashInfer MXFP8 backend for the dense projections; `cutlass` or empty = stock |
+| `SPARK_PAGE_CACHE_RELEASE` | 1 | drop the checkpoint's page cache after the KV pool is allocated (0 = keep it) |
 | `SPARK_PREFILL_FLUSH_TOKENS` | 8,192 | longest sequence that triggers the allocator flush after a prefill chunk (0 = off) |
 | `SPARK_ROCE_AR`, `SPARK_ROCE_AR_MAX` | 0, 1MB | RDMA all-reduce route on/off, largest tensor routed (the launcher turns it on) |
 | `SPARK_ROCE_AG`, `SPARK_ROCE_AG_MAX` | 1, 16MB | RDMA all-gather route, largest per-rank shard routed |
@@ -183,6 +186,10 @@ author's vLLM implementation, needs no C library, decodes 8–9 % faster and pre
 
 - Host-memory floor. With 2,048-token prefill chunks every node kept 11–14 GiB free through a 128K prefill; with
   1,024-token chunks 16–20 GiB. Larger chunks are untested. The floor is what your OOM guard has to live with.
+- Page cache is not free memory for the GPU. The driver fails an allocation rather than evict cached file data, and
+  the kernel only reclaims cache when free memory is down to its watermarks (about 1.5 GB by default). The overlay
+  keeps its own files out of the way (`page_cache_release`, `SPARK_ENGRAM_CACHE_GB`); anything else on the node that
+  reads large files while the engine serves eats into the same headroom. Watch `MemFree`, not `MemAvailable`.
 - The RoCE runtime is fail-stop. A stalled peer poisons it, the health check after the next forward raises, the engine
   dies, and the watchdog relaunches the fleet. That is the intended behaviour; there is no in-place recovery.
 - The base tag `lmsysorg/sglang:dev-dsv41` is a moving tag, and upstream's newer `dsv4.1` branch removed the
@@ -212,6 +219,7 @@ overlay/mxfp8_kernel.py       FlashInfer MXFP8 backend selection with per-shape 
 overlay/indexer_schedule.py   DeepGEMM plan for the ratio-1/2 indexers on SM120 (hook)
 overlay/sm120_prefill_pages.py  64-token pages for the ratio-2 KV source in the sparse prefill (hook)
 overlay/prefill_flush.py      allocator flush after long prefill chunks (hook)
+overlay/page_cache_release.py drops the checkpoint's page cache once the KV pool is allocated (hook)
 overlay/roce_collectives.py   one-shot RDMA collectives for the TP group + fail-stop health check (hook)
 overlay/served_aliases.py     extra model ids on /v1/models (hook)
 overlay/request_guard.py      rejects prompt-logprob requests that would stop the server under bounded replay (hook)
@@ -229,6 +237,7 @@ tests/test_hooks_cpu.py       CPU check, inside the image, that every hook binds
 ../../../bench/needle.py      (shared) long-context needle: prefill tok/s from time to first token, answer checked
 ../../../bench/prefill_repetitive.py  (shared) the same on repetitive filler (the input behind most published prefill numbers)
 ../../../bench/decode_bench.py  (shared) single-stream decode: counting / code / prose, best of N runs
+../../../bench/long_prefill_stress.py  (shared) long unique prefills back to back with decode streams: the load behind the 2026-09 rank crashes
 vendor/                       b12x wheel and source snapshot (Apache-2.0) used at image build, with checksums
 docs/design.md                why each hook exists and how it works
 docs/results.md               measurements, bring-up history, production boot facts

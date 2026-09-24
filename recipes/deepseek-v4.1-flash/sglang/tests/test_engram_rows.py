@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CPU test of engram_rows.c (ABI 2, persistent worker pool) against numpy on a synthetic sparse shard.
+"""CPU test of engram_rows.c (ABI 3: persistent worker pool, page-cache resident/release) against numpy on a synthetic sparse shard.
 
 Builds a tiny safetensors-like file: header + weight [N,256] fp8 bytes + scale [N,8] bytes,
 punches holes so only rows [lo,hi) exist (a node-local sparse copy), then gathers random ids
@@ -61,6 +61,10 @@ def load_library() -> ctypes.CDLL:
     lib.engram_rows_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)]
     lib.engram_rows_stats.restype = None
     lib.engram_rows_abi_version.restype = ctypes.c_int
+    lib.engram_rows_resident.argtypes = [ctypes.c_void_p]
+    lib.engram_rows_resident.restype = ctypes.c_uint64
+    lib.engram_rows_release.argtypes = [ctypes.c_void_p]
+    lib.engram_rows_release.restype = None
     return lib
 
 
@@ -180,6 +184,24 @@ def test_prefetch(lib, shard, rng) -> None:
     print(f"prefetch: {n} owned rows advised OK")
 
 
+def test_page_cache(lib, shard, rng) -> None:
+    """resident() counts the cached pages of the owned spans; release() drops them and gathers stay correct after."""
+    store = shard.open(lib, 8)
+    lib.engram_rows_release(store)
+    base = lib.engram_rows_resident(store)
+    ids = np.arange(shard.lo, shard.hi, dtype=np.int64)          # every owned row: the whole span gets touched
+    check(lib, store, shard, ids, "all owned rows")
+    warm = lib.engram_rows_resident(store)
+    span = (shard.hi - shard.lo) * 256
+    assert warm >= span * 0.9, f"resident {warm} after touching {span} bytes of rows"
+    lib.engram_rows_release(store)
+    cold = lib.engram_rows_resident(store)
+    assert cold <= max(base, 4096 * 4), f"resident {cold} after release (was {warm})"
+    check(lib, store, shard, rng.integers(0, shard.N, 2000, dtype=np.int64), "after release")
+    lib.engram_rows_close(store)
+    print(f"page cache: resident {base} -> {warm} after gathering every owned row -> {cold} after release; gathers correct OK")
+
+
 def test_zero_workers(lib, shard, rng) -> None:
     before = thread_count()
     store = shard.open(lib, 0)
@@ -257,7 +279,7 @@ def bench(lib, shard, rng, threads: int, count: int = 80, reps: int = 2000) -> N
 def main() -> int:
     lib = load_library()
     abi = lib.engram_rows_abi_version()
-    assert abi == 2, f"expected ABI 2, library reports {abi}"
+    assert abi == 3, f"expected ABI 3, library reports {abi}"
     rng = np.random.default_rng(7)
     tmpdir = tempfile.mkdtemp(prefix="engram_rows_test_")
     try:
@@ -265,6 +287,7 @@ def main() -> int:
         test_basic(lib, shard, rng)
         test_prefetch(lib, shard, rng)
         test_zero_workers(lib, shard, rng)
+        test_page_cache(lib, shard, rng)
         test_stress(lib, shard, rng)
         test_open_close_loop(lib, shard, rng)
         for threads in (0, 8, 64):
