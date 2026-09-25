@@ -10,6 +10,5 @@ export PRODUCTION_IMAGE="aidendle94/sparkrun-sglang-dsv41-gb10:production-1.6"  
 # end before the prompt's last 128 tokens (1.4 ran them on one token, 1.5 skips them); decode-sized attention runs on the
 # rank's real heads, not padded to 64
 export LATE_TAIL_SKIP="${LATE_TAIL_SKIP:-1}" LATE_TAIL_SKIP_ALL="${LATE_TAIL_SKIP_ALL:-1}" SM120_REAL_HEADS="${SM120_REAL_HEADS:-1}"
-# CUDA driver error details in the container log (a refused kernel load on 2026-09-25 left no reason behind)
-export CUDA_LOG="${CUDA_LOG:-1}"
+# CUDA_LOG=1 puts CUDA driver error details in the container log (off by default; turn it on to chase a driver error)
 exec bash "$(dirname "$0")/launch-sgl-dsv41.sh" "$@"

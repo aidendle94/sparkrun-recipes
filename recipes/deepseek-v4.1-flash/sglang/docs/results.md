@@ -388,8 +388,9 @@ follow-ups and bursts of 3-8 parallel article summaries, thinking on, 12 minutes
 reproduce it. Production-1.3 ran 14 hours with the same Engram cache budget without it.
 
 Production-1.6 adds `overlay/kernel_load_guard.py`: a load refused with that error waits for the GPU's queued work and
-is retried (up to 5 times, each refusal logged); anything else is raised as before. The production profile also turns
-on `CUDA_LOG_FILE=stderr`, so a recurrence leaves the driver's reason in the log. The cause stays open.
+is retried (up to 5 times, each refusal logged); anything else is raised as before. `CUDA_LOG=1` in the launcher
+sets `CUDA_LOG_FILE=stderr` so the driver logs its reason; it ran in production for a day and is off by default. The
+cause stays open.
 
 ## Bring-up
 
