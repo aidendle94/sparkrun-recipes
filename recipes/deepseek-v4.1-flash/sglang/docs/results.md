@@ -374,6 +374,23 @@ Halving the weight bytes does not pay for decoding them in the kernel on this pa
 
 Production-1.5 (W8A16 off), salted needles on the serving fleet: 32K in 8.0 s and 128K in 45.0 s to first token (1.4: 8.8 / 45.9 s; 1.3: 9.1 / 52.2 s).
 
+## A refused kernel load, and a guard for it (2026-09-25)
+
+At 00:03:48, 77 minutes into production-1.5, five requests were decoding after a burst of article-sized prompts (a
+news query) when SGLang launched its `assign_req_to_token_pool` Triton kernel with a specialization it had not loaded
+before (`bs_upper = next_power_of_2(batch_size)` is a compile-time constant, and Triton also specializes on pointer
+alignment). The driver refused the load: `Triton Error [CUDA]: operation not permitted`, from `load_binary`. Rank 0's
+scheduler died, ranks 1-3 lost their peer and exited, and the watchdog relaunched the fleet (12 minutes down).
+
+Not the page-cache problem: 12.5 GB were free, no driver out-of-memory line, nothing in the kernel log. It had never
+appeared in any earlier log of this stack. A replay of the load on the same image (a ~90K-token conversation with
+follow-ups and bursts of 3-8 parallel article summaries, thinking on, 12 minutes, `CUDA_LOG_FILE=stderr`) did not
+reproduce it. Production-1.3 ran 14 hours with the same Engram cache budget without it.
+
+Production-1.6 adds `overlay/kernel_load_guard.py`: a load refused with that error waits for the GPU's queued work and
+is retried (up to 5 times, each refusal logged); anything else is raised as before. The production profile also turns
+on `CUDA_LOG_FILE=stderr`, so a recurrence leaves the driver's reason in the log. The cause stays open.
+
 ## Bring-up
 
 Seven boots of this stack, in order. The first three were fix-one-thing boots and no benchmark numbers were kept for

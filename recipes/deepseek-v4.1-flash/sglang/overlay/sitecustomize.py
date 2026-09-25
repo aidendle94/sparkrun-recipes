@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 _ENGRAM_STAGED = os.environ.get("SPARK_ENGRAM_MODE", "hostnode") == "staged"
 _ENGRAM_IMPL = "engram_staged" if _ENGRAM_STAGED else "engram_store"
 HOOKS: dict[str, list[tuple[str, str]]] = {
+    "triton.compiler.compiler": [("kernel_load_guard", "install")],
     "sglang.srt.layers.engram": [(_ENGRAM_IMPL, "install"), ("step_timers", "install_engram")],
     "sglang.srt.layers.quantization.fp8_utils": [("mxfp8_kernel", "install")],
     "sglang.srt.layers.attention.dsv4.metadata": [("indexer_schedule", "install")],

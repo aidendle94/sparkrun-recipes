@@ -2,7 +2,7 @@
 model: deepseek-ai/DeepSeek-V4.1-Flash
 engine: sglang
 engine_base: lmsysorg/sglang@sha256:4a5d132a06a77c8331e15845f2e925adc788b00105097ad55409afa3f4fa4860   # dev-dsv41, 2026-09-11
-image: aidendle94/sparkrun-sglang-dsv41-gb10:production-1.5
+image: aidendle94/sparkrun-sglang-dsv41-gb10:production-1.6
 status: production            # production | validated | experimental | archived
 nodes: 4 x NVIDIA DGX Spark (GB10, 128 GB), switched RoCE fabric, TP4/EP4
 context_length: 524288
