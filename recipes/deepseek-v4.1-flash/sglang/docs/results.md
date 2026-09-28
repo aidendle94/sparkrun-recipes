@@ -504,6 +504,10 @@ Window 33, a 90-minute soak of that build (wide-rc2) on the test port, against p
 
 Extensions fired on 5% of steps and added 7.8 tokens each.
 
+**production-1.7** (2026-09-28 09:27): that image (`aidendle94/sparkrun-sglang-dsv41-gb10:production-1.7`, the same digest
+as wide-rc2) with wide mode as the production profile's default. Live checks after the boot: batched correctness 8/8,
+images 2/2, thinking at effort 100, no error line on any rank; KV pool 5,705,216 tokens.
+
 ## Bring-up
 
 Seven boots of this stack, in order. The first three were fix-one-thing boots and no benchmark numbers were kept for

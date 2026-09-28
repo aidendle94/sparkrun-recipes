@@ -61,7 +61,7 @@ says otherwise.
 
 ```bash
 # 1. The image, on every node (arm64). Pull the published build...
-docker pull aidendle94/sparkrun-sglang-dsv41-gb10:production-1.6
+docker pull aidendle94/sparkrun-sglang-dsv41-gb10:production-1.7
 #    ...or build it on each node from this repository, then put IMAGE=sglang-dsv41-spark:local in launch/fleet.env
 #    so the launcher, relaunch.sh and the watchdog all use it.
 docker build -t sglang-dsv41-spark:local .
@@ -79,7 +79,7 @@ python3 tools/engram_local.py /path/to/snapshot ~/dsv41-engram-local 1:<lo>:<hi>
 #    Optional CPU check, on a node that now has a row copy: the hooks bind to this image's SGLang (no GPU).
 #    It must end with HOOKS CPU TEST PASS.
 docker run --rm -v ~/dsv41-engram-local:/engram-local:ro -e SPARK_ENGRAM_DIR=/engram-local \
-  --entrypoint python3 aidendle94/sparkrun-sglang-dsv41-gb10:production-1.6 /opt/dsv41-spark/tests/test_hooks_cpu.py
+  --entrypoint python3 aidendle94/sparkrun-sglang-dsv41-gb10:production-1.7 /opt/dsv41-spark/tests/test_hooks_cpu.py
 
 # 5. Print the four docker run commands without starting anything. This already needs ssh to every rank:
 #    the RoCE-v2 GID index is probed on each node.
@@ -182,25 +182,25 @@ Environment variables the hooks read (all prefixed `SPARK_`; the launcher sets t
 | `SPARK_SERVED_ALIASES` | empty | extra model ids for `/v1/models` |
 | `SPARK_STEP_TIMERS` | 0 | 1: per-block decode-step timing, sampled every `SPARK_STEP_TIMERS_EVERY` (100) replays; 2: gaps between graphs |
 | `SPARK_STEP_TIMERS_ATTN` | 0 | with mode 1, also split attention into projections, compressor, indexer, kernel and output |
-| `SPARK_LOOKUP_DRAFT`, `SPARK_LOOKUP_MODE` | 0, `replace` | prompt-lookup drafting on/off; `wide` is the mode to use (`replace`/`extend` are the measured-and-rejected variants) |
+| `SPARK_LOOKUP_DRAFT`, `SPARK_LOOKUP_MODE` | 0, `replace` (1, `wide` in `launch/production.sh`) | prompt-lookup drafting on/off; `wide` is the mode to use (`replace`/`extend` are the measured-and-rejected variants) |
 | `SPARK_LOOKUP_EXT_KEY`, `SPARK_LOOKUP_EXT_BUDGET`, `SPARK_LOOKUP_MIN_TOKENS`, `SPARK_LOOKUP_WINDOW` | 8, 20, 2, 0 | tokens that must match before extending; extension tokens per step over the batch; shortest extension; tokens searched back (0 = whole context) |
-| `SPARK_LOOKUP_SYNC_GATE`, `SPARK_LOOKUP_NARROW_SLOTS`, `SPARK_LOOKUP_FUSED_C2` | 0, 0, 0 (1, 1, 1 in the wide profile) | wide-mode step-cost fixes: skip the per-step length copy while no extension is in demand; size graph slots for 6-token rows; production's fused ratio-2 compressor on uniform steps |
+| `SPARK_LOOKUP_SYNC_GATE`, `SPARK_LOOKUP_NARROW_SLOTS`, `SPARK_LOOKUP_FUSED_C2` | 0, 0, 0 (1, 1, 1 in `launch/production.sh`) | wide-mode step-cost fixes: skip the per-step length copy while no extension is in demand; size graph slots for 6-token rows; production's fused ratio-2 compressor on uniform steps |
 
 A second Engram implementation ships alongside: `SPARK_ENGRAM_MODE=staged` (launcher `ENGRAM_MODE=staged`) stages the
 rows before every forward from a pre-forward hook instead of gathering them inside the graph. It is a port of the
 author's vLLM implementation, needs no C library, decodes 8–9 % faster and prefills 14–20 % slower on unique text
 (numbers in `docs/results.md`). The default stays host-node.
 
-## Prompt-lookup wide mode (opt-in)
+## Prompt-lookup wide mode (production since 1.7)
 
-Launch with `SPEC_K=15 LOOKUP_DRAFT=1 LOOKUP_MODE=wide RAGGED_VERIFY_MODE=compact LOOKUP_SYNC_GATE=1
-LOOKUP_NARROW_SLOTS=1 LOOKUP_FUSED_C2=1 IMAGE=aidendle94/sparkrun-sglang-dsv41-gb10:wide-rc2` on top of
-`launch/production.sh` (with the LOOKUP knobs off that image behaves as production-1.6). Soak against the production
-profile on the same cluster (`docs/results.md`, window 33): a 63K-token coding conversation 65.9 -> 74.4 tok/s,
+`launch/production.sh` turns it on: `SPEC_K=15 LOOKUP_DRAFT=1 LOOKUP_MODE=wide RAGGED_VERIFY_MODE=compact
+LOOKUP_SYNC_GATE=1 LOOKUP_NARROW_SLOTS=1 LOOKUP_FUSED_C2=1` (each overridable from the environment; `LOOKUP_DRAFT=0
+SPEC_K=5 RAGGED_VERIFY_MODE=static` gives the 1.6 decode path on the same image). A 90-minute soak against
+production-1.6 on the same cluster (`docs/results.md`, window 33): a 63K-token coding conversation 65.9 -> 74.4 tok/s,
 copy-heavy answers 69.7 -> 85.3, plain chat 53.7 -> 54.2, ten concurrent requests 132.9 -> 161.0; news replay,
-long-prefill stress, needle-style archive codes and batched-correctness checks all passed. It stays opt-in until it
-has run in production. `tests/test_lookup_draft_cpu.py` checks the matcher, the table bookkeeping, the gate and the
-graph layouts on CPU (Triton interpreter), including SGLang's own compact verify-id gather.
+long-prefill stress, archive codes, images and batched-correctness checks all passed. `tests/test_lookup_draft_cpu.py`
+checks the matcher, the table bookkeeping, the gate and the graph layouts on CPU (Triton interpreter), including
+SGLang's own compact verify-id gather.
 
 ## Caveats
 

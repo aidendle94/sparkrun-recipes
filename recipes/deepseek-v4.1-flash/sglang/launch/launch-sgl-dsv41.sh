@@ -1,7 +1,7 @@
 #!/bin/bash
 # launch-sgl-dsv41.sh — DeepSeek-V4.1-Flash with SGLang (TP4/EP4) on four DGX Sparks over a switched RoCE fabric.
 # One container per node, host networking, RDMA passthrough. Image: the Dockerfile in this repo on lmsysorg/sglang:dev-dsv41
-# (published as aidendle94/sparkrun-sglang-dsv41-gb10:production-1.6; production.sh selects it). Engram rows come from
+# (published as aidendle94/sparkrun-sglang-dsv41-gb10:production-1.7; production.sh selects it). Engram rows come from
 # node-local NVMe (tools/engram_local.py) or, on the node that holds the checkpoint, straight from the shards.
 #   ./launch-sgl-dsv41.sh [--dry-run|--stop]
 # Site facts — nodes, users, home directories, network devices, model paths — come from launch/fleet.env: copy

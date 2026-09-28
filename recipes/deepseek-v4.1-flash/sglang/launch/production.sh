@@ -5,10 +5,16 @@
 # profile; use launch/relaunch.sh to restart it by hand so the watchdog is disarmed and re-armed around the boot.
 # MIT License, Copyright (c) 2026 Aiden Le.
 export PORT="${PORT:-8210}"
-export PRODUCTION_IMAGE="aidendle94/sparkrun-sglang-dsv41-gb10:production-1.6"   # used unless IMAGE is set in the environment or fleet.env
+export PRODUCTION_IMAGE="aidendle94/sparkrun-sglang-dsv41-gb10:production-1.7"   # used unless IMAGE is set in the environment or fleet.env
 # production switches (overlay/late_tail.py, overlay/sm120_prefill_pages.py): prefill skips the late layers on chunks that
 # end before the prompt's last 128 tokens (1.4 ran them on one token, 1.5 skips them); decode-sized attention runs on the
 # rank's real heads, not padded to 64
 export LATE_TAIL_SKIP="${LATE_TAIL_SKIP:-1}" LATE_TAIL_SKIP_ALL="${LATE_TAIL_SKIP_ALL:-1}" SM120_REAL_HEADS="${SM120_REAL_HEADS:-1}"
+# 1.7: prompt-lookup wide mode (overlay/lookup_wide.py): DSpark drafts its 5 tokens, rows whose block continues an earlier
+# 8-token match of the context verify up to 10 more tokens of it (16-token verify window, compact ragged verify), plus
+# the step-cost fixes. LOOKUP_DRAFT=0 SPEC_K=5 RAGGED_VERIFY_MODE=static gives the 1.6 decode path on the same image.
+export SPEC_K="${SPEC_K:-15}" LOOKUP_DRAFT="${LOOKUP_DRAFT:-1}" LOOKUP_MODE="${LOOKUP_MODE:-wide}" \
+       RAGGED_VERIFY_MODE="${RAGGED_VERIFY_MODE:-compact}" LOOKUP_SYNC_GATE="${LOOKUP_SYNC_GATE:-1}" \
+       LOOKUP_NARROW_SLOTS="${LOOKUP_NARROW_SLOTS:-1}" LOOKUP_FUSED_C2="${LOOKUP_FUSED_C2:-1}"
 # CUDA_LOG=1 puts CUDA driver error details in the container log (off by default; turn it on to chase a driver error)
 exec bash "$(dirname "$0")/launch-sgl-dsv41.sh" "$@"
