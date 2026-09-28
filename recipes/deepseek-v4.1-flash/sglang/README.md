@@ -154,6 +154,7 @@ and the image runs stock SGLang.
 | `overlay/late_tail.py` | `sglang.srt.managers.scheduler`, the V4 attention backend | With `SPARK_LATE_TAIL_SKIP=1` (production profile) the layers after the last kv_source layer run on one token for prefill chunks that end before the prompt's last 128 tokens; chunks holding any of those run exactly as SGLang runs them. | V4.1 caches its long-range KV only at layers 2, 8, 14 and 20 (YOCO-style); decode reads the later layers' window state only for the last 128 prompt positions, so their pass over earlier chunks was 14 % of every chunk and unread. |
 | `overlay/kernel_load_guard.py` | `triton.compiler.compiler` | Retries a Triton kernel load the CUDA driver refuses with "operation not permitted" (waits for the GPU, up to 5 more attempts, logs each refusal); every other error is raised as before. | A mid-serving load of a new kernel specialization was refused once in production and took the fleet down; the cause is not known yet (`CUDA_LOG=1` in the launcher makes the driver log its reason). A safety net, not a fix. |
 | `overlay/request_guard.py` | `sglang.srt.managers.tokenizer_manager` | Answers a request for prompt-token log-probabilities (for example `/v1/completions` with `echo` and `logprobs`) with HTTP 400. | Under V4.1's decoder sliding-window bounded replay such a request raises inside the model and stops the whole server. |
+| `overlay/lookup_draft.py` + `overlay/lookup_wide.py` | the DSpark draft/worker/planner modules, `ngram_embedding_manager`, `spec_info`, the decode graph runner, `layers.engram`, `dsv41_sparse`, the V4 attention backend | Off unless `SPARK_LOOKUP_DRAFT=1`. Prompt-lookup drafting on top of DSpark: a device table of every request's tokens and a Triton matcher find where the text being written already occurs in the context. In wide mode DSpark still drafts its 5 tokens and, when its block continues an earlier 8-token match, the next up to 10 tokens of that occurrence are appended; only those rows verify the longer block (SGLang's compact ragged verify, graphs captured at 6b, 6b+10, 6b+20 tokens). Sampling stays exact (one-hot draft distributions on lookup tokens). | Answers that quote, restate or edit their input copy long runs of it; DSpark alone takes at most 6 tokens a step there. See "Prompt-lookup wide mode" below. |
 | `overlay/step_timers.py` | `sglang.srt.models.deepseek_v4`, `deepseek_v2`, `layers.engram`, the V4 attention backend | Off unless `SPARK_STEP_TIMERS` is set: capture-safe CUDA events around attention, MoE and Engram inside the decode graphs (mode 1), or the GPU-timeline gaps between graphs without any synchronisation (mode 2). | Diagnosis only; this is how the decode-step breakdown in `docs/results.md` was measured. |
 
 Environment variables the hooks read (all prefixed `SPARK_`; the launcher sets them from its knobs):
@@ -181,11 +182,25 @@ Environment variables the hooks read (all prefixed `SPARK_`; the launcher sets t
 | `SPARK_SERVED_ALIASES` | empty | extra model ids for `/v1/models` |
 | `SPARK_STEP_TIMERS` | 0 | 1: per-block decode-step timing, sampled every `SPARK_STEP_TIMERS_EVERY` (100) replays; 2: gaps between graphs |
 | `SPARK_STEP_TIMERS_ATTN` | 0 | with mode 1, also split attention into projections, compressor, indexer, kernel and output |
+| `SPARK_LOOKUP_DRAFT`, `SPARK_LOOKUP_MODE` | 0, `replace` | prompt-lookup drafting on/off; `wide` is the mode to use (`replace`/`extend` are the measured-and-rejected variants) |
+| `SPARK_LOOKUP_EXT_KEY`, `SPARK_LOOKUP_EXT_BUDGET`, `SPARK_LOOKUP_MIN_TOKENS`, `SPARK_LOOKUP_WINDOW` | 8, 20, 2, 0 | tokens that must match before extending; extension tokens per step over the batch; shortest extension; tokens searched back (0 = whole context) |
+| `SPARK_LOOKUP_SYNC_GATE`, `SPARK_LOOKUP_NARROW_SLOTS`, `SPARK_LOOKUP_FUSED_C2` | 0, 0, 0 (1, 1, 1 in the wide profile) | wide-mode step-cost fixes: skip the per-step length copy while no extension is in demand; size graph slots for 6-token rows; production's fused ratio-2 compressor on uniform steps |
 
 A second Engram implementation ships alongside: `SPARK_ENGRAM_MODE=staged` (launcher `ENGRAM_MODE=staged`) stages the
 rows before every forward from a pre-forward hook instead of gathering them inside the graph. It is a port of the
 author's vLLM implementation, needs no C library, decodes 8–9 % faster and prefills 14–20 % slower on unique text
 (numbers in `docs/results.md`). The default stays host-node.
+
+## Prompt-lookup wide mode (opt-in)
+
+Launch with `SPEC_K=15 LOOKUP_DRAFT=1 LOOKUP_MODE=wide RAGGED_VERIFY_MODE=compact LOOKUP_SYNC_GATE=1
+LOOKUP_NARROW_SLOTS=1 LOOKUP_FUSED_C2=1 IMAGE=aidendle94/sparkrun-sglang-dsv41-gb10:wide-rc2` on top of
+`launch/production.sh` (with the LOOKUP knobs off that image behaves as production-1.6). Soak against the production
+profile on the same cluster (`docs/results.md`, window 33): a 63K-token coding conversation 65.9 -> 74.4 tok/s,
+copy-heavy answers 69.7 -> 85.3, plain chat 53.7 -> 54.2, ten concurrent requests 132.9 -> 161.0; news replay,
+long-prefill stress, needle-style archive codes and batched-correctness checks all passed. It stays opt-in until it
+has run in production. `tests/test_lookup_draft_cpu.py` checks the matcher, the table bookkeeping, the gate and the
+graph layouts on CPU (Triton interpreter), including SGLang's own compact verify-id gather.
 
 ## Caveats
 
@@ -232,6 +247,9 @@ overlay/roce_collectives.py   one-shot RDMA collectives for the TP group + fail-
 overlay/served_aliases.py     extra model ids on /v1/models (hook)
 overlay/request_guard.py      rejects prompt-logprob requests that would stop the server under bounded replay (hook)
 overlay/step_timers.py        per-graph decode-step timing for diagnosis windows (hook, off unless SPARK_STEP_TIMERS=1)
+overlay/lookup_draft.py       prompt-lookup drafting: token table, Triton matcher, proposal builder (hook, off unless SPARK_LOOKUP_DRAFT=1)
+overlay/lookup_wide.py        wide mode: 5-token DSpark draft, per-row compact verify, graph buckets, ragged Engram/token maps (hooks)
+overlay/lookup_index.py       pure-Python reference matcher the CPU test checks the Triton one against
 launch/fleet.env.example      the site file, every line documented; copy to launch/fleet.env (git-ignored)
 launch/launch-sgl-dsv41.sh    the four-node launcher: preflight, GID probe, free-GPU wait, docker run per rank, --dry-run, --stop
 launch/production.sh          the production profile: published image, port 8210
@@ -242,10 +260,13 @@ tools/engram_partition.py     prints each rank's Engram row ranges for a TP size
 tools/engram_local.py         copies one rank's rows to a node-local sparse file and verifies them
 tests/test_engram_rows.py     CPU test of the C library against numpy on a synthetic sparse shard
 tests/test_hooks_cpu.py       CPU check, inside the image, that every hook binds to its SGLang module
+tests/test_lookup_draft_cpu.py CPU test of the lookup drafter (Triton interpreter): matcher, table, gate, layouts, prefetch hash
 ../../../bench/needle.py      (shared) long-context needle: prefill tok/s from time to first token, answer checked
 ../../../bench/prefill_repetitive.py  (shared) the same on repetitive filler (the input behind most published prefill numbers)
 ../../../bench/decode_bench.py  (shared) single-stream decode: counting / code / prose, best of N runs
 ../../../bench/long_prefill_stress.py  (shared) long unique prefills back to back with decode streams: the load behind the 2026-09 rank crashes
+../../../bench/multi_check.py  (shared) batched-decode correctness: the same greedy chats alone and 4 at a time
+../../../bench/vision_check.py  (shared) image requests, including an image inside a chunked long prompt
 vendor/                       b12x wheel and source snapshot (Apache-2.0) used at image build, with checksums
 docs/design.md                why each hook exists and how it works
 docs/results.md               measurements, bring-up history, production boot facts

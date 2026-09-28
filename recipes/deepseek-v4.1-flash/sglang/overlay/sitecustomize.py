@@ -47,7 +47,9 @@ _ENGRAM_STAGED = os.environ.get("SPARK_ENGRAM_MODE", "hostnode") == "staged"
 _ENGRAM_IMPL = "engram_staged" if _ENGRAM_STAGED else "engram_store"
 HOOKS: dict[str, list[tuple[str, str]]] = {
     "triton.compiler.compiler": [("kernel_load_guard", "install")],
-    "sglang.srt.layers.engram": [(_ENGRAM_IMPL, "install"), ("step_timers", "install_engram")],
+    # lookup_wide first: it teaches the stock hasher ragged verify, the Engram store then wraps that forward
+    "sglang.srt.layers.engram": [("lookup_wide", "install_engram"), (_ENGRAM_IMPL, "install"), ("step_timers", "install_engram")],
+    "sglang.srt.layers.attention.dsv4.dsv41_sparse": [("lookup_wide", "install_dsv41_sparse")],
     "sglang.srt.layers.quantization.fp8_utils": [("mxfp8_kernel", "install")],
     "sglang.srt.layers.attention.dsv4.metadata": [("indexer_schedule", "install")],
     "sglang.kernels.ops.attention.flash_mla_sm120": [("sm120_prefill_pages", "install")],
@@ -63,8 +65,15 @@ HOOKS: dict[str, list[tuple[str, str]]] = {
     "sglang.srt.managers.tokenizer_manager": [("request_guard", "install")],
     "sglang.srt.models.deepseek_v4": [("step_timers", "install_v4"), ("sm120_prefill_pages", "install_real_heads"),
                                       ("late_tail", "install_model"), ("wo_a_w8a16", "install")],
-    "sglang.srt.layers.attention.deepseek_v4_backend": [("step_timers", "install_attn_backend"), ("late_tail", "install_backend")],
+    "sglang.srt.layers.attention.deepseek_v4_backend": [("lookup_wide", "install_backend"), ("step_timers", "install_attn_backend"),
+                                                         ("late_tail", "install_backend")],
     "sglang.srt.models.deepseek_v2": [("step_timers", "install_v2")],
+    "sglang.srt.model_executor.model_runner_components.ngram_embedding_manager": [("lookup_draft", "install_manager")],
+    "sglang.srt.speculative.dspark_components.dspark_draft": [("lookup_draft", "install_proposer")],
+    "sglang.srt.speculative.spec_info": [("lookup_wide", "install_spec_info")],
+    "sglang.srt.speculative.dspark_components.dspark_planner": [("lookup_wide", "install_planner")],
+    "sglang.srt.speculative.dspark_components.dspark_worker_v2": [("lookup_wide", "install_worker")],
+    "sglang.srt.model_executor.runner.decode_cuda_graph_runner": [("lookup_wide", "install_graph_runner")],
 }
 
 

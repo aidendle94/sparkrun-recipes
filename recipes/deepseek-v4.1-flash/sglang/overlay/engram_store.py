@@ -780,6 +780,7 @@ def _wrap_hasher(module) -> None:
             multipliers=self.multipliers.detach().to(cpu),
             primes=self.primes.detach().to(cpu),
             offsets=self.offsets.detach().to(cpu),
+            obj=self,                     # image_token_id is set after __init__ (EngramHasher.from_config)
         )
 
     __init__._spark_wrapped = True

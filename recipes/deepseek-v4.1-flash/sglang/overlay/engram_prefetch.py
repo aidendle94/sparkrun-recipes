@@ -36,8 +36,21 @@ def _impl():
 
 
 def _hash_ids(tokens: torch.Tensor, blocked: torch.Tensor) -> torch.Tensor:
+    """Same ids as EngramHasher._torch_hash_ids for a prompt chunk. Image placeholders (prompt ids at or above
+    MM_PAD_SHIFT_VALUE) become the image token and block every older look-back, as in the stock hasher; without a
+    vision tower, ids outside the vocabulary are treated as run starts rather than indexing past the token map."""
     from sglang.srt.layers.engram import compute_engram_hash_ids
+    from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
     h = HASHER
+    image_token_id = getattr(h.get("obj"), "image_token_id", None)
+    if image_token_id is not None:
+        tokens = tokens.masked_fill(tokens >= MM_PAD_SHIFT_VALUE, image_token_id)
+        blocked = (blocked | (tokens == image_token_id)).to(torch.int32).cummax(-1).values.bool()
+    else:
+        vocab = h["token_map"].shape[0]
+        outside = (tokens < 0) | (tokens >= vocab)
+        blocked = (blocked | outside).to(torch.int32).cummax(-1).values.bool()
+        tokens = tokens.masked_fill(outside, 0)
     return compute_engram_hash_ids(tokens, blocked, h["pad_id"], h["token_map"], h["multipliers"],
                                    h["primes"], h["offsets"])
 
@@ -48,6 +61,18 @@ def _prefetch_chunk(ids: list, start: int, n: int, stores: dict, layer_ids: list
     end = min(len(ids), start + n)
     if end <= start:
         return
+    hashes = _chunk_hashes(ids, start, end)  # [T, n_layers, n_hash_cols]
+    for li, layer_id in enumerate(layer_ids):
+        store = stores.get(layer_id)
+        if store is None:
+            continue
+        flat = hashes[:, li, :].reshape(-1).contiguous()
+        arr = flat.numpy()
+        store_mod.prefetch_rows(layer_id, arr)
+
+
+def _chunk_hashes(ids: list, start: int, end: int) -> torch.Tensor:
+    """Hash ids of prompt tokens start..end-1, each with its n-1 predecessors from the same prompt."""
     look = HASHER["ngram"]  # n: token + n-1 predecessors
     cols = []
     blocked_cols = []
@@ -59,14 +84,7 @@ def _prefetch_chunk(ids: list, start: int, n: int, stores: dict, layer_ids: list
         blocked_cols.append(torch.tensor(blk, dtype=torch.bool))
     tokens = torch.stack(cols, dim=-1)
     blocked = torch.stack(blocked_cols, dim=-1)
-    hashes = _hash_ids(tokens, blocked)  # [T, n_layers, n_hash_cols]
-    for li, layer_id in enumerate(layer_ids):
-        store = stores.get(layer_id)
-        if store is None:
-            continue
-        flat = hashes[:, li, :].reshape(-1).contiguous()
-        arr = flat.numpy()
-        store_mod.prefetch_rows(layer_id, arr)
+    return _hash_ids(tokens, blocked)
 
 
 def install(module) -> None:
@@ -75,7 +93,7 @@ def install(module) -> None:
         return
     cls = module.Scheduler
     stock = cls.run_batch
-    state = {"pool": None, "warned": False}
+    state = {"pool": None, "warned": False, "warned_chunk": False}
 
     def run_batch(self, batch, *args, **kwargs):
         try:
@@ -97,7 +115,12 @@ def install(module) -> None:
                 if jobs:
                     def work(jobs=jobs):
                         for ids, start, n in jobs:
-                            _prefetch_chunk(ids, start, n, stores, layer_ids)
+                            try:
+                                _prefetch_chunk(ids, start, n, stores, layer_ids)
+                            except Exception as exc:  # noqa: BLE001 — a missed warm-up only costs latency
+                                if not state["warned_chunk"]:
+                                    state["warned_chunk"] = True
+                                    logger.warning("Engram prefetch skipped a chunk (logged once): %r", exc)
                     threading.Thread(target=work, daemon=True, name="engram-prefetch").start()
         except Exception as exc:  # noqa: BLE001 — prefetch is best effort
             if not state["warned"]:

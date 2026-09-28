@@ -392,6 +392,118 @@ is retried (up to 5 times, each refusal logged); anything else is raised as befo
 sets `CUDA_LOG_FILE=stderr` so the driver logs its reason; it ran in production for a day and is off by default. The
 cause stays open.
 
+## Prompt-lookup drafting: inside DSpark's block (lost), then as a per-row extension (wide mode) (2026-09-27)
+
+Answers that quote, restate or edit their input copy long runs of the context, which a prompt-lookup drafter predicts
+by finding the last few committed tokens earlier in the context. `overlay/lookup_draft.py` (`LOOKUP_DRAFT=1`, off by
+default) keeps a device table of every request's committed tokens and a Triton matcher for the most recent earlier
+occurrence of a 4-token key (checked on CPU against a pure-Python reference, `tests/test_lookup_draft_cpu.py`); drafted
+positions of a sampled row get a one-hot draft distribution, so sampling stays exact.
+
+One window, candidate (1.6 flags + `LOOKUP_DRAFT=1`) against production 1.6 on the same 10 tasks (`lookup_ab.py`: 6
+copy-heavy, 4 free chat):
+
+| | 1.6 | 1.6 + lookup |
+|---|---|---|
+| copy tasks, single stream, greedy | 69.7 tok/s, 4.23 tokens/step | 65.9 tok/s, 3.96 tokens/step |
+| free chat, single stream, greedy | 53.7 tok/s, 3.07 tokens/step | 53.0 tok/s, 3.04 tokens/step |
+| 10 concurrent, greedy | 132.9 tok/s | 125.7 tok/s |
+| json-restate, temperature 0.7 | 5.96 tokens/step | 4.60 tokens/step |
+
+Correctness held (8/8 archive codes to 47K tokens, sampled outputs clean, no crash). The loss is structural: lookup
+took over about a third of the rows, and those rows accepted 3.73 of 5 lookup tokens, but they are exactly the copied
+spans on which DSpark is at its best. DSpark accepts its whole block on 98% of json-restate steps, 59% of code-edit and
+23-31% of the quote tasks, since it drafts from the target's hidden state, which already attends to the copied text.
+The offline estimate (+3% at K=5) credited DSpark with its average acceptance on the steps lookup took, which
+overstated lookup's advantage. Within a 6-token verify window, lookup cannot beat DSpark.
+
+Where it can help is after DSpark's block: when DSpark's 5 tokens match the lookup continuation, verify the lookup's
+next tokens too (a wider verify window on those rows only). That never lowers acceptance and targets the full-block
+steps above; it needs a verify width above 6 (graphs, verify-window allocation, draft KV injection), not attempted yet.
+The teacher-forced top-1 check cannot run against this stack: the request guard refuses prompt-logprob requests.
+
+Extension, measured at a uniform width (window 23): `SPEC_K=15` + `LOOKUP_MODE=extend` keeps DSpark's first 5 tokens
+and fills positions 6-15 with the lookup continuation of DSpark's block, so every step verifies 16 tokens. Extended rows
+(15% of rows) accepted 5.3 tokens beyond DSpark's 5: json-restate 5.96 -> 9.98 tokens/step, code-edit 4.98 -> 6.69.
+But a 16-wide step costs 80-95 ms instead of 57-63, and DSpark's own acceptance drops when it drafts 15 positions
+(chat 2.59 -> 2.09, chat-code 4.88 -> 4.00: its block attention is not causal), so only json-restate got faster
+(99.3 -> 110.6 tok/s); free chat fell to 21-49 tok/s and 10 concurrent to 94.6 (from 132.9). 8/8 archive codes, no crash.
+A worthwhile version needs DSpark kept at 5 tokens and the wide verify only on extended rows (compact ragged verify with
+engine-chosen lengths, extra graph buckets, a draft width split from the verify width); projected +23-31% on
+restate/edit outputs, about +5% on quote tasks, 0 on chat.
+
+Wide mode (`LOOKUP_MODE=wide`, `overlay/lookup_wide.py`; `SPEC_K=15 RAGGED_VERIFY_MODE=compact`) is that version. The
+server keeps a 16-token verify window, so KV reservation, verify graphs, accept and commit stay consistent at width 16;
+DSpark's proposer, folded sampler, draft attention and draft graphs are narrowed back to its trained 5 tokens; the verify
+runs SGLang's compact ragged layout with per-row lengths 6 + extension (supplied by the hook, since the stock planner
+needs a confidence head this checkpoint lacks); the verify graphs are captured at 6b, 6b+10 and 6b+20 tokens so a step
+without extensions costs what it does at width 6; SGLang's Engram hasher and `dsv41_sparse.token_req_indices` get ragged
+support (both assumed one equal block per request, so stock compact mode cannot even capture on V4.1).
+
+The first wide windows were exact for one request but corrupted batches (token salad, early EOS). Seven bisection windows
+narrowed it to compact verify with rows shorter than the 16-token slot and two or more requests; a code-reading sweep
+then found it in the hook itself: SGLang's compact verify-id gather reads row r's anchor at `draft_block_ids[r * gamma]`
+with gamma = the draft width (15), while the narrowed proposer's ids were 5 wide, so every row but the first verified a
+stray anchor. `apply_wide` now returns ids as wide as the drafts; the CPU test runs SGLang's real gather on a two-request
+batch and reproduces the old failure.
+
+Window 31, wide mode against production 1.6, same tasks:
+
+| | 1.6 | wide |
+|---|---|---|
+| code-edit, single stream | 79.3 tok/s (4.98 tokens/step) | 100.3 (8.04), +26% |
+| json-restate, single stream | 99.3 (5.96) | 118.3 (10.78), +19% |
+| rag-quotes / article-quotes | 57.9 / 66.3 | 64.6 / 69.0, +12% / +4% |
+| copy tasks mean / free chat mean | 69.7 / 53.7 | 77.1 (+11%) / 51.8 (-4%) |
+| 10 concurrent, greedy | 132.9 tok/s | 148.9 tok/s, +12% |
+| batched correctness (multi_check.py, 4 concurrent x 2) | 8/8 | 8/8 |
+
+Extended rows (17% of rows) accept 5.1-5.3 tokens beyond DSpark's 5. Plain chat paid 2-3 ms per step.
+
+Three step-cost fixes (window 32, each behind its own switch in `overlay/lookup_wide.py`):
+`LOOKUP_NARROW_SLOTS` captures the compact verify graphs with tokens // 6 request slots instead of min(tokens, 16), so the
+in-graph epilogue no longer scatters and argmaxes 96 full-vocabulary rows for one request; `LOOKUP_FUSED_C2` lets the
+uniform 6b graphs (every row exactly 6, which routing guarantees) use production's fused ratio-2 compressor;
+`LOOKUP_SYNC_GATE` skips the per-step host copy of the verify lengths while the batch has shown no extension demand for
+32 steps (read two steps late, identical on every TP rank). A pre-window review also found that the lookup table's
+prefill writes (scheduler stream) and verify writes (forward stream) were unordered, so ranks could hold different
+tables after a row changed hands and pick different graphs; prefill now waits on the GPU for the last verify write.
+
+| | 1.6 | wide (window 31) | wide + fixes (window 32 C) |
+|---|---|---|---|
+| plain chat mean | 53.7 tok/s | 51.8 | 53.5 |
+| chat step ms (explain / story / compare) | 57.6 / 56.2 / 56.9 | 58.4 / 58.4 / 60.2 | 57.2 / 56.8 / 56.6 |
+| copy tasks mean | 69.7 | 77.1 | 83.7 (+20%) |
+| code-edit / json-restate | 79.3 / 99.3 | 100.3 / 118.3 | 103.6 / 120.9 |
+| 10 concurrent | 132.9 | 148.9 | 153.1 (+15%) |
+
+multi_check 8/8, archive codes 8/8, no crash. The gate alone (boot B, gated vs forced sync on the same boot) made no
+measurable difference; the narrow slots and the fused compressor recovered the chat step. chat-code stays about 6 ms per
+step slower: an extended step costs about 30 ms more at batch size 1, and its 4-token matches often extend code that then
+gets rejected. An offline replay (oracle DSpark) shows an 8-token match cuts chat-code's extension steps from 19% to 3%
+and slightly helps the copy tasks.
+
+A production soak of that build (2026-09-28, stopped after 26 minutes) showed two things. Real traffic (one 132K-token
+conversation) extended 36% of steps for only 2.9 extra tokens each: the 4-token match was too weak. And the Engram
+prefetch thread died on every prompt chunk holding an image: prompt ids of image placeholders (at or above
+MM_PAD_SHIFT_VALUE) indexed past the token map. That bug predates wide mode (the same test crashes it on 1.6); the
+prefetcher now masks them as SGLang's hasher does (CPU test against the hasher) and a failed chunk no longer kills the
+thread. Extensions now need an 8-token match (`SPARK_LOOKUP_EXT_KEY`).
+
+Window 33, a 90-minute soak of that build (wide-rc2) on the test port, against production 1.6:
+
+| | 1.6 | wide-rc2 |
+|---|---|---|
+| 10-turn coding conversation over ~63K tokens of source (`agent_convo`) | 65.9 tok/s | 74.4 (+13%) |
+| copy tasks mean / free chat mean | 69.7 / 53.7 | 85.3 (+22%) / 54.2 |
+| 10 concurrent | 132.9 | 161.0 (+21%) |
+| news replay (12 min, 10 rounds) | | 0 failed |
+| long-prefill stress (12 x 48K unique tokens + 8 decoders) | | 12/12, 8/8 |
+| archive codes to 47K / batched correctness before and after / images (incl. in a 15K prompt) | | 8/8 / 8/8, 8/8 / 2/2 |
+| errors on any rank, prefetch failures, NV_ERR_NO_MEMORY | | 0, 0, 0 |
+
+Extensions fired on 5% of steps and added 7.8 tokens each.
+
 ## Bring-up
 
 Seven boots of this stack, in order. The first three were fix-one-thing boots and no benchmark numbers were kept for

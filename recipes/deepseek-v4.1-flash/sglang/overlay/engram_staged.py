@@ -686,6 +686,7 @@ def _wrap_hasher(hasher_cls) -> None:
             multipliers=self.multipliers.detach().cpu().clone(),
             primes=self.primes.detach().cpu().clone(),
             offsets=self.offsets.detach().cpu().clone(),
+            obj=self,                     # image_token_id is set after __init__ (EngramHasher.from_config)
         )
 
     __init__.__wrapped__ = stock
