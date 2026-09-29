@@ -489,6 +489,45 @@ def check_fused_predicate():
     print("fused ratio-2 predicate: uniform 6b batches only (not ragged, not the stock capture layout, not the draft)")
 
 
+def check_image_placeholders():
+    """A continuation that runs into an image placeholder (prompt ids >= 1,000,000) stops before it, so no placeholder
+    is ever drafted or used as a scatter index into the draft distribution (the 2026-09-29 production-1.7 crash: a
+    sampled request whose lookup continued into a screenshot's placeholders hit a device-side assert)."""
+    gamma, base, V = 15, 5, 300
+    text = list(range(10, 40))                         # 30 tokens of text that the answer will repeat
+    prompt = [5, 6, 7] + text + [1_000_000 + 829] * 12 + list(range(100, 130))
+    width = len(prompt) + 64
+    pool = types.SimpleNamespace(req_to_token=torch.zeros(2, width, dtype=torch.int32))
+    epi = types.SimpleNamespace(draft_tokens_buf=torch.zeros(16 * gamma, dtype=torch.int64))
+    runner = types.SimpleNamespace(decode_cuda_graph_runner=types.SimpleNamespace(capture_num_tokens=BUCKETS))
+    ld._S.__init__()
+    ld._MODE, ld._BASE = "wide", base
+    ld._S.vocab = V
+    ld._S.wide = {"gamma": gamma, "base": base, "epilogue": epi, "runner": runner, "budget": 20, "max_bs": 16}
+    try:
+        req = fake_req("img", 1, prompt)
+        req.extend_range = types.SimpleNamespace(length=len(prompt))
+        ld.write_prefill(fake_batch(pool, [req], [1], [len(prompt)]))
+        # committed so far: the prompt + the first 22 tokens of `text` repeated; anchor = text[22]; DSpark drafts text[23:28]
+        answer = text[:22]
+        ld._S.table[1, len(prompt):len(prompt) + len(answer)] = torch.tensor(answer, dtype=torch.int32)
+        L = len(prompt) + len(answer)
+        batch = fake_batch(pool, [req], [1], [L])
+        drafts = torch.tensor([text[23:28]])
+        logits = torch.randn(1, base, V)
+        prop = DraftProposal(draft_block_ids=torch.tensor([[text[22]] + [0] * (base - 1)]),
+                             draft_block=DraftBlockResult(drafts, logits, torch.zeros(1, dtype=torch.bool), torch.ones(1)))
+        out = ld.apply_wide(prop, batch).draft_block
+        lens = ld._S.layout.verify_lens.tolist()
+        ext = out.draft_tokens[0, base:lens[0] - 1].tolist()
+        assert ext == text[28:30], (ext, lens)          # the two text tokens before the image, then it stops
+        assert int(out.draft_tokens.max()) < V
+        print(f"image placeholders: the continuation stops at the image ({len(ext)} text tokens drafted), "
+              f"sampled one-hot stays inside the vocabulary")
+    finally:
+        ld._MODE, ld._S.wide, ld._S.vocab = "replace", None, None
+
+
 def check_prefetch_hash():
     """engram_prefetch's CPU hash of a prompt chunk equals SGLang's EngramHasher (extend mode), image placeholders
     included (the prefetch thread used to index the token map with the raw placeholder ids and die)."""
@@ -557,6 +596,7 @@ def main():
     check_gate(data)
     check_narrow_slots()
     check_fused_predicate()
+    check_image_placeholders()
     check_prefetch_hash()
     check_sampling_patch()
     print("OK")

@@ -61,7 +61,7 @@ says otherwise.
 
 ```bash
 # 1. The image, on every node (arm64). Pull the published build...
-docker pull aidendle94/sparkrun-sglang-dsv41-gb10:production-1.7
+docker pull aidendle94/sparkrun-sglang-dsv41-gb10:production-1.7.1
 #    ...or build it on each node from this repository, then put IMAGE=sglang-dsv41-spark:local in launch/fleet.env
 #    so the launcher, relaunch.sh and the watchdog all use it.
 docker build -t sglang-dsv41-spark:local .
@@ -79,7 +79,7 @@ python3 tools/engram_local.py /path/to/snapshot ~/dsv41-engram-local 1:<lo>:<hi>
 #    Optional CPU check, on a node that now has a row copy: the hooks bind to this image's SGLang (no GPU).
 #    It must end with HOOKS CPU TEST PASS.
 docker run --rm -v ~/dsv41-engram-local:/engram-local:ro -e SPARK_ENGRAM_DIR=/engram-local \
-  --entrypoint python3 aidendle94/sparkrun-sglang-dsv41-gb10:production-1.7 /opt/dsv41-spark/tests/test_hooks_cpu.py
+  --entrypoint python3 aidendle94/sparkrun-sglang-dsv41-gb10:production-1.7.1 /opt/dsv41-spark/tests/test_hooks_cpu.py
 
 # 5. Print the four docker run commands without starting anything. This already needs ssh to every rank:
 #    the RoCE-v2 GID index is probed on each node.
@@ -153,6 +153,7 @@ and the image runs stock SGLang.
 | `overlay/page_cache_release.py` | `sglang.srt.model_executor.model_runner` | Right after each model runner has allocated its KV pool, drops the checkpoint files from the page cache (`posix_fadvise(DONTNEED)`, no privileges). | Every rank reads the checkpoint at boot and never again, but the kernel kept 12–17 GB of it cached per node. On a Spark the GPU driver allocates from the same memory and fails instead of evicting cache; when such a failure hit cuBLAS, a rank died mid-prefill and the fleet hung (twice, see `docs/results.md`). |
 | `overlay/late_tail.py` | `sglang.srt.managers.scheduler`, the V4 attention backend | With `SPARK_LATE_TAIL_SKIP=1` (production profile) the layers after the last kv_source layer run on one token for prefill chunks that end before the prompt's last 128 tokens; chunks holding any of those run exactly as SGLang runs them. | V4.1 caches its long-range KV only at layers 2, 8, 14 and 20 (YOCO-style); decode reads the later layers' window state only for the last 128 prompt positions, so their pass over earlier chunks was 14 % of every chunk and unread. |
 | `overlay/kernel_load_guard.py` | `triton.compiler.compiler` | Retries a Triton kernel load the CUDA driver refuses with "operation not permitted" (waits for the GPU, up to 5 more attempts, logs each refusal); every other error is raised as before. | A mid-serving load of a new kernel specialization was refused once in production and took the fleet down; the cause is not known yet (`CUDA_LOG=1` in the launcher makes the driver log its reason). A safety net, not a fix. |
+| `overlay/inline_system.py` | `sglang.srt.entrypoints.anthropic.serving` | On `/v1/messages`, system notes a client sends in the middle of the conversation (Claude Code adds one per turn) stay where they were and are folded into the next user message, instead of being hoisted into the system prompt at the top (`SPARK_INLINE_SYSTEM_IN_PLACE`, default 1). | Hoisting changed the prompt at about token 4,400 on every turn, so the prefix cache matched ~4K of a 150K-token Claude Code prompt and each turn re-prefilled the rest (about a minute before the first token). |
 | `overlay/request_guard.py` | `sglang.srt.managers.tokenizer_manager` | Answers a request for prompt-token log-probabilities (for example `/v1/completions` with `echo` and `logprobs`) with HTTP 400. | Under V4.1's decoder sliding-window bounded replay such a request raises inside the model and stops the whole server. |
 | `overlay/lookup_draft.py` + `overlay/lookup_wide.py` | the DSpark draft/worker/planner modules, `ngram_embedding_manager`, `spec_info`, the decode graph runner, `layers.engram`, `dsv41_sparse`, the V4 attention backend | Off unless `SPARK_LOOKUP_DRAFT=1`. Prompt-lookup drafting on top of DSpark: a device table of every request's tokens and a Triton matcher find where the text being written already occurs in the context. In wide mode DSpark still drafts its 5 tokens and, when its block continues an earlier 8-token match, the next up to 10 tokens of that occurrence are appended; only those rows verify the longer block (SGLang's compact ragged verify, graphs captured at 6b, 6b+10, 6b+20 tokens). Sampling stays exact (one-hot draft distributions on lookup tokens). | Answers that quote, restate or edit their input copy long runs of it; DSpark alone takes at most 6 tokens a step there. See "Prompt-lookup wide mode" below. |
 | `overlay/step_timers.py` | `sglang.srt.models.deepseek_v4`, `deepseek_v2`, `layers.engram`, the V4 attention backend | Off unless `SPARK_STEP_TIMERS` is set: capture-safe CUDA events around attention, MoE and Engram inside the decode graphs (mode 1), or the GPU-timeline gaps between graphs without any synchronisation (mode 2). | Diagnosis only; this is how the decode-step breakdown in `docs/results.md` was measured. |
@@ -191,9 +192,9 @@ rows before every forward from a pre-forward hook instead of gathering them insi
 author's vLLM implementation, needs no C library, decodes 8–9 % faster and prefills 14–20 % slower on unique text
 (numbers in `docs/results.md`). The default stays host-node.
 
-## Prompt-lookup wide mode (production since 1.7)
+## Prompt-lookup wide mode (off since 1.7.1, `WIDE=1`)
 
-`launch/production.sh` turns it on: `SPEC_K=15 LOOKUP_DRAFT=1 LOOKUP_MODE=wide RAGGED_VERIFY_MODE=compact
+`WIDE=1 launch/production.sh` turns it on (off by default since 2026-09-29: a lookup continuation ran into image placeholder ids and a device-side assert stopped the fleet; 1.7.1 stops continuations at the first non-token id, and wide mode comes back after a verification window): `SPEC_K=15 LOOKUP_DRAFT=1 LOOKUP_MODE=wide RAGGED_VERIFY_MODE=compact
 LOOKUP_SYNC_GATE=1 LOOKUP_NARROW_SLOTS=1 LOOKUP_FUSED_C2=1` (each overridable from the environment; `LOOKUP_DRAFT=0
 SPEC_K=5 RAGGED_VERIFY_MODE=static` gives the 1.6 decode path on the same image). A 90-minute soak against
 production-1.6 on the same cluster (`docs/results.md`, window 33): a 63K-token coding conversation 65.9 -> 74.4 tok/s,

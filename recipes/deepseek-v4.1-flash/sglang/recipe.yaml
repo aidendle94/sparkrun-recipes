@@ -2,7 +2,7 @@
 model: deepseek-ai/DeepSeek-V4.1-Flash
 engine: sglang
 engine_base: lmsysorg/sglang@sha256:4a5d132a06a77c8331e15845f2e925adc788b00105097ad55409afa3f4fa4860   # dev-dsv41, 2026-09-11
-image: aidendle94/sparkrun-sglang-dsv41-gb10:production-1.7   # prompt-lookup wide mode on by default (1.6 decode path: LOOKUP_DRAFT=0 SPEC_K=5 RAGGED_VERIFY_MODE=static)
+image: aidendle94/sparkrun-sglang-dsv41-gb10:production-1.7.1   # 1.6 decode path + Claude Code prefix caching; prompt-lookup wide mode with WIDE=1 (off until re-verified)
 status: production            # production | validated | experimental | archived
 nodes: 4 x NVIDIA DGX Spark (GB10, 128 GB), switched RoCE fabric, TP4/EP4
 context_length: 524288
@@ -17,7 +17,7 @@ numbers:
   boot_to_healthy_s: 508
 features: [images, tools, thinking, dspark, rdma_collectives, engram_from_nvme]
 blog: https://aidenle.dev/recipes/deepseek-v4-1-flash-sglang-4x-dgx-spark
-wide_lookup_vs_1_6:             # production-1.7's decode path against production-1.6, 90-minute soak, 2026-09-28 (docs/results.md window 33)
+wide_lookup_vs_1_6:             # WIDE=1 (was production-1.7's decode path against production-1.6, 90-minute soak, 2026-09-28 (docs/results.md window 33)
   coding_conversation_63k_tok_s: [65.9, 74.4]
   copy_tasks_tok_s: [69.7, 85.3]
   plain_chat_tok_s: [53.7, 54.2]

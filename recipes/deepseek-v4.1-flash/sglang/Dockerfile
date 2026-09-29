@@ -3,7 +3,7 @@
 # (Engram tables from node-local NVMe inside the CUDA graph, next-chunk prefetch, the b12x MXFP8 kernel, two SM120
 # fixes, an allocator flush, one-shot RDMA collectives, served-model aliases; see README). Build on a Spark (arm64):
 #   cp -r ../../../licenses . && docker build -t sglang-dsv41-spark:local .   # the licence texts live at the repository root
-# The published tag aidendle94/sparkrun-sglang-dsv41-gb10:production-1.7 is this file built on the pinned base.
+# The published tag aidendle94/sparkrun-sglang-dsv41-gb10:production-1.7.1 is this file built on the pinned base.
 # Pinned by digest: dev-dsv41 is a moving tag (docker pull lmsysorg/sglang:dev-dsv41 gave this digest on 2026-09-11).
 ARG BASE=lmsysorg/sglang@sha256:4a5d132a06a77c8331e15845f2e925adc788b00105097ad55409afa3f4fa4860
 FROM ${BASE}

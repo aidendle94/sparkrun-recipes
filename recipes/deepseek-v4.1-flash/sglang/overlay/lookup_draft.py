@@ -63,6 +63,7 @@ _BASE = int(os.environ.get("SPARK_LOOKUP_BASE", "5"))
 # chat and code ("of the", "self.") whose continuation differs, and an extension the verifier rejects still costs the
 # wider verify; 8 tokens keeps the copy spans (long) and drops most of those (window 32 notes in docs/results.md).
 _EXT_KEY = int(os.environ.get("SPARK_LOOKUP_EXT_KEY", "8"))
+_NON_TOKEN = 1_000_000          # SGLang's MM_PAD_SHIFT_VALUE: every id at or above it is a placeholder, not a token
 
 # stats columns: rows proposed, rows replaced by lookup, lookup tokens proposed, accepted drafts in replaced rows,
 # accepted drafts in DSpark rows
@@ -89,6 +90,7 @@ class _State:
         self.gate = {"cold": 0, "hot": 0, "forced": 0, "missed": 0}
         self.uniform = {}                  # (bs, device) -> cached all-6 RaggedVerifyLayout
         self.verify_evt = None             # recorded after each write_verify; write_prefill's stream waits on it
+        self.vocab = None                  # target vocabulary size; lookup continuations stop at the first id outside it
 
 
 _S = _State()
@@ -155,7 +157,12 @@ def lookup_after(table, rows, lens, key, tail, n: int, window: int = 0):
     in_tail = (idx - L[:, None]).clamp(0, t - 1)
     toks = torch.where(idx < L[:, None], toks, tail.to(torch.int64).gather(1, in_tail))
     avail = torch.where(best >= 0, (L + t - follow).clamp(0, n), torch.zeros_like(best))
-    return toks, avail
+    # Prompts carry ids that are not tokens: image placeholders (MM_PAD_SHIFT_VALUE and up) stand in the table where
+    # the image was. A continuation that runs into one ends there; drafted, it would index the embedding and the
+    # draft distribution past the vocabulary (a device-side assert that took production-1.7 down, 2026-09-29).
+    bad = (toks < 0) | (toks >= (_S.vocab or _NON_TOKEN))
+    first_bad = torch.where(bad.any(1), bad.to(torch.int32).argmax(1), torch.full_like(avail, n))
+    return toks, torch.minimum(avail, first_bad)
 
 
 def _committed_tail(table, rows, lens, k: int):

@@ -124,6 +124,7 @@ def install_worker(module) -> None:
 
     def __init__(self, *a, **kw):
         stock_init(self, *a, **kw)
+        ld._S.vocab = int(self.target_worker.model_runner.model_config.vocab_size)
         base = _base()
         if self.gamma <= base:                  # diagnosis only: compact verify at DSpark's own width, no extension
             logger.warning("lookup wide at gamma=%d <= %d: no extension, the draft is not split", self.gamma, base)

@@ -62,6 +62,7 @@ HOOKS: dict[str, list[tuple[str, str]]] = {
     "sglang.srt.distributed.parallel_state": [("roce_collectives", "install")],
     "sglang.srt.managers.scheduler": [("engram_prefetch", "install"), ("late_tail", "install_scheduler")],
     "sglang.srt.entrypoints.http_server": [("served_aliases", "install")],
+    "sglang.srt.entrypoints.anthropic.serving": [("inline_system", "install")],
     "sglang.srt.managers.tokenizer_manager": [("request_guard", "install")],
     "sglang.srt.models.deepseek_v4": [("step_timers", "install_v4"), ("sm120_prefill_pages", "install_real_heads"),
                                       ("late_tail", "install_model"), ("wo_a_w8a16", "install")],

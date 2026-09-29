@@ -508,6 +508,22 @@ Extensions fired on 5% of steps and added 7.8 tokens each.
 as wide-rc2) with wide mode as the production profile's default. Live checks after the boot: batched correctness 8/8,
 images 2/2, thinking at effort 100, no error line on any rank; KV pool 5,705,216 tokens.
 
+Two incidents on 1.7. 2026-09-28 18:18: node n2 reset itself (its journal just stops; no kernel, GPU or thermal line),
+the other ranks stalled and the watchdog relaunched the fleet (18:30). 2026-09-29 02:37: a device-side assert
+(scatter index out of bounds) on every rank during a Claude Code session: a lookup continuation ran into image
+placeholder ids (1,000,000 and up) stored in the token table from a prompt with screenshots, and the sampled one-hot
+patch indexed the draft distribution with one. The soak's image check was greedy and never repeated the text before
+an image. Production went to the same image with lookup drafting off (the 1.6 decode path) at 02:48.
+
+The same session showed why Claude Code waited about a minute per turn: each /v1/messages request was ~158K tokens and
+the prefix cache matched only 4,096 of them. Two consecutive requests (captured with SGLang's runtime request dump)
+first differed at token 4,437: SGLang hoists every inline system message into the system prompt when the chat template
+has no mid-conversation system turn, and Claude Code adds one `<total_tokens>` note per turn.
+
+**production-1.7.1**: `overlay/inline_system.py` folds inline system notes in place (the prompt now only grows at the
+end); lookup continuations stop at the first id outside the vocabulary (CPU regression test reproduces the exact
+out-of-bounds scatter without it); `launch/production.sh` runs the 1.6 decode path unless `WIDE=1`.
+
 ## Bring-up
 
 Seven boots of this stack, in order. The first three were fix-one-thing boots and no benchmark numbers were kept for
