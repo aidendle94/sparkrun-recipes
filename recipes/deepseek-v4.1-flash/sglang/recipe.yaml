@@ -18,7 +18,7 @@ numbers:
   kv_pool_tokens: 6304768                                  # auto-sized at memory fraction 0.80, varies per boot
   boot_to_healthy_s: 542
 features: [images, tools, thinking, dspark, rdma_collectives, engram_from_nvme, prometheus_metrics]
-blog: https://aidenle.dev/recipes/deepseek-v4-1-flash-sglang-4x-dgx-spark
+blog: https://aidenle.com/recipes/deepseek-v4-1-flash-sglang-4x-dgx-spark
 wide_lookup_vs_1_6:             # WIDE=1 on production-1.7.1 only: production-1.7's decode path against production-1.6, 90-minute soak, 2026-09-28 (docs/results.md window 33)
   coding_conversation_63k_tok_s: [65.9, 74.4]
   copy_tasks_tok_s: [69.7, 85.3]
