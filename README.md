@@ -19,4 +19,4 @@ launcher reads a git-ignored `launch/fleet.env` documented by `fleet.env.example
 secrets and private identifiers.
 
 Measured numbers are single boots on the author's fleet with unique-content prompts; the recipe pages say what each
-number is. The blog at https://aidenle.dev/recipes tells the story behind each recipe.
+number is. The blog at https://aidenle.com/recipes tells the story behind each recipe.
