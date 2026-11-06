@@ -1,4 +1,7 @@
-# Third-party artifacts used at image build time
+# Third-party artifacts used at image build time (until production-1.7.1)
+
+Since production-1.8 the image uses the b12x bundled in the base image's FlashInfer 0.7.2 and installs nothing
+from this directory; it is kept as the exact provenance of the production-1.7.1 builds.
 
 Both are unmodified copies of upstream artifacts of b12x (a PyPI release and a GitHub commit archive) (github.com/local-inference-lab/b12x, Apache License 2.0;
 see NOTICE for the other licences inside the snapshot). Verify with `sha256sum -c` against the values below.

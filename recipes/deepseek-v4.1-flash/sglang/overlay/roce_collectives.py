@@ -94,6 +94,25 @@ class _Runtime:
         except Exception as exc:  # noqa: BLE001 — the runtime already coordinated the ranks
             logger.warning("RoCE runtime construction failed: %s", exc)
             return
+        self.plan, self.session, self._kw = None, None, {}
+        if not hasattr(self.rt, "prepare"):
+            # The b12x in FlashInfer runs only published prepared calls: declare one plan for this runtime and publish
+            # it through a preparation session (it compiles the launchers and runs a seed all-reduce per dtype and a
+            # seed all-gather on every rank together); the session lives as long as the runtime.
+            error = None
+            try:
+                self.plan, self.session = _publish_plan(roce, self.rt, device)
+            except Exception as exc:  # noqa: BLE001 — reported through the vote below
+                error = f"{type(exc).__name__}: {exc}"
+            # Every rank must take the same route: one rank on NCCL while the others wait on RDMA hangs the group.
+            votes = [None] * world
+            dist.all_gather_object(votes, error, group=cpu_group)
+            bad = [f"rank {i}: {e}" for i, e in enumerate(votes) if e]
+            if bad:
+                logger.warning("RoCE plan preparation failed, collectives stay on NCCL on every rank: %s", "; ".join(bad))
+                self.close()
+                return
+            self._kw = {"plan": self.plan}
         self._live = {"ar": False, "ag": False}
         if rank == 0:
             logger.info("RoCE collectives on: world=%d hcas=%s all-reduce<=%d B all-gather shard<=%d B gather=%s",
@@ -105,7 +124,7 @@ class _Runtime:
         if not self._live["ar"]:
             self._live["ar"] = True
             logger.info("RoCE all-reduce live: first routed tensor %d B %s", x.numel() * x.element_size(), x.dtype)
-        return self.rt.all_reduce(x)
+        return self.rt.all_reduce(x, **self._kw)
 
     def all_gather(self, x: torch.Tensor, dim: int):
         if self.rt is None or not self.gather or not self.rt.should_all_gather(x, dim):
@@ -113,19 +132,61 @@ class _Runtime:
         if not self._live["ag"]:
             self._live["ag"] = True
             logger.info("RoCE all-gather live: first routed shard %s %s dim %d", tuple(x.shape), x.dtype, dim)
-        return self.rt.all_gather(x, dim=dim)
+        return self.rt.all_gather(x, dim=dim, **self._kw)
 
     def check_health(self):
         if self.rt is not None:
             self.rt.check_health()
 
     def close(self):
+        if self.session is not None:
+            try:
+                self.session.close()
+            finally:
+                self.session = None
         if self.rt is not None:
             self.rt.close()
             self.rt = None
 
 
 _TP: _Runtime | None = None
+
+
+def _publish_plan(roce, rt, device):
+    """Declare and publish the prepared plan the FlashInfer b12x runtime requires on every collective (the pattern of
+    FlashInfer's tests/experimental/b12x/comm/test_roce_oneshot_gpu.py). Returns (plan, open session)."""
+    from b12x.comm.roce import _preparation
+    from b12x.preparation import PreparationSession, PreparedCall
+
+    query = roce.query_from_runtime(
+        rt, surface="AllReduce.all_reduce", call={"dtypes": ("bfloat16", "float32", "float16")},
+        topology="roce_rdma", peer_hosts=tuple(f"rank-{r}" for r in range(rt.world_size)))
+    declaration = roce.plan(query, runtime=rt)
+    seeds = [torch.zeros(16 // dt.itemsize, dtype=dt, device=device) for dt in (torch.float16, torch.bfloat16, torch.float32)]
+
+    def prepare(state):
+        calls = [_preparation.prepared_call(state, inp=seed) for seed in seeds]
+        calls.append(_preparation.prepared_gather_call(state, inp=seeds[1]))
+        return PreparedCall(run=lambda: [call.run() for call in calls])
+
+    session = PreparationSession(device=device, autotune=False, compile_workers=2)
+    try:
+        session.prepare((declaration.request(name="spark_roce", prepare_call=prepare),))
+    except BaseException:
+        session.close()
+        raise
+    return declaration, session
+
+
+def _prepare(rt, dtypes) -> None:
+    """Compile the launchers and allocate the scratch before a CUDA-graph capture (both are refused inside one).
+    b12x 1.3.0 exposed this as `AllReduce.prepare(dtypes)`; the b12x in FlashInfer (>= 0.7.2) does the same work in
+    `_prepare_resources(dtypes, padded_gather=True)`, which is what its own preparation session calls."""
+    prepare = getattr(rt, "prepare", None)
+    if prepare is not None:
+        prepare(dtypes)
+    else:
+        rt._prepare_resources(dtypes, padded_gather=True)
 
 
 def install(module) -> None:
@@ -172,7 +233,7 @@ def install(module) -> None:
         rt = getattr(self, "roce", None)
         with stock_capture(self, graph_capture_context, stream) as ctx:
             if rt is not None and rt.rt is not None:
-                rt.rt.prepare((torch.bfloat16, torch.float16, torch.float32))
+                _prepare(rt.rt, (torch.bfloat16, torch.float16, torch.float32))
                 with rt.rt.capture(stream=ctx.stream):
                     yield ctx
             else:
@@ -204,4 +265,5 @@ def install_health(module) -> None:
             _TP.check_health()
         return out
 
+    forward.__wrapped__ = stock
     cls.forward = forward

@@ -83,11 +83,12 @@ def install_scheduler(module) -> None:
     cls.run_batch = run_batch
 
 
-def _layout(extend_lens_cpu, seq_lens_cpu, tails, device):
-    """late_layer_tail_layout with a tail length per request (same outputs and conventions as SGLang's)."""
+def _layout(extend_lens_cpu, seq_lens_cpu, tails, tail_len, device):
+    """late_layer_tail_layout with a tail length per request (same outputs and conventions as SGLang's: every tail row's
+    window floor is seq_len - tail_len, clamped at 0, whatever the tail's own length)."""
     if len(extend_lens_cpu) == 1:
         n, t, s = extend_lens_cpu[0], tails[0], seq_lens_cpu[0]
-        floor = torch.full((t,), s - t, dtype=torch.int32, device=device)
+        floor = torch.full((t,), max(0, s - tail_len), dtype=torch.int32, device=device)
         return torch.arange(n - t, n, device=device), list(tails), floor
     lens = torch.tensor([list(extend_lens_cpu), list(tails), list(seq_lens_cpu)], device=device)
     extend_lens, tail_lens, seq_lens = lens[0], lens[1], lens[2]
@@ -95,7 +96,7 @@ def _layout(extend_lens_cpu, seq_lens_cpu, tails, device):
     req = torch.repeat_interleave(torch.arange(len(tails), device=device), tail_lens, output_size=total)
     offs = torch.arange(total, device=device) - (torch.cumsum(tail_lens, 0) - tail_lens)[req]
     token_indices = (torch.cumsum(extend_lens, 0) - tail_lens)[req] + offs
-    floor = (seq_lens - tail_lens)[req].to(torch.int32)
+    floor = (seq_lens - tail_len).clamp_min(0)[req].to(torch.int32)
     return token_indices, list(tails), floor
 
 
@@ -104,18 +105,28 @@ def install_backend(module) -> None:
     if _skip():
         stock = module.late_layer_tail_layout
 
-        def late_layer_tail_layout(*, extend_lens_cpu, seq_lens_cpu, tail_len, device):
+        def late_layer_tail_layout(*, extend_lens_cpu, seq_lens_cpu, tail_len, device, **extra):
+            def as_stock():
+                return stock(extend_lens_cpu=extend_lens_cpu, seq_lens_cpu=seq_lens_cpu, tail_len=tail_len,
+                             device=device, **extra)
+
+            # whole_extend marks requests whose every row is read (prompt logprobs, full hidden-state capture): never
+            # cut a batch that has one. Any other keyword is one this hook does not know: leave the batch to SGLang.
+            whole = extra.get("whole_extend")
+            if set(extra) - {"whole_extend"} or (whole is not None and any(whole)):
+                return as_stock()
             info = getattr(_TLS, "reqs", None)
             default = [min(tail_len, n) for n in extend_lens_cpu]
             if (not info or len(info) != len(extend_lens_cpu)
                     or any(e != n for (_, e), n in zip(info, extend_lens_cpu))):
-                return stock(extend_lens_cpu=extend_lens_cpu, seq_lens_cpu=seq_lens_cpu, tail_len=tail_len, device=device)
+                return as_stock()
             tails = []
             for (prompt_len, _), n, s, t in zip(info, extend_lens_cpu, seq_lens_cpu, default):
                 need_from = prompt_len - tail_len          # decode's late windows read positions >= this
                 # A chunk holding any of those positions keeps SGLang's tail untouched (its window floor, and so every
                 # value decode reads, stay exactly as stock); a chunk entirely before them runs one token, whose
-                # output nothing reads.
+                # output nothing reads. The last kv_source layer writes its compressed KV for every row before the
+                # tail starts (write_tail_source_kv), so a cut tail never shortens that write.
                 tails.append(t if s > need_from else 1)
             # Every request of the batch is a chunk decode never reads the late layers of: skip them entirely
             # (install_model); the one tail row per request then carries the last kv_source layer's state.
@@ -124,9 +135,9 @@ def install_backend(module) -> None:
             _STATS["tokens_before"] += sum(default)
             _STATS["tokens_after"] += sum(tails)
             if tails == default:
-                return stock(extend_lens_cpu=extend_lens_cpu, seq_lens_cpu=seq_lens_cpu, tail_len=tail_len, device=device)
+                return as_stock()
             _STATS["cut"] += 1
-            return _layout(extend_lens_cpu, seq_lens_cpu, tails, device)
+            return _layout(extend_lens_cpu, seq_lens_cpu, tails, tail_len, device)
 
         module.late_layer_tail_layout = late_layer_tail_layout
         logger.info("late-layer tail cut on: late layers run only over the prompt positions decode reads")
@@ -161,6 +172,11 @@ def install_model(module) -> None:
     if not (_skip() and _skip_all()):
         return
     model_cls, layer_cls = module.DeepseekV4Model, module.DeepseekV4DecoderLayer
+    if not hasattr(layer_cls, "forward_hc_pre_from_prev"):
+        # SGLang after 2026-09 runs CUDA layers through cross-layer hc boundaries (residual_batch); a pass-through
+        # there has not been written yet. Refuse instead of serving a half-applied skip.
+        raise RuntimeError("SPARK_LATE_TAIL_SKIP_ALL=1 is not ported to this SGLang; set it to 0 (SPARK_LATE_TAIL_SKIP=1 "
+                           "alone still cuts the tails)")
     init = model_cls.__init__
 
     def __init__(self, *args, **kwargs):
@@ -223,5 +239,6 @@ def install_runner(module) -> None:
             _T.update(n=0, fwd=0.0, tail=0.0, tokens=0, last=now)
         return out
 
+    forward.__wrapped__ = stock
     cls.forward = forward
     logger.info("late tail timers on (one sync per prefill forward)")

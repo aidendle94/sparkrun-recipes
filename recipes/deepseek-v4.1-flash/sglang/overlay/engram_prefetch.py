@@ -15,6 +15,7 @@ MIT License, Copyright (c) 2026 Aiden Le.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import threading
@@ -93,6 +94,11 @@ def install(module) -> None:
         return
     cls = module.Scheduler
     stock = cls.run_batch
+    # The next chunk starts where this round's extend ends: Req.extend_end (fill ids [prefix_len, extend_end)).
+    # Refuse to boot if the field moved again, instead of skipping every request without a word.
+    from sglang.srt.managers.schedule_batch import Req
+    if "self.extend_end" not in inspect.getsource(Req.__init__):
+        raise RuntimeError("Engram prefetch: Req.extend_end is gone from this SGLang; the next-chunk start is unknown")
     state = {"pool": None, "warned": False, "warned_chunk": False}
 
     def run_batch(self, batch, *args, **kwargs):
@@ -106,10 +112,10 @@ def install(module) -> None:
                 jobs = []
                 for req in getattr(batch, "reqs", []) or []:
                     ids = getattr(req, "origin_input_ids", None)
-                    rng = getattr(req, "extend_range", None)
-                    if ids is None or rng is None:
+                    end = getattr(req, "extend_end", None)
+                    if ids is None or end is None:
                         continue
-                    start = len(getattr(req, "prefix_indices", ())) + int(getattr(rng, "length", 0))
+                    start = int(end)
                     if start < len(ids):
                         jobs.append((list(ids), start, int(chunk)))
                 if jobs:

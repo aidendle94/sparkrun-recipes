@@ -635,12 +635,15 @@ def _shape_check_loader(layer_id: int, what: str, expect: tuple[int, int]):
     return weight_loader
 
 
-def embedding_init(self, num_embeddings: int, dim: int, layer_id: int) -> None:
+def embedding_init(self, num_embeddings: int, dim: int, layer_id: int, column_bounds=None) -> None:
     """Replacement ``EngramEmbedding.__init__``: no table in memory, one open row store per layer.
 
     Keeps every attribute the rest of the class reads (dim, tp_size, row_start, rows, host_table, weight,
     scale) and gives the two parameters zero-size tensors of the checkpoint dtypes, so the loader finds
-    them by name and their ``weight_loader`` can validate the shard without copying 101 GB."""
+    them by name and their ``weight_loader`` can validate the shard without copying 101 GB. SGLang's
+    ``column_bounds`` (its per-rank split along the hash columns) is accepted and not used: the rank
+    ranges come from the row source and tile the table, and the zero-fill + all-reduce lookup is exact
+    for any tiling."""
     if _SGL is None:
         raise RuntimeError("engram_store.install() was not called before EngramEmbedding was built")
     torch.nn.Module.__init__(self)

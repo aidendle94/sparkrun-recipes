@@ -424,7 +424,7 @@ def _capturing(t: torch.Tensor) -> bool:
     return t.is_cuda and torch.cuda.is_current_stream_capturing()
 
 
-def _init(self, num_embeddings: int, dim: int, layer_id: int):
+def _init(self, num_embeddings: int, dim: int, layer_id: int, column_bounds=None):
     """Replacement EngramEmbedding.__init__: no table, zero-size parameters, one
     memory map of the shard, pinned + device staging of `capacity()` ids."""
     torch.nn.Module.__init__(self)
@@ -769,8 +769,8 @@ def hash_ids_no_commit(hasher, input_ids: torch.Tensor, forward_batch) -> torch.
         row = torch.repeat_interleave(torch.arange(bs, device=device), lens)
         num_real = row.shape[0]
         kmode = eng.MODE_EXTEND
-        if forward_batch.ngram_history is not None:
-            history, via_slots = forward_batch.ngram_history, False
+        if forward_batch.engram_history is not None:
+            history, via_slots = forward_batch.engram_history, False
     if input_ids.is_cuda and torch.version.cuda is not None:
         hash_ids, _ = eng.engram_hash_ids(
             input_ids, forward_batch.positions, mode=kmode, history=history,

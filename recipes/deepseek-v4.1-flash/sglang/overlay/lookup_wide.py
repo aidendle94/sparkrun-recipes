@@ -46,6 +46,16 @@ import lookup_draft as ld
 logger = logging.getLogger(__name__)
 
 ACTIVE = ld._ENABLED and ld._MODE == "wide"
+# SPARK_VERIFY_CAP=1 (verify_cap.py) runs SGLang's own compact verify planner (per-request verify lengths from the
+# draft's confidence head) without the lookup drafter: it needs the ragged Engram hasher, the ragged token -> request map
+# and the token-keyed graph buckets below, and nothing else from this module.
+CAP = os.environ.get("SPARK_VERIFY_CAP", "0") == "1" and not ACTIVE
+RAGGED = ACTIVE or CAP
+# Forward generation: bumped at the start of every target-model forward (eager, warm-up or graph capture). The ragged
+# row memo below is valid only inside the forward that computed it; a memo carried from one forward into another (the
+# warm-up batch object is reused by the capture) baked one graph's tensors into another graph and read freed memory
+# (window 44: illegal memory access at the first decode).
+_GEN = [0]
 EXT_BUDGET = int(os.environ.get("SPARK_LOOKUP_EXT_BUDGET", "20"))
 EXT_TIERS = tuple(sorted({*range(0, EXT_BUDGET + 1, 10), EXT_BUDGET})) if EXT_BUDGET >= 10 else (0, EXT_BUDGET)
 SYNC_GATE = os.environ.get("SPARK_LOOKUP_SYNC_GATE", "0") == "1"
@@ -197,14 +207,18 @@ def _rewrite(module, fn, replacements):
 
 
 def install_graph_runner(module) -> None:
-    """model_executor.runner.decode_cuda_graph_runner: compact verify graphs at 6b, 6b+10, 6b+20 tokens."""
-    if not ACTIVE:
+    """model_executor.runner.decode_cuda_graph_runner: compact verify graphs at 6b, 6b+10, 6b+20 tokens (wide), or at
+    the verify-cap buckets (verify_cap.cap_buckets: every count to 12, then 6b - 3 and 6b)."""
+    if not RAGGED:
         return
     cls = module.DecodeCudaGraphRunner
 
     def _build_ragged_verify_token_buckets(self):
         narrow = _base() + 1
         limit = self.max_bs * self.captured_req_width            # rows of the shared logits buffer
+        if CAP:
+            import verify_cap
+            return verify_cap.cap_buckets(self.capture_bs, self.captured_req_width, limit)
         return sorted({b * narrow + e for b in self.capture_bs for e in EXT_TIERS if b * narrow + e <= limit})
 
     def _spark_capture_sizes(self):
@@ -245,7 +259,11 @@ def install_graph_runner(module) -> None:
 
 def _ragged_rows(forward_batch, num_tokens: int):
     """(layout, row [T], starts [bs]) of a compact target-verify batch, or None. Fixed shapes (graph-capturable): the
-    row of token t is found in the layout's qo_indptr; tokens past the covered total land on the last row."""
+    row of token t is found in the layout's qo_indptr; tokens past the covered total land on the last row.
+
+    Memoised on the forward batch per (layout, num_tokens): SGLang hoists its token -> request map into the attention
+    metadata for decode only, so in target verify every low-ratio layer asks again (38 of 40 layers); one searchsorted
+    chain per step instead of one per layer (window 42: compact verify spent ~2.5 ms more outside attention/MoE)."""
     import torch
     from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
     if not forward_batch.forward_mode.is_target_verify():
@@ -253,6 +271,19 @@ def _ragged_rows(forward_batch, num_tokens: int):
     layout = resolve_ragged_verify_layout(forward_batch)
     if layout is None:
         return None
+    memo = getattr(forward_batch, "_spark_ragged_rows", None)
+    if memo is not None and memo[0] is layout and memo[1] == num_tokens and memo[3] == _GEN[0]:
+        return memo[2]
+    out = _ragged_rows_compute(forward_batch, layout, num_tokens)
+    try:
+        forward_batch._spark_ragged_rows = (layout, num_tokens, out, _GEN[0])
+    except AttributeError:  # a slotted batch type: no memo, still correct
+        pass
+    return out
+
+
+def _ragged_rows_compute(forward_batch, layout, num_tokens: int):
+    import torch
     bs = int(forward_batch.req_pool_indices.shape[0])
     indptr = layout.qo_indptr_device.to(torch.int64)
     nb = min(int(indptr.numel()) - 1, bs)
@@ -261,9 +292,24 @@ def _ragged_rows(forward_batch, num_tokens: int):
     return layout, row, indptr[:nb]
 
 
+def install_forward_gen(module) -> None:
+    """models.deepseek_v4: bump the forward generation at the start of every model forward (see _GEN)."""
+    if not RAGGED:
+        return
+    cls = module.DeepseekV4ForCausalLM
+    stock = cls.forward
+
+    def forward(self, *args, **kwargs):
+        _GEN[0] += 1
+        return stock(self, *args, **kwargs)
+
+    forward.__wrapped__ = stock
+    cls.forward = forward
+
+
 def install_dsv41_sparse(module) -> None:
     """layers.attention.dsv4.dsv41_sparse: token -> request map for ragged verify (stock repeats a uniform block)."""
-    if not ACTIVE:
+    if not RAGGED:
         return
     stock = module.token_req_indices
 
@@ -272,7 +318,15 @@ def install_dsv41_sparse(module) -> None:
             n = num_tokens if num_tokens is not None else int(forward_batch.positions.shape[0])
             ragged = _ragged_rows(forward_batch, n)
             if ragged is not None:
-                return forward_batch.req_pool_indices.to(ragged[1].dtype)[ragged[1]]
+                memo = getattr(forward_batch, "_spark_req_idx", None)
+                if memo is not None and memo[0] is ragged[1] and memo[2] == _GEN[0]:
+                    return memo[1]
+                req = forward_batch.req_pool_indices.to(ragged[1].dtype)[ragged[1]]
+                try:
+                    forward_batch._spark_req_idx = (ragged[1], req, _GEN[0])
+                except AttributeError:
+                    pass
+                return req
         return stock(forward_batch, num_tokens=num_tokens)
 
     module.token_req_indices = token_req_indices
@@ -281,7 +335,7 @@ def install_dsv41_sparse(module) -> None:
 def install_engram(module) -> None:
     """layers.engram: hash ids of a ragged verify batch through the extend path (per-token row + run starts), with no
     history commit (verify commits after acceptance, in commit_after_verify)."""
-    if not ACTIVE:
+    if not RAGGED:
         return
     cls = module.EngramHasher
     stock = cls.forward

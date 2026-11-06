@@ -1,23 +1,25 @@
 # Machine-readable summary of this recipe (the blog's recipe cards and performance panels can be generated from it).
-model: deepseek-ai/DeepSeek-V4.1-Flash
+model: deepseek-ai/DeepSeek-V4.1-Flash-1017       # deepseek-ai/DeepSeek-V4.1-Flash works unchanged (same config and tensors)
 engine: sglang
-engine_base: lmsysorg/sglang@sha256:4a5d132a06a77c8331e15845f2e925adc788b00105097ad55409afa3f4fa4860   # dev-dsv41, 2026-09-11
-image: aidendle94/sparkrun-sglang-dsv41-gb10:production-1.7.1   # 1.6 decode path + Claude Code prefix caching; prompt-lookup wide mode with WIDE=1 (off until re-verified)
+engine_base: lmsysorg/sglang@sha256:bfef46e5a45a815f8c2f88a722980baf47b71a8689b89c6cc738f596ceeaf47c   # nightly-dev-cu13-20261018-b234b5c3 (SGLang main b234b5c32)
+image: aidendle94/sparkrun-sglang-dsv41-gb10:production-1.8   # SGLang main base, 4096-token prefill chunks, Prometheus metrics; wide lookup mode needs production-1.7.1
+previous_image: aidendle94/sparkrun-sglang-dsv41-gb10:production-1.7.1   # dev-dsv41 base; launcher at that commit
 status: production            # production | validated | experimental | archived
 nodes: 4 x NVIDIA DGX Spark (GB10, 128 GB), switched RoCE fabric, TP4/EP4
 context_length: 524288
-measured: 2026-09-23            # decode and concurrency on production-1.2; prefill, KV and boot on production-1.1 (2026-09-21)
+measured: 2026-10-18          # production-1.8 test windows 34-46 and the deploy boot; aggregate_tok_s from production-1.4
 max_running_requests: 16
 numbers:
-  prefill_tok_s: {32k_unique: 3308, 128k_unique: 2208, 32k_filler: 3470, 128k_filler: 3380}
-  decode_tok_s:  {counting: 110, code: 94, prose: 37}      # single stream, bench/decode_bench.py, best of 2
-  aggregate_tok_s: {c1: 55.8, c8: 220.3, c16: 331.3}       # production-1.4, fixed prompt set, 2026-09-24
-  needle_ttft_s: {32k: 8.0, 128k: 45.0}                     # production-1.5, serving fleet
-  kv_pool_tokens: 6604544                                  # auto-sized at memory fraction 0.80, varies per boot
-  boot_to_healthy_s: 508
-features: [images, tools, thinking, dspark, rdma_collectives, engram_from_nvme]
+  needle_ttft_s: {32k: 6.7, 128k: 34.1}                    # deploy boot, unique text, salted
+  prefill_tok_s: {32k_unique: 4890, 128k_unique: 3840, filler: [4100, 5300]}
+  decode_tok_s:  {counting: 114, code: 96, prose: 35}       # single stream, bench/decode_bench.py
+  coding_conversation_62k_tok_s: 65.5                      # 10 turns, overall decode
+  aggregate_tok_s: {c1: 55.8, c8: 220.3, c16: 331.3}       # production-1.4, fixed prompt set, 2026-09-24 (not re-run)
+  kv_pool_tokens: 6304768                                  # auto-sized at memory fraction 0.80, varies per boot
+  boot_to_healthy_s: 542
+features: [images, tools, thinking, dspark, rdma_collectives, engram_from_nvme, prometheus_metrics]
 blog: https://aidenle.dev/recipes/deepseek-v4-1-flash-sglang-4x-dgx-spark
-wide_lookup_vs_1_6:             # WIDE=1 (was production-1.7's decode path against production-1.6, 90-minute soak, 2026-09-28 (docs/results.md window 33)
+wide_lookup_vs_1_6:             # WIDE=1 on production-1.7.1 only: production-1.7's decode path against production-1.6, 90-minute soak, 2026-09-28 (docs/results.md window 33)
   coding_conversation_63k_tok_s: [65.9, 74.4]
   copy_tasks_tok_s: [69.7, 85.3]
   plain_chat_tok_s: [53.7, 54.2]

@@ -524,6 +524,82 @@ has no mid-conversation system turn, and Claude Code adds one `<total_tokens>` n
 end); lookup continuations stop at the first id outside the vocabulary (CPU regression test reproduces the exact
 out-of-bounds scatter without it); `launch/production.sh` runs the 1.6 decode path unless `WIDE=1`.
 
+## production-1.8: the overlay on SGLang `main` (2026-10-18, windows 34–46)
+
+The overlay was rebased from the `dev-dsv41` branch image onto the SGLang team's nightly of `main` at `b234b5c32`
+(what had to change is in [upstream.md](upstream.md)). Fleet serving DeepSeek-V4.1-Flash-1017; every number below
+was taken on test boots on a separate port within one window, the production-1.7.1 numbers on the same fleet.
+
+| test | production-1.7.1 | production-1.8 (rc4) |
+|---|---|---|
+| 32K needle, time to first token | 8.0 s | 6.6–6.7 s |
+| 128K needle, time to first token | 45.0 s | 34.1–39 s |
+| repetitive prefill | ~3,400 tok/s | 4,100–5,300 tok/s |
+| 12 long unique prefills back to back with decode streams | 167 s | 140 s |
+| 10-turn coding conversation over ~62K tokens, overall decode | 65.9 tok/s | 65.5 tok/s |
+| single stream, counting / code / prose | ~108 / 93 / 37 | 114 / 96–100 / 36 |
+| A/B set: copy / chat / 10 concurrent | 69.7 / 53.7 / 132.9 | 70.9 / 51.5 / 131.9 |
+| decode step, one stream, short context | ~54–56 ms | ~52 ms |
+
+Prefill gains come from upstream (the bounded prefill indexer, which also makes 4,096-token chunks safe) and the
+larger chunk. Decode is level: upstream's decode work for V4 (fused projections, mega-mHC, the MXFP8 dispatch cache)
+switches on for SM100 only. Correctness on every rc boot: batched decode (the same greedy chats alone and four at a
+time), images, needles, archive codes, news replay and the long-prefill stress all passed.
+
+Three things the new base broke on GB10 and how they were found:
+
+- **Candidate indexer.** SGLang's factory now picks a sparse-table backend from compute capability 10 up, whose
+  DeepGEMM kernel is enabled on SM100 only: backend init raises on SM12x. `candidate_indexer.py` builds the
+  dense-blocks backend instead (rc1).
+- **Long-context decode +11 ms.** With step timers at a ~64K context the indexers of one decode step took
+  10.2–10.5 ms against 0.9 ms on 1.7.1: the dense-blocks decode branch scores the whole graph width (524,555
+  positions at ratio 1). Routing the scores through DeepGEMM (rc2) did not help; taking SGLang's paged branch, which
+  reads only each row's visible positions, brought it to 1.8 ms (rc3).
+- **RoCE collectives.** The b12x in FlashInfer 0.7.2 wants a prepared plan on every call (first boot:
+  `all_reduce() missing plan`), and the Dockerfile's old step had installed the standalone 1.3.0 wheel over the
+  bundled copy. The wheel step is gone and the plan is published once and voted across ranks (rc1).
+
+rc4 adds zero-padding of K for the shared expert's 5120×576 projection so it runs on b12x: exact (max |diff| 0
+against cutlass on the first call), no measurable change in step time. Shipped as production-1.8 with
+`CHUNK=4096`, `LATE_TAIL_SKIP=1`, `LATE_TAIL_SKIP_ALL=0`. Deploy boot: healthy after 542 s, 32K needle 6.7 s,
+128K 34.1 s, archive codes 8/8, decode 113.7 / 96.5 / 34.9 tok/s. A later boot (2026-10-21, after one node reset
+itself) sized the KV pool at 6,304,768 tokens.
+
+### MoE cost per verify row, and expert-parallel slices (window 40)
+
+One routed-MoE layer in the production layout (CUTLASS W4A8, 96 whole experts per rank), slowest of the four ranks,
+synthetic MXFP4 weights and uniform top-6 routing:
+
+| verify rows (tokens) | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|---|
+| µs per layer | 397 | 580 | 758 | 945 | 1,041 | 1,189 |
+
+The cost is close to linear in the rows a step verifies, because each row routes to experts the others do not touch
+and the kernel is bound by memory bandwidth. Splitting every expert four ways instead (b12x on a 576-wide slice of all
+384 experts per rank, its best decode configuration) measured 1.09× the current layout at 6 tokens (worse), 0.85–0.96×
+at 12–48 and 0.96–0.98× at 96–512: not worth the weight repack.
+
+### Verify cap (windows 41–46, not adopted)
+
+`SPARK_VERIFY_CAP=1` runs SGLang's compact DSpark verify, which gives each request a verify length from the 1017
+checkpoint's confidence head, on V4.1 TP4 (`verify_cap.py`). Cutting from 6 to 3 rows saved about 15 ms per step as
+the table above predicts, but against the static verify:
+
+| test | static verify | verify cap |
+|---|---|---|
+| prose, single stream | 36.4 tok/s | 42.9 (+18 %) |
+| chat tasks | 51.5 | 53.5 (+4 %) |
+| 10 concurrent | 131.9 | 135.4 (+3 %) |
+| copy tasks | 70.9 | 67.1 (−5 %) |
+| code, single stream | 98.8 | 86.4 (−13 %) |
+| 10-turn coding conversation | 65.5 | 61.3 (−6 %, final rc7) |
+
+Two costs outweigh the saving on code: the planner's host work keeps a full-width compact step about 4 ms slower
+than a static one, and lengths chosen from confidence two steps old cut drafts on code and copied text that would
+have been accepted. The first version also hit an illegal memory access at the first decode after capture: a
+per-batch memo of the ragged token map outlived the warm-up forward it was built in; it is now keyed to one model
+forward. The switch stays off.
+
 ## Bring-up
 
 Seven boots of this stack, in order. The first three were fix-one-thing boots and no benchmark numbers were kept for
