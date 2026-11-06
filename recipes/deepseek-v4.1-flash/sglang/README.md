@@ -152,8 +152,8 @@ Tuning knobs are environment variables read by `launch/launch-sgl-dsv41.sh` and 
 `MAXREQ` (16 running requests), `CTX` (524,288), `MXFP8`, `ROCE_AR`, `THINKING_DEFAULT`, `ENGRAM_MODE`, `ENGRAM_EARLY`,
 `ENGRAM_PREFETCH`, `STEP_TIMERS`, `EXTRA_ARGS`. Thinking is
 on by default at maximum reasoning effort; a request turns it off with `"chat_template_kwargs": {"thinking": false}`.
-Send reasoning effort as a number (1–100): the 1017 reference encoder maps the names differently from SGLang's port
-(`high` is 75 there, 50 here).
+Named reasoning efforts follow the 1017 reference on this base (`low` 50, `high` 75, `max` 100; production-1.7.1's SGLang
+mapped `low` 25, `high` 50, `xhigh` 75); an integer from 1 to 100 means the same on both.
 
 `launch/production.sh` also starts the server with `--enable-metrics` (`METRICS=0` turns it off): Prometheus metrics
 on `http://<rank-0>:8210/metrics`, SGLang's own names (`sglang:num_running_reqs`, `sglang:num_queue_reqs`,
