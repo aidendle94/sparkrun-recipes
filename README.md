@@ -7,6 +7,7 @@ and the measured numbers. Everything here is MIT; third-party material is listed
 | recipe | status | image | headline |
 |---|---|---|---|
 | [`deepseek-v4.1-flash/sglang`](recipes/deepseek-v4.1-flash/sglang/) | production | `aidendle94/sparkrun-sglang-dsv41-gb10:production-1.8` | V4.1-Flash-1017 on SGLang `main`: 32K prompt in 6.7 s, 128K in 34 s, 114 / 96 / 35 tok/s single-stream decode, 524K context |
+| [`inkling-2-small/sglang`](recipes/inkling-2-small/sglang/) | experimental | `lmsysorg/sglang:dev-inkling-2-small` (unmodified) + mounted hooks | Inkling-2-Small NVFP4 at TP4/EP4: 61 tok/s single-stream decode, 106 / 130 tok/s at 4 / 8 streams, 2,400 tok/s prefill, 500K context tested; three days old, see its README |
 | [`deepseek-v4.1-flash/vllm`](recipes/deepseek-v4.1-flash/vllm/) | pending port | `aidendle94/sparkrun-vllm-dsv41-gb10:production-1.2` (local build, not on Docker Hub) | DCP4, RoCE collectives, 3.42M-token KV pool at 500K |
 | [`glm-5.3-flash/vllm`](recipes/glm-5.3-flash/vllm/) | pending port | `aidendle94/sparkrun-vllm-glm53-gb10:production-1.2` | FP8, DFlash2, 90 tok/s structured output |
 | [`deepseek-v4-flash/vllm`](recipes/deepseek-v4-flash/vllm/) | pending port | `aidendle94/sparkrun-vllm-ds4-gb10:production-3.76.1` / `:production-3.73-vision` | DSpark, prefix caching, vision profile |
