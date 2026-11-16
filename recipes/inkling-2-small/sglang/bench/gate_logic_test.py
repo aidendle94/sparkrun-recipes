@@ -84,8 +84,14 @@ import sglang.srt.models.inkling2 as inkling2  # noqa: E402
 assert hasattr(inkling2.Inkling2CausalLLM.forward, "__wrapped__")
 fake = types.SimpleNamespace(_fused_accept_tail=False, simulated_correct_len=None, deferred_commit=None, _post_fold=False)
 assert g._refusal(fake, dspark_verify) == "", g._refusal(fake, dspark_verify)
+fake._post_fold = True  # the verify graph relays the capped accept's own buffers
+assert g._refusal(fake, dspark_verify) == "", g._refusal(fake, dspark_verify)
 fake._fused_accept_tail = True
 assert g._refusal(fake, dspark_verify)
+g._s["sampler"].sharded_accept = True  # logits on vocab shards: the ranks would disagree on K, so every row is verified
+assert g._rows(ep, 3) is None and g._s.get("sharded")
+g._s["sampler"].sharded_accept = False
+assert g._rows(ep, 3) is not None
 
 bs = 4
 cand = torch.randint(5, 900, (bs, 8))

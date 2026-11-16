@@ -1,4 +1,4 @@
-"""Compile the Triton kernels of patches/fi_moe.py for GB10 without a GPU and check each fits a program's shared
+"""Compile the Triton kernels of patches/fi_moe.py and patches/fi_mxfp8.py for GB10 without a GPU and check each fits a program's shared
 memory (101376 bytes on GB10), at the shapes of expert parallelism (96 local experts, width 2304) and of the sharded
 layout (SPARK_TP_SHARD: 384 local experts, width 576). To be run before any window that changes them: a kernel that
 does not fit only fails at its first launch.
@@ -58,7 +58,7 @@ def stock_modules():
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--only", default="", help="only the jobs whose label contains this")
-ap.add_argument("--no-stock", action="store_true", help="fi_moe's kernels alone")
+ap.add_argument("--no-stock", action="store_true", help="the hooks' kernels alone (fi_moe, fi_mxfp8)")
 args = ap.parse_args()
 SHARED = 101376
 target = GPUTarget("cuda", 121, 32)
@@ -88,14 +88,25 @@ for y in ("*fp32", "*bf16"):
                                        WDenominator="*fp32", Y=y, start="i32", unscale="fp32", TOP_K=8, N=4608,
                                        BLOCK=1024), 4))
 jobs = [(fi_moe, *job) for job in jobs]
+OURS = [fi_moe]
 bad = 0
 try:
     route, marlin = stock_modules()
+    import fi_mxfp8  # noqa: E402  (takes two helpers from the image's kernel modules)
 except Exception:
     bad += 1
-    print("FAIL stock: the image's kernel modules did not import", flush=True)
+    print("FAIL stock: the image's kernel modules (or fi_mxfp8 on top of them) did not import", flush=True)
     traceback.print_exc(limit=6)
 else:
+    OURS.append(fi_mxfp8)  # SPARK_FI_MXFP8: a shard's MXFP8 layer (384 local experts, hidden 4608, width 576)
+    jobs.append((fi_mxfp8, "_quant_gather", dict(
+        X="*bf16", Slots="*i64", Ids="*i32", Indptr="*i32", A="*fp8e4nv", ASf="*i32", start="i32", m_pad="i32",
+        TOP_K=8, K=4608, BLOCK=256), 4))
+    jobs.append((fi_mxfp8, "_swiglu_requant", dict(
+        Acc="*bf16", Slots="*i64", Ids="*i32", Gammas="*fp32", Indptr="*i32", A2="*fp8e4nv", A2Sf="*i32",
+        start="i32", m_pad="i32", N=576, BLOCK=256, **CAPS), 4))
+    for y in ("*fp32", "*bf16"):
+        jobs.append((fi_mxfp8, "_combine", dict(Out2="*bf16", Slots="*i64", Y=y, TOP_K=8, N=4608, BLOCK=1024), 4))
     pow2 = lambda v: 1 << (v - 1).bit_length()  # noqa: E731
     for local in (96, 384):
         block_e = pow2(local + 1)
@@ -118,11 +129,12 @@ else:
         jobs.append((marlin, "_swiglu_fake_quantize_mxfp8", dict(
             X="*bf16", Ids="*i32", Gammas="*fp32", Y="*bf16", start="i32", num_local="i32", N=width, BLOCK=256,
             **CAPS), 4))
-SHOWN = ("NUM_LOCAL", "BINS", "BLOCK_N", "N", "Y", "WORLD", "E", "BLOCK_E", "BLOCK_S", "E_POW2", "BSM", "BLOCKS")
+SHOWN = ("NUM_LOCAL", "BINS", "BLOCK_N", "N", "K", "Y", "WORLD", "E", "BLOCK_E", "BLOCK_S", "E_POW2", "BSM", "BLOCKS")
 for module, name, sig, warps in jobs:
     consts = {k: v for k, v in sig.items() if not isinstance(v, str)}
-    label = f"{'' if module is fi_moe else 'stock '}{name} " + " ".join(f"{k}={v}" for k, v in sig.items() if k in SHOWN)
-    if args.only not in label or (args.no_stock and module is not fi_moe):
+    owner = "" if module is fi_moe else "fi_mxfp8 " if module in OURS else "stock "
+    label = f"{owner}{name} " + " ".join(f"{k}={v}" for k, v in sig.items() if k in SHOWN)
+    if args.only not in label or (args.no_stock and module not in OURS):
         continue
     keys = list(sig)
     signature = {k: v for k, v in sig.items() if isinstance(v, str)}

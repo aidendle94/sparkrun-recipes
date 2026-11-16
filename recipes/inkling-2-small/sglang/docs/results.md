@@ -2,10 +2,10 @@
 
 The working notes behind this recipe, in the order things were built and measured (2026-11-12 to 2026-11-16): what
 the GB10 hooks do, the bug that produced garbage under concurrency, every decode lever with its numbers, long
-contexts and multi-turn history, the reasoning loop on long lists, the KV cache, reasoning effort, and the first
-day's measurements. "Production" and "the fleet" mean the author's four Sparks; times are UTC. Each number is one
-boot on that fleet unless the text says otherwise. The launch scripts are in `launch/`, the tools in `bench/`, the
-hooks in `patches/`. The summary and the way to run it are in the [README](../README.md).
+contexts and multi-turn history, the reasoning loop on long lists, the KV cache, the prefill switches, reasoning
+effort, and the first day's measurements. "Production" and "the fleet" mean the author's four Sparks; times are
+UTC. Each number is one boot on that fleet unless the text says otherwise. The launch scripts are in `launch/`, the
+tools in `bench/`, the hooks in `patches/`. The summary and the way to run it are in the [README](../README.md).
 
 ## GB10 hooks (`patches/sitecustomize.py`)
 
@@ -286,6 +286,51 @@ For reference, sampled requests on the gated default: 40.7 tok/s at temperature 
 step, 3.8 verify rows), 21.2 per stream at four streams. Chat requests without a `temperature` are sampled at 0.7
 (the server's default; the model ships no generation config).
 
+**Sampled decode at temperature 1.0** (the publisher evaluates at temperature 1.0, top_p 1; window of 2026-11-16).
+On the serving configuration one stream runs 53.4 tok/s greedy, 50.3 at temperature 0.7 and 48.5 at 1.0 (24
+questions of 400 tokens; 2.93, 2.66 and 2.47 tokens per step), four streams 25.3 against 23.3 per stream. Steps
+are not slower when sampling (at four forced rows 55.1 ms sampled against 54.5 greedy): the draft's tokens are
+accepted less often, 0.69 0.60 0.56 0.51 0.47 0.45 0.42 by position at 1.0. Three levers that leave the output
+distribution alone were measured, and none of them gains:
+
+| lever | simulated on the dump (tok/s against the serving rule) | on the clock, same boot, paired by prompt |
+|---|---|---|
+| another gate rule for sampled requests: the best of five features and their thresholds is `mix` (the mean of the drafted token's and the best token's log probability) | x1.009 +- 0.002 at 1.0 (tau 0.35; x1.006 on held-out steps), x1.006 at 0.7 (tau 0.45); a lower threshold on the serving rule x1.002 | x1.012 +- 0.023 at 1.0, x1.007 +- 0.020 at four streams, x1.027 +- 0.023 at 0.7 |
+| the draft sampling sharper than the target (alpha x the request's temperature, the accept reading the draft's probabilities at that temperature) | alpha 0.85 / 0.7 / 0.5 / 0.3: x0.996 / 0.991 / 0.984 / 0.976 at 1.0; an argmax draft x0.965 (x0.978 at its best threshold) | alpha 0.7: x0.988 +- 0.019 |
+| the engine's block-wise rejection kernel (`SGLANG_OPT_DSV41_BLOCKWISE_REJECTION=1`) | not simulated (the same rule in another kernel) | a boot of its own: 51.2 tok/s at 50.7 ms a step against 49.0 at 50.6 (the difference is tokens per step of other sampled texts), 23.3 against 23.6 per stream at four, 52.2 against 52.4 at 0.7; at four forced rows 54.6 ms sampled against 54.3 greedy |
+
+A rule that could read the target's own acceptance probabilities would gain x1.16: the room is in how well the
+draft's confidence predicts the target, not in the threshold. The stock argmax-draft switch
+(`SGLANG_DSPARK_USE_GREEDY_DRAFT=1`) keeps no step logits, which turns the gate off, so it was judged by
+re-weighting the dump (alpha 0) and not booted. Block-wise rejection runs cleanly on GB10 with the gate (texts
+read, K hashes equal on the four ranks) and is left off. Tools: `patches/sampled_lab.py` (`SPARK_SAMPLED_LAB=1` with
+`SPARK_GATE_RID=1`, windows only: a request id `lab-<feature>_<tau>_<alpha>-` chooses the gate rule and the draft
+temperature of its request; `bench/sampled_lab_test.py` is its CPU test), the dump of `patches/accept_stats.py`
+(`SPARK_ACCEPT_DUMP=<dir>`, written by the rank that has the directory, paused while `<dir>/pause` exists) with
+`bench/accept_sim.py` (scores gate rules and draft temperatures on dumped 8-row steps) and
+`bench/sampled_lab_check.py`, and `bench/sampled_arms.py` (arms of one boot side by side, paired by prompt).
+Sampled tok/s over 24 questions moves about 5 % between boots because the texts differ: compare rules within a
+boot or on the dump.
+
+**Three more kernel ideas for the decode step, none adopted** (windows of 2026-11-16; one stream spends about 57 ms
+a step on the serving configuration):
+
+- A fused path for the 1 to 8 rows of a verify step through the sharded experts: 204.1 against 204.5 us a layer at
+  one row, and it failed one graph-against-eager comparison. The two grouped GEMMs are 190 of those 204 us and read
+  their weights at the rate the memory gives. The code is gone; `bench/fi_shard_test.py --only stages` keeps the
+  split of a layer that shows it.
+- The engine's own fast-path switches (`SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH`, `SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED`,
+  `SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS` and `SGLANG_OPT_DSV41_DSPARK_MID_FOLD`, `_POST_FOLD`,
+  `_PREPARE_INPUTS_ONCE`, `_SKIP_PREFILLED_INPUTS`, all `=1`): they run on GB10 with the hooks and leave the text
+  alone; -0.5 ms a step against a second stock boot, which is inside what two boots of one configuration differ
+  by. Not set. The gate arms under the post-fold relay since this window (it refused before), and under
+  `SGLANG_DSPARK_SHARDED_ACCEPT` it verifies all 8 rows, because the draft's logits stay on vocabulary shards.
+- The prefill glue's fused attn_res + RMSNorm kernel (below) inside the decode graph: the same bits, 1.4 to 2.5
+  times slower than stock's pair of launches at 1 to 8 rows. It stays a prefill part.
+
+What is left for decode is tokens per step, that is how well the draft's confidence predicts the target (see the
+sampled-decode paragraph above), not the step.
+
 `bench/nll_texts.py` scores held-out text (58 spans of 199 tokens, windows only: it asks for input logprobs) and
 pairs a boot against a reference boot token by token; stock is 0.9828.
 
@@ -417,6 +462,9 @@ Serving since 2026-11-16 00:34 UTC, through the environment of the relaunch (not
     CTX=524288 MEMFRAC=0.94 NCCL_EXTRA="-e SPARK_WMARK_BOOST=1 -e SPARK_DRAFT_KV_FP8=1" \
       EXTRA_ARGS="--max-total-tokens 793000 --swa-full-tokens-ratio 0.05 --prefill-decode-interval 2" bash launch/relaunch-inkling2.sh
 
+Since 17:20 UTC the same day the line also carries the three prefill switches (see Prefill below); they do not
+change the pool.
+
 Two steps, each in the bytes of the one before: the windowed pool at half its share (716,000 tokens, 11-15 22:37
 UTC), then the draft's pools as FP8 (793,000 tokens, below).
 
@@ -519,6 +567,110 @@ sizes every rank's pool. One GB there is about 130K tokens.
   memory, and writes one file a token at page size 1; whether it restores the windowed tail, the conv state and the
   draft's KV is not known. KV page sharding across nodes applies to replicated KV only (not this model); FP4 KV is
   not built for this pool.
+
+## Prefill: the glue, the far-bias kernel and MXFP8 off Marlin (2026-11-16)
+
+Three switches for prefill, each off unless set, each a variable of the containers (`NCCL_EXTRA="-e NAME=value"`).
+The fleet serves with all three since 2026-11-16 17:20 UTC through the relaunch environment; the launcher's defaults
+are unchanged. Cold prefill of fresh prompts (`bench/prefill_probe.py`, three prompts of 30,000 tokens, one of
+120,000, one of 300,000; one boot a row, the pool settings of the KV section on all of them):
+
+| boot | exact | 30,000 tokens | 120,000 tokens | 300,000 tokens |
+|---|---|---|---|---|
+| without the switches | | 2,474 tok/s | 2,241 tok/s (53.6 s) | not measured |
+| `SPARK_PREFILL_GLUE=epilogue,stream,gate,qkvr,relbias` | yes | 2,756 (+11.4%) | 2,469 (+10.2%, 48.7 s) | 1,961 (153.2 s) |
+| glue + `SPARK_FA4_BIAS_FAR=f2` | yes | 2,785 (+12.6%) | 2,519 (+12.4%, 47.7 s) | 2,035 (147.6 s) |
+| `SPARK_FI_MXFP8=1` alone | no | 2,747 (+11.0%) | 2,456 (+9.6%, 48.9 s) | not measured |
+| glue + MXFP8 | no | 3,095 (+25.1%) | 2,733 (+22.0%, 44.0 s) | not measured |
+| all three (the serving boot) | no | 3,110 (+25.7%) | 2,786 (+24.3%, 43.1 s) | 2,223 (135.1 s) |
+
+Prefill tok/s repeats to about 2% between boots of one configuration, so the last two rows are the same speed at
+30,000 tokens. Decode is not touched by any of them: only plain prefill batches take the new paths.
+
+The serving line (any of the three left out of `NCCL_EXTRA` runs stock's path for that part; without all three it is
+the line of the KV section):
+
+    CTX=524288 MEMFRAC=0.94 \
+      NCCL_EXTRA="-e SPARK_WMARK_BOOST=1 -e SPARK_DRAFT_KV_FP8=1 -e SPARK_PREFILL_GLUE=epilogue,stream,gate,qkvr,relbias -e SPARK_FA4_BIAS_FAR=f2 -e SPARK_FI_MXFP8=1" \
+      EXTRA_ARGS="--max-total-tokens 793000 --swa-full-tokens-ratio 0.05 --prefill-decode-interval 2" bash launch/relaunch-inkling2.sh
+
+### The glue (`patches/prefill_glue.py`, exact)
+
+A 4,096-token chunk spends about a tenth of its time between the big kernels: each of the 48 layers builds its
+inputs, projects, biases and closes with launches that read and write rows x 4608 values (or the 100 MB
+relative-bias tensor) once more. Each part removes one of those passes and keeps every IEEE operation and its
+order. One GB10, ms a call at 4,096 rows, stock against fused (`bench/glue_check.py`, 0 differing values):
+
+| part | what | stock | fused |
+|---|---|---|---|
+| `epilogue` | the layer's closing convolution and residual add in one tiled kernel (`patches/fused_epilogue.py`) | 1.032 | 0.715 |
+| `epilogue`, block-boundary layers | the same without the running partial sum | 0.869 | 0.540 |
+| `stream` | attn_res + RMSNorm of a layer's inputs in one kernel that never writes the FP32 stream (`patches/fused_stream.py`); 2 sources | 1.195 | 0.530 |
+| `stream`, global layer | 3 sources, 3 queries | 3.070 | 1.057 |
+| `gate` | the attention output stays BF16 (stock asks for an FP32 copy, which the SM12x forward makes from its BF16 result) | 0.403 | 0.192 |
+| `qkvr` | a global layer projects three sources through the whole qkvr weight and keeps k of the second and v of the third; here those two take only their slice of the weight | 4.309 | 1.927 |
+| `relbias` | the relative-position bias written once, already sheared, instead of an einsum and the interface's shear (`patches/fused_relbias.py`) | 1.576 | 0.655 |
+
+- `qkvr` is the one part whose equality depends on a library: cuBLAS chooses its sums by the shape it is given.
+  The split product equals the stacked one from 500 rows up and differs at 65 to 384 rows, so the part has a floor
+  of 512 rows and compares the two products the first time it sees a row count; a count that differs in one bit is
+  left to stock (logged). The other floors: `stream` 512, `epilogue` and `gate` 2,048 rows.
+- A boot with `SPARK_PREFILL_GLUE_CHECK=1` (diagnosis windows only: every fused call also runs stock's path)
+  counted 0 differing values on every rank over a 9,000, four 30,000 and a 120,000-token prefill. Held-out NLL
+  (`bench/nll_texts.py`) equals the reference boot's in every token; one-stream decode gave the same text on 16 of
+  16 questions.
+- Only plain extend batches outside CUDA graph capture take it. Decode, verification and mixed batches run stock's
+  code, and so does any call a kernel does not cover (image tokens, no KV cache); each refusal logs its reason once.
+
+### The far key blocks of a biased attention call (`patches/fa4_bias_far.py`, exact)
+
+A prefill call of a global layer walks every key block of the prefix, and only the last 8 blocks (1,024 keys)
+carry a relative bias. Compiled with a bias, SGLang's SM120 forward kernel takes 0.536 ms per 1,000 prefix keys
+per 4,096-row chunk for the other blocks, against 0.379 for the same kernel compiled without one, although all it
+has to do there is multiply by the softmax scale. `f2` splits the loop over the key blocks: the blocks that carry
+a bias run stock's body, the far ones a body compiled without the bias state. Same operations, same order of
+blocks. One GPU (`bench/bias_far_window.py`): 0.482 ms, output and log-sum-exp equal to stock's bit for bit in
+every case. `f1` (the scale as one whole-tensor store, no loop split) gains nothing (0.542); deleting the multiply
+altogether gives 0.484, so the rest of the gap to the no-bias build is not the multiply. On four nodes, on top of
+the glue: 120,000 tokens 48.67 -> 47.70 s, 300,000 tokens 153.16 -> 147.61 s, NLL equal per token.
+
+The class is derived from the image's source by exact text replacements, so a changed image fails the boot and not
+the first request. The forward kernel cache moves to a directory named after the derived source: under the stock
+key a later stock boot would load the derived kernel.
+
+### The MXFP8 expert layers on FlashInfer (`patches/fi_mxfp8.py`, not bit-identical)
+
+Layers 40 to 47 are MXFP8. On SM12x the image runs them as Marlin GEMMs over fake-quantized BF16 activations: about
+30 ms a layer a rank for a 4,096-token chunk. FlashInfer's MXFP8 grouped GEMM runs e4m3 x e4m3 on GB10's FP8
+tensor cores in about 17 ms for the same two GEMMs, with the checkpoint's weights and the activations quantized
+block by block with the model's own rule, so the operands are the same numbers. The GEMM adds the same products in
+another order before the BF16 rounding, which is the whole difference: held-out NLL 0.9840 against 0.9840 (11,542
+paired tokens, difference 0.0000 +- 0.0002), mean absolute difference per token 0.0064, median 0.0006, above 0.1
+in 0.5% of the tokens, above 1 in none. Nothing in the engine calls that GEMM on this path, so
+`bench/fi_mxfp8_probe.py` pins the operand layout and `bench/fi_mxfp8_test.py` compares the layer with the Marlin
+one. Needs the sharded MXFP8 layers (`TP_SHARD=half,fp8`, the default). Decode steps are within boot-to-boot
+noise (Marlin is bound by the weight reads there).
+
+### The serving boot (all three, 2026-11-16 17:20 UTC)
+
+- All four ranks log the five glue parts, the derived forward kernel and the FlashInfer MXFP8 layers; no part fell
+  back to stock.
+- NLL equals the glue + MXFP8 window boot's in every token (0.9840), so `f2` is exact on four nodes too.
+- Tool-call suite: 252 right, 20 soft, 11 failed of 283 (the 10 `tool_choice: none` cases and one sampled slip).
+  No case of the temperature-0 trial changed its verdict against two runs of the suite on the boot without the
+  switches. Those two runs gave 250 / 20 / 13 and 252 / 17 / 14 with 9 verdicts moved on the sampled trial: at four
+  requests in parallel the totals move by one to three between any two runs, so compare cases, not totals.
+- `bench/stress.py`: 21 requests in 450 s, 8 workers, one 210,000-token context, no problem.
+  `bench/concurrency_check.py` clean after the boot and after the load; `bench/reasoning_cache_check.py` clean.
+  Hottest node 87 degrees C.
+
+### Tried and dropped, and what is left
+
+- A 128-row query tile for the global layers' forward kernel: exact, 1.74 to 1.80 times slower.
+- Left in a chunk: the all-reduces, about 309 ms of a 4,096-token chunk (19% before the switches). The 40 amax
+  exchanges of the sharded experts are among them; leaving them out changes the target's operands and was not
+  done. Running the grouped GEMMs on the routed experts alone (no empty groups) is worth under 1% and needs a
+  change inside FlashInfer.
 
 ## Reasoning effort: thinking tokens by level (2026-11-14)
 

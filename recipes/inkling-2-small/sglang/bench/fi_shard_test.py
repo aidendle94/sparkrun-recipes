@@ -25,6 +25,10 @@ weights (384 experts, hidden 4608, width 2304), the four ranks run one after the
           to the product than EP's (the bound says eight).
  time     one layer inside a CUDA graph (how decode runs), verify rows 1, 4, 8: EP rank with a quarter of the pairs
           local and with all of them, zeroed against unwritten scale buffers, and a shard. us a layer.
+ stages   where a shard's layer spends its time at verify rows 1, 4, 8: graphs of the forward cut after each of its
+          steps (the differences are the steps); each GEMM alone on the forward's operands at
+          every tile FlashInfer allows, bit for bit against the tiles production uses, and on the routed experts
+          alone (no empty groups) to see what the 384-group schedule costs; against the byte-read floor.
  marlin   (GPU; bench/fi_shard_marlin_emu.py runs these checks alone against a plain-torch stand-in before a
           window) an MXFP8 layer through stock's Hopper code (Inkling2Experts._forward_source, what layers 40-47
           run on GB10), expert parallelism's four ranks against the four shards of SPARK_TP_SHARD_FP8 (every expert
@@ -669,6 +673,140 @@ def timing(rows):
         print(f"  {name:<52}{us:9.1f} us a layer{40 * us / 1e3:8.2f} ms over 40 layers", flush=True)
 
 
+def bits(t):
+    """A tensor's bytes: a comparison that counts NaN payloads and signed zeros."""
+    return t.contiguous().view(torch.uint8)
+
+
+class poisoned:
+    """torch.empty hands out 0xFF bytes (operands, scales) and NaN (floats) while this is open."""
+
+    def __enter__(self):
+        self.real = real = torch.empty
+
+        def empty(*a, **k):
+            t = real(*a, **k)
+            if t.dtype == torch.uint8 and t.dim() == 2:
+                t.fill_(255)
+            elif t.dtype in (torch.bfloat16, torch.float16, torch.float32):
+                t.fill_(float("nan"))
+            return t
+
+        torch.empty = empty
+
+    def __exit__(self, *exc):
+        torch.empty = self.real
+
+
+STEPS = ("f_assign", "f_quant", "f_gather", "f_gemm13", "f_amax", "f_requant", "f_gemm2", "f_combine")
+
+
+def compact_groups(a_sf, b, b_sf, indptr, alpha):
+    """A grouped GEMM's operands with the experts that have no rows left out (the rows keep their slots; the grouped
+    activation scale rows move to their expert's new tile)."""
+    counts = (indptr[1:] - indptr[:-1]).long()
+    used = counts.nonzero().flatten()
+    first = indptr.long()[used]
+    old = (first + used * 127) // 128 * 128
+    new = (first + torch.arange(used.numel(), device=dev) * 127) // 128 * 128
+    lin = unswizzle(a_sf[None])[0]
+    moved = torch.zeros_like(lin)
+    for o, n, c in zip(old.tolist(), new.tolist(), counts[used].tolist()):
+        moved[n:n + c] = lin[o:o + c]
+    ends = torch.cat((first, indptr[-1:].long())).to(torch.int32)
+    return (fi_moe.swizzle_scales_128x4(moved[None])[0], b[used].contiguous(), b_sf[used].contiguous(), ends,
+            None if alpha is None else alpha[used].contiguous())
+
+
+def stages(rows):
+    from flashinfer.gemm import group_gemm_nvfp4_nt_groupwise as fi
+    layers = 6
+    sets = [inputs(rows) for _ in range(layers)]
+    out = {}
+    before = 0.0
+    for k in range(1, len(STEPS) + 1):
+        def hook(category, fn, allowed=STEPS[:k]):
+            if category in allowed:
+                return fn
+
+            def stop(*a, **kw):
+                raise _Stop
+            return stop
+
+        def run():
+            for x, ids, gam in sets:
+                try:
+                    shard_rank(x, ids, gam, 1, lambda parts: parts, half=HALF)
+                except _Stop:
+                    pass
+
+        fi_moe.TIMED = hook
+        try:
+            t = 1e3 * graph_timed(run, 100) / layers
+        finally:
+            fi_moe.TIMED = None
+        out[STEPS[k - 1]] = t - before
+        print(f"  {STEPS[k - 1]:<28}{t - before:8.1f} us   up to here {t:8.1f} us a layer", flush=True)
+        before = t
+    calls = []
+
+    def keep(a, b, a_sf, b_sf, indptr, **kw):
+        calls.append((a, b, a_sf, b_sf, indptr, kw))
+        return fi(a, b, a_sf, b_sf, indptr, **kw)
+
+    with poisoned():
+        for x, ids, gam in sets:
+            shard_rank(x, ids, gam, 1, lambda parts: parts, half=HALF, gemm=keep)
+    for name, mine in (("GEMM13", calls[0::2]), ("GEMM2", calls[1::2])):
+        ref = [kw["out"].clone() for *_, kw in mine]
+        used = sum(int((c[4][1:] > c[4][:-1]).sum()) for c in mine) / layers
+        b = mine[0][1]
+        mb = used * (b[0].numel() + b[0].numel() // 8) / 1e6  # the routed experts' weights and block scales
+        print(f"  {name}: {used:.1f} experts a layer, {mb:.1f} MB = {mb / 250e3 * 1e6:.0f} us at 250 GB/s", flush=True)
+        swap = mine[0][5]["swap_ab"]
+        for tile_n, tile_k, sw in ((64, 256, swap), (32, 256, swap), (128, 256, swap), (64, 128, swap),
+                                   (32, 128, swap), (128, 128, swap), (64, 256, not swap)):
+            outs = [torch.empty_like(o) for o in ref]
+
+            def run():
+                for (a, bb, a_sf, b_sf, indptr, kw), o in zip(mine, outs):
+                    fi(a, bb, a_sf, b_sf, indptr, **{**kw, "tile_n": tile_n, "tile_k": tile_k, "swap_ab": sw, "out": o})
+
+            label = f"{name} tile_n {tile_n} tile_k {tile_k} swap_ab {sw}"
+            try:
+                t = 1e3 * graph_timed(run, 100) / layers
+            except Exception as exc:  # noqa: BLE001
+                print(f"  {label:<44} refused: {type(exc).__name__}: {str(exc)[:120]}", flush=True)
+                torch.cuda.synchronize()
+                continue
+            same = all(torch.equal(bits(o), bits(r)) for o, r in zip(outs, ref))
+            out[label] = t
+            print(f"  {label:<44}{t:8.1f} us a layer  {'same bits' if same else 'OTHER BITS'}", flush=True)
+        try:
+            packed = [(c[0], *compact_groups(c[2], c[1], c[3], c[4], c[5].get("alpha")), c[5]) for c in mine]
+            outs = [torch.empty_like(o) for o in ref]
+
+            def run():
+                for (a, a_sf, bb, b_sf, ends, alpha, kw), o in zip(packed, outs):
+                    more = {} if alpha is None else {"alpha": alpha}
+                    fi(a, bb, a_sf, b_sf, ends, **{**kw, **more, "out": o})
+
+            t = 1e3 * graph_timed(run, 100) / layers
+            same = True
+            for (x, ids, gam), o, r, c in zip(sets, outs, ref, mine):
+                real = torch.bincount(ids.flatten().long(), minlength=E)  # rows written: the others hold padding
+                take = torch.cat([torch.arange(int(f), int(f) + int(n), device=dev)
+                                  for f, n in zip(c[4][:-1].tolist(), real.tolist()) if n])
+                same = same and torch.equal(bits(o[take]), bits(r[take]))
+            out[f"{name} routed experts alone"] = t
+            print(f"  {name + ' on the routed experts alone':<44}{t:8.1f} us a layer  "
+                  f"{'same bits' if same else 'OTHER BITS'}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  {name} on the routed experts alone: {type(exc).__name__}: {str(exc)[:200]}", flush=True)
+            torch.cuda.synchronize()
+    report[f"stages-{rows}"] = out
+
+
 M = {}  # the MXFP8 layer's parts, filled by marlin_setup
 
 
@@ -824,6 +962,20 @@ def marlin_timing(rows):
         print(f"  {name:<52}{us:9.1f} us a layer{8 * us / 1e3:8.2f} ms over 8 layers", flush=True)
 
 
+def marlin_prefill():
+    """ms a layer at a 4,096-token chunk, eager (how prefill runs): the MXFP8 shard on Marlin, the NVFP4 shard."""
+    if "sh" not in M:
+        return result(False, "marlin: no layers to time at 4,096 tokens")
+    x, ids, gam = inputs(4096)
+    out = {"MXFP8 shard, Marlin": timed(lambda: marlin_rank(M["sh"][1], x, ids, gam), 10),
+           "NVFP4 shard, FlashInfer, FP16 partial rows": timed(
+               lambda: shard_rank(x, ids, gam, 1, lambda parts: parts, half=HALF), 10)}
+    del M["seen"][:]
+    report["marlin-prefill"] = out
+    for name, ms in out.items():
+        print(f"  {name:<52}{ms:9.2f} ms a layer at 4,096 tokens", flush=True)
+
+
 section("helpers", helpers)
 section("K576", k576)
 if not EMU:
@@ -838,6 +990,8 @@ for T in (8, 64):
     section("exact", exact, T)
 for K in () if EMU else (1, 4, 8):
     section("time", timing, K)
+for K in () if EMU else (1, 4, 8):
+    section("stages", stages, K)
 if MARLIN:
     if not EMU:
         torch.cuda.empty_cache()
@@ -848,6 +1002,8 @@ if MARLIN:
             torch.cuda.empty_cache()
     for K in () if EMU else (1, 4, 8):
         section("marlin time", marlin_timing, K)
+    if not EMU:
+        section("marlin prefill", marlin_prefill)
 if args.out:
     with open(args.out, "w") as f:
         json.dump({"failures": failures, **report}, f, indent=1)

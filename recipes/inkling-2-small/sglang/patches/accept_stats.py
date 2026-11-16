@@ -15,10 +15,12 @@ both rules, the tokens the running rule committed and K, and logs the running me
 
 SPARK_ACCEPT_DUMP=<dir inside the container> (with SPARK_ACCEPT_STATS=1): every request of every sampled step also
 becomes one JSON line of <dir>/accept-<pid>.jsonl, for bench/accept_sim.py to try other gate rules and other draft
-temperatures on, offline. Only a rank whose directory exists writes (every rank computes the same accept: make the
-directory on the head alone). Rejection sampling is exact for any proposal the accept knows, so the draft may sample at
-alpha x the request's temperature T; what that would accept is 1 - TV(target at T, draft at alpha T) per position,
-read here from the two full distributions of the step, without coins:
+temperatures on, offline. Only a rank whose directory exists writes and counts (every rank computes the same accept:
+make the directory on the head alone), and that rank does neither while the file <dir>/pause exists, so that one
+boot can also time requests without this patch's work in their steps. Rejection sampling is exact for any proposal
+the accept knows, so the draft may sample at alpha x the request's temperature T; what that would accept is
+1 - TV(target at T, draft at alpha T) per position, read here from the two full distributions of the step, without
+coins:
   T, k, n        the request's temperature, the rows the gate kept (only drafts below k met a real target row; force
                  k = 8 with SPARK_GATE_RID and a "gate-k8-" request id), the drafts the accept took before the cap
   x              [7] drafted tokens
@@ -40,6 +42,7 @@ import torch
 LOG_EVERY = 256
 BUCKETS = 201  # temperatures 0.00 .. 2.00
 DUMP = os.environ.get("SPARK_ACCEPT_DUMP", "")
+PAUSE = os.path.join(DUMP, "pause")  # with a dump directory: nothing is written or counted while this file exists
 ALPHAS = (0.0, 0.3, 0.5, 0.7, 0.85, 1.0, 1.2, 1.5)
 _log = logging.getLogger("accept_stats")
 _s = {"lens": None, "temps": None, "table": None, "calls": 0, "failed": False, "file": None, "dump_off": not DUMP}
@@ -143,7 +146,7 @@ def install(mod):
 
     def chain_speculative_sampling_triton(*args, **kwargs):
         out = stock_kernel(*args, **kwargs)
-        if not _s["failed"]:
+        if not _s["failed"] and (not DUMP or (os.path.isdir(DUMP) and not os.path.exists(PAUSE))):
             try:
                 _note(kwargs)
             except Exception:  # a diagnosis must not take the accept down

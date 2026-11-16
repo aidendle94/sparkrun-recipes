@@ -57,6 +57,9 @@ dense_fq (SPARK_DENSE_FQ=<bits>, quality windows only): patches/dense_fq.py roun
   weight format would cost in quality, measured before any kernel reads one.
 accept_stats (SPARK_ACCEPT_STATS=1, diagnosis windows only): patches/accept_stats.py logs, for sampled requests, the
   tokens per step that token-by-token rejection and block verification would each commit in expectation.
+sampled_lab (SPARK_SAMPLED_LAB=1 with the gate and SPARK_GATE_RID=1, diagnosis windows only): patches/sampled_lab.py
+  lets a request id choose the gate rule and the draft temperature of its request (both leave a sampled request's
+  distribution alone), to measure them side by side in one boot.
 dense_i8 (SPARK_DENSE_I8=<parts>, off by default): patches/dense_i8.py keeps int8 codes (one scale per output row)
   beside the chosen dense weights and reads them with a Triton kernel on forwards of up to 64 rows, where a linear
   runs at memory bandwidth: half the bytes, half the time. Parts draft and dhead leave the target's arithmetic alone;
@@ -75,6 +78,9 @@ tp_shard (SPARK_TP_SHARD=1 | local, off by default, windows only until measured;
   each row's amax between the ranks (the checkpoint's quantized operands, rounding-level differences), "local" does not.
   SPARK_TP_SHARD_HALF=1 (with "1"): the down projection's partial sums as FP16, summed without the BF16 rounding.
   SPARK_TP_SHARD_FP8=1: the MXFP8 expert layers sharded the same way (stock's Hopper code, every expert local).
+fi_mxfp8 (SPARK_FI_MXFP8=1, off by default, not bit-identical to Marlin; needs SPARK_FI_MOE=1 and
+  SPARK_TP_SHARD_FP8=1): patches/fi_mxfp8.py runs the sharded MXFP8 expert layers through FlashInfer's native MXFP8
+  grouped GEMM instead of Marlin (the same operands, another order of sums: not bit-identical).
 route_balance (SPARK_ROUTE_BALANCE=1, diagnosis windows only, garbage text): patches/route_diag.py renames the routed
   experts of every forward so the ranks read equal shares: with graph_timers, what the wait for the busiest rank costs.
 reasoning_cache (SPARK_REASONING_CACHE=1 or a flag file's path, off by default): patches/reasoning_cache.py keeps the
@@ -89,6 +95,20 @@ draft_kv_fp8 (SPARK_DRAFT_KV_FP8=1, off by default; with --kv-cache-dtype fp8_e4
   reads to patches/draft_decode.py (the image's Triton decode kernel rebuilt for an e4m3 pool: every valid key, no
   bias). The draft's K/V are rounded when stored; the target's arithmetic is untouched.
   SPARK_DRAFT_KV_STATS=1 (diagnosis windows only): patches/draft_kv_stats.py logs what e4m3 does to those values.
+prefill_glue (SPARK_PREFILL_GLUE=<parts>, off by default; parts epilogue,stream,gate,qkvr,relbias):
+  patches/prefill_glue.py takes passes over memory out of the per-layer glue of a plain prefill chunk: the layer's
+  closing convolution + residual add in one kernel (fused_epilogue.py), attn_res + RMSNorm in one kernel
+  (fused_stream.py), FA4's output read as BF16 by gate_sink, a global layer's k and v projected through their own
+  slice of the qkvr weight, and the relative-position bias written once, already sheared (fused_relbias.py; the
+  FA4 wrapper below hands it over as presheared). Every part keeps stock's operations and their order: the same
+  bits. Decode, verification and mixed batches run stock's code. SPARK_PREFILL_GLUE_CHECK=1 (diagnosis windows
+  only) runs stock's path beside every fused call and counts differing values. Measured on 4 nodes (all
+  five parts, the default row floors): cold prefill +11% at 30,000 tokens, +10% at 120,000; 0 differing values
+  under CHECK on every rank.
+fa4_bias_far (SPARK_FA4_BIAS_FAR=f1|f2, off by default; f2 saves 2% of a 120,000-token prefill, 3.6% at 300,000):
+  patches/fa4_bias_far.py derives the SM120 FA4 forward kernel with the far key blocks of a call with a relative
+  bias compiled without the bias code (the same multiplies in the same order: the same bits), and gives the derived
+  kernels their own persistent cache directory.
 SPARK_FA_DEBUG=1: also log the tensors of a failing SM12x FA4 call.
 MIT License, Copyright (c) 2026 Aiden Le.
 """
@@ -144,6 +164,9 @@ def fa4_sm12x_args(mod):
     inner = mod._flash_attn_varlen_func
 
     def interface_call(*args, **kwargs):
+        if _PREFILL_GLUE:  # a projection input that no wrapped call took becomes stock's tensor
+            import prefill_glue
+            prefill_glue.undefer(kwargs)
         if getattr(state, "presheared", False) and kwargs.get("rel_bias") is not None:
             kwargs["rel_bias_presheared"] = True
         return inner(*args, **kwargs)
@@ -171,19 +194,28 @@ def fa4_sm12x_args(mod):
                      and not getattr(state, "nested", False) and kwargs.get("rel_bias") is not None)
             if check:  # the pool and page table as the model passed them, before the fp8 view replaces them
                 pool = (kwargs["k_cache"], kwargs["v_cache"], kwargs["page_table"])
+            # the timers keep the global layers apart (no window): their time grows with the prefix
+            glob = "" if (kwargs.get("window_size") or (-1, -1))[0] >= 0 else "_g"
             if _e4m3(kwargs.get("k_cache")):  # fp8_kv: the SM12x FA4 forward reads BF16 K/V only
                 import fp8_kv
-                kwargs["k_cache"], kwargs["v_cache"], kwargs["page_table"] = _timed("fp8_view", fp8_kv.bf16_view)(
+                kwargs["k_cache"], kwargs["v_cache"], kwargs["page_table"] = _timed("fp8_view" + glob, fp8_kv.bf16_view)(
                     kwargs["k_cache"], kwargs["v_cache"], kwargs["page_table"], kwargs["cache_seqlens"],
                     kwargs.get("cu_seqlens_q"), (kwargs.get("window_size") or (-1, -1))[0],
                     q.shape[0] if q.dim() == 3 else q.shape[0] * q.shape[1])
+            took = None
+            if _PREFILL_GLUE and not presheared and kwargs.get("rel_bias") is not None:
+                import prefill_glue
+                # relbias: the projection's input, handed back, becomes the sheared bias (or stock's tensor)
+                took = prefill_glue.fa4_relbias(__name, __stock, args, kwargs, getattr(state, "nested", False),
+                                                _timed, glob)
+                presheared = took is not None
             owner = presheared and not getattr(state, "presheared", False)
             if owner:
                 state.presheared = True
             nested = getattr(state, "nested", False)  # flash_attn_with_kvcache calls flash_attn_varlen_func: time once
             state.nested = True
             try:
-                result = (__stock if nested else _timed("fa4", __stock))(*args, **kwargs)
+                result = (__stock if nested else _timed("fa4" + glob, __stock))(*args, **kwargs)
             except Exception:
                 if debug:
                     parts = [f"{k}={_desc(v)}" for k, v in kwargs.items() if _desc(v)]
@@ -199,15 +231,16 @@ def fa4_sm12x_args(mod):
                     state.presheared = False
             if check:
                 import attn_check
-                attn_check.prefill(q, *pool, kwargs.get("cache_seqlens"), kwargs.get("cu_seqlens_q"), kwargs["rel_bias"],
+                attn_check.prefill(q, *pool, kwargs.get("cache_seqlens"), kwargs.get("cu_seqlens_q"),
+                                   kwargs["rel_bias"] if took is None else took.unsheared(),
                                    kwargs.get("softmax_scale"), kwargs.get("window_size"), result)
+            if took is not None:
+                took.verify(result)
             if not widen:
                 return result
-            if isinstance(result, tuple):
-                out.copy_(result[0].view(out.shape))
-                return (out, *result[1:])
-            out.copy_(result.view(out.shape))
-            return out
+            widened = result[0] if isinstance(result, tuple) else result
+            _timed("fa4_widen", out.copy_)(widened.view(out.shape))
+            return (out, *result[1:]) if isinstance(result, tuple) else out
 
         wrapped.__wrapped__ = stock
         setattr(mod, name, wrapped)
@@ -358,9 +391,16 @@ def moe_marlin(mod):
         stock_swizzle = cls.swizzle_nvfp4_scales
 
         def swizzle_nvfp4_scales(self):
-            if getattr(self, "_spark_fi", False):
+            if getattr(self, "_spark_fi", False) or getattr(self, "_spark_mx", None) is not None:
                 return  # already in the 128x4 layout (same shape as the checkpoint's: never swizzle twice)
             if not self._nvfp4_scale_shapes or set(self._nvfp4_scale_shapes) != {"w13", "w2"}:
+                if _FI_MXFP8 and getattr(self, "_spark_shard_fp8", None) is not None:
+                    import fi_mxfp8
+                    if _TIMERS:
+                        fi_moe.TIMED = _timed
+                    if fi_mxfp8.adopt(self):  # False (reason logged): stock's Marlin repack below
+                        self._identity = torch.arange(1 << 17, dtype=torch.int32, device=self.w13_weight.device)
+                        return
                 done = stock_swizzle(self)
                 if _TP_SHARD and getattr(self, "_spark_shard_fp8", None) is not None:
                     import tp_shard
@@ -384,6 +424,18 @@ def moe_marlin(mod):
             if _ROUTE_STATS:
                 _route_stats(ids, self.ep_rank * self.w13_weight.shape[0], self.w13_weight.shape[0])
             shard = getattr(self, "_spark_shard", None)  # (rank, world): patches/tp_shard.py loaded this layer
+            mx = getattr(self, "_spark_mx", None)  # patches/fi_mxfp8.py adopted this (sharded MXFP8) layer
+            if mx is not None and x.shape[0]:
+                import fi_mxfp8
+                bf16 = _MOE_BF16 and ids.shape[0] > mod.BF16_COMBINE_MIN_TOKENS
+                sums = _timed("x_fi_mxfp8", fi_mxfp8.experts_forward)(
+                    x, ids, weights, self.ep_rank * self.w13_weight.shape[0], self.w13_weight, mx[0],
+                    self.w2_weight, mx[1], (self.gate_cap, self.up_cap),
+                    out_dtype=torch.bfloat16 if bf16 else torch.float32)
+                combined = mod.multicast_all_reduce(sums, mod.get_parallel().moe_ep_group)
+                if not combine:
+                    return mod.RoutedOutput(combined, self._identity[: ids.shape[0]], 1)
+                return combined.to(x.dtype)
             if not getattr(self, "_spark_fi", False) or x.shape[0] == 0:
                 if shard is not None and x.shape[0]:
                     raise RuntimeError("SPARK_TP_SHARD: a sharded expert layer has no path but fi_moe's")
@@ -617,12 +669,21 @@ _DENSE_P12 = bool(os.environ.get("SPARK_DENSE_P12"))
 # SPARK_TP_SHARD=1 | local (unset or empty = off; needs SPARK_FI_MOE=1): NVFP4 expert layers sharded by intermediate
 # width instead of by expert, patches/tp_shard.py.
 _TP_SHARD = os.environ.get("SPARK_TP_SHARD") or ""
+# SPARK_FI_MXFP8=1 (needs SPARK_FI_MOE=1 and SPARK_TP_SHARD_FP8=1): the sharded MXFP8 expert layers on FlashInfer's
+# MXFP8 grouped GEMM instead of Marlin, patches/fi_mxfp8.py.
+_FI_MXFP8 = os.environ.get("SPARK_FI_MXFP8") == "1"
 # SPARK_ROUTE_BALANCE=1 (diagnosis windows only, the text is garbage): patches/route_diag.py.
 _ROUTE_BALANCE = os.environ.get("SPARK_ROUTE_BALANCE") == "1"
 # SPARK_ACCEPT_STATS=1 (diagnosis windows only): expected accepted lengths of sampled steps, patches/accept_stats.py.
 _ACCEPT_STATS = os.environ.get("SPARK_ACCEPT_STATS") == "1"
+# SPARK_SAMPLED_LAB=1 (diagnosis windows only; needs SPARK_GATE and SPARK_GATE_RID=1): a request id chooses the gate
+# rule and the draft temperature of its request, patches/sampled_lab.py.
+_SAMPLED_LAB = _GATE and os.environ.get("SPARK_SAMPLED_LAB") == "1" and os.environ.get("SPARK_GATE_RID") == "1"
 # SPARK_REASONING_CACHE=1 or <flag file> (unset = off): history turns get their reasoning back, patches/reasoning_cache.py.
 _REASONING_CACHE = bool(os.environ.get("SPARK_REASONING_CACHE"))
+# SPARK_PREFILL_GLUE=<parts> (unset or empty = off): the per-layer glue of plain prefill chunks in fewer passes,
+# patches/prefill_glue.py.
+_PREFILL_GLUE = bool(os.environ.get("SPARK_PREFILL_GLUE"))
 
 
 def _route_stats(ids, start, num_local):
@@ -740,6 +801,20 @@ if _GATE:
         spark_gate.install_model(mod)
 
 
+if _SAMPLED_LAB:  # after the gate's hooks: the lab wraps what they installed
+    @_on_import("sglang.srt.speculative.dspark_components.dspark_draft")
+    def sampled_lab_draft(mod):
+        import sampled_lab
+        sampled_lab.install_draft(mod)
+
+    @_on_import("sglang.srt.speculative.dspark_components.dspark_draft_sampler")
+    def sampled_lab_sampler(mod):
+        import sampled_lab
+        import spark_gate
+        sampled_lab.install_draft(mod)
+        sampled_lab.install_gate(spark_gate)
+
+
 if _REASONING_CACHE:
     @_on_import("sglang.srt.entrypoints.openai.serving_inkling")
     def reasoning_history(mod):
@@ -808,6 +883,37 @@ if _DENSE_P12:  # after dense_i8: a module that carries int8 codes is left to it
     def dense_p12_attn(mod):
         import dense_p12
         dense_p12.install_attn(mod)
+
+
+# SPARK_FA4_BIAS_FAR=f1|f2 (unset or empty = off): the far key blocks of a prefill call with a relative bias,
+# patches/fa4_bias_far.py.
+_FA4_BIAS_FAR = os.environ.get("SPARK_FA4_BIAS_FAR", "")
+
+if _FA4_BIAS_FAR:
+    @_on_import("sglang.kernels.ops.attention.flash_attn.cute.interface")
+    def fa4_bias_far(mod):
+        if _sm12x():
+            import fa4_bias_far  # derive the kernel now: a changed image fails the boot, not the first request
+            fa4_bias_far.install(_FA4_BIAS_FAR, mod)
+
+
+if _PREFILL_GLUE:  # after dense_p12: the qkvr part wraps whatever _project_sources is by then
+    @_on_import("sglang.srt.models.inkling_common.attn")
+    def prefill_glue_relproj(mod):
+        import prefill_glue
+        prefill_glue.install_relproj(mod)
+
+    @_on_import("sglang.srt.models.inkling_common.inkling2_attn")
+    def prefill_glue_attn(mod):
+        import prefill_glue
+        prefill_glue.install_attn(mod)
+
+    @_on_import("sglang.srt.models.inkling2")
+    def prefill_glue_layer(mod):
+        import prefill_glue
+        if _TIMERS:
+            prefill_glue.TIMED = _timed
+        prefill_glue.install_layer(mod)
 
 
 if _GRAPH_TIMERS:

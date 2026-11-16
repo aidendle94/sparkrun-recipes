@@ -18,8 +18,9 @@ the verify replay from the draft sampler's step logits (identical on every rank 
 the same torch kernels on every rank, the property the stock sampled accept already rests on; a running hash of K
 is logged every LOG_EVERY steps and must agree across the ranks' logs.
 The gate refuses to arm (and logs why) on any configuration whose accept ignores the cap or was not examined:
-fused accept tail, sampling-accept graph, deferred context KV, post-fold, a simulated accept length, compact
-ragged verify.
+fused accept tail, sampling-accept graph, deferred context KV, a simulated accept length, compact ragged verify.
+Post-fold (SGLANG_OPT_DSV41_DSPARK_POST_FOLD) is fine: the verify graph scatters the capped accept's own buffers.
+With SGLANG_DSPARK_SHARDED_ACCEPT the draft's logits stay on each rank's vocab shard and the gate verifies 8 rows.
 SPARK_GATE_KMIN (default 1): the smallest K. SPARK_GATE_RID=1 (windows only): a request id "gate-k<n>-..." forces
 K = n for that request and "gate-t<tau>-..." gives it its own tau (bench/gate_run.py measures step time against K).
 SPARK_GATE_PARTS=mask or =cap (diagnosis only, wrong results below K = 8): only that half of the gate.
@@ -64,8 +65,8 @@ def _refusal(ep, mod):
         return "the fused accept tail ignores caps"
     if ep.simulated_correct_len is not None:
         return "SGLANG_SIMULATE_ACC_LEN"
-    if ep.deferred_commit is not None or ep._post_fold:
-        return "deferred context KV / post-fold were not examined"
+    if ep.deferred_commit is not None:
+        return "deferred context KV was not examined"
     if mod.envs.SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH.get():
         return "the sampling-accept graph was not examined"
     return ""
@@ -91,6 +92,12 @@ def _rows(ep, bs):
     sampler = _s["sampler"]
     logits = None if sampler is None else sampler.step_logits
     if logits is None or bs > logits.shape[0] or logits.shape[1] != ep.gamma:
+        return None
+    if getattr(sampler, "sharded_accept", False):  # each rank keeps its own vocab shard: the ranks would disagree on K
+        if not _s.get("sharded"):
+            _s["sharded"] = True
+            _log.warning("[gate] SGLANG_DSPARK_SHARDED_ACCEPT keeps the draft's logits on vocab shards: every step "
+                         "verifies 8 rows")
         return None
     tokens = sampler.out[: bs * ep.gamma].view(bs, ep.gamma, 1)
     logp = torch.empty((bs, ep.gamma), dtype=torch.float32, device=logits.device)

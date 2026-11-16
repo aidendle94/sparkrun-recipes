@@ -14,9 +14,13 @@ Adapted third-party code (modified for this recipe; the original notices apply t
     this repository's DeepSeek-V4.1 recipe, overlay/served_aliases.py). Copyright SGLang Team. Apache License 2.0.
   - patches/paged_decode.py and patches/draft_decode.py: rebuild SGLang's Triton decode kernel from the source inside
     the image at import, with the page lookup (and, for the draft's reader, the masks) changed; they carry no copy of
-    that source. The hooks in patches/sitecustomize.py, fi_moe.py,
-    fp8_kv.py, dense_p12.py, dense_i8.py, tp_shard.py and spark_gate.py wrap or replace functions of SGLang's Inkling
-    model code and call its and FlashInfer's kernels. Copyright SGLang Team / FlashInfer contributors. Apache License 2.0.
+    that source. patches/fa4_bias_far.py does the same for the SM120 FA4 forward kernel (the loop over the key
+    blocks split, the far blocks compiled without the bias state). patches/fused_epilogue.py, fused_stream.py and
+    fused_relbias.py are Triton kernels written for this recipe that reproduce, operation for operation, SGLang's
+    short-convolution, residual-add, attn_res, RMSNorm and bias-shear kernels. The hooks in patches/sitecustomize.py,
+    fi_moe.py, fi_mxfp8.py, prefill_glue.py, fp8_kv.py, dense_p12.py, dense_i8.py, tp_shard.py, spark_gate.py and
+    sampled_lab.py wrap or replace functions of SGLang's Inkling model code and call its and FlashInfer's kernels.
+    Copyright SGLang Team / FlashInfer contributors. Apache License 2.0.
   - launch/relaunch-inkling2.sh and launch/watchdog-inkling2.sh: adapted from this repository's DeepSeek-V4.1 recipe
     (launch/relaunch.sh, launch/watchdog.sh; same author, MIT).
 

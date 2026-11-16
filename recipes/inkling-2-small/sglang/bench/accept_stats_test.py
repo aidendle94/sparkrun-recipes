@@ -88,12 +88,24 @@ mod._accept_sampling_core(cutoff_verify_lens=None, sampling_info=types.SimpleNam
 check("a step-logit buffer of another width turns the dump off without an error",
       accept_stats._s["dump_off"] and not accept_stats._s["failed"])
 accept_stats._s.update(file=None, dump_off=False)
-accept_stats.DUMP = os.path.join(accept_stats.DUMP, "absent")
 gate._s["sampler"].step_logits = z
-mod._accept_sampling_core(cutoff_verify_lens=None, sampling_info=types.SimpleNamespace(temperatures=torch.ones(1, 1)),
-                          kernel=dict(candidates=cand[:1], target_probs=tp[:1], draft_probs=dp[:1],
-                                      accept_token_num=acc[:1]))
-check("a rank without the directory writes nothing and makes nothing",
-      accept_stats._s["dump_off"] and not accept_stats._s["failed"] and not os.path.exists(accept_stats.DUMP))
+one_step = lambda: mod._accept_sampling_core(
+    cutoff_verify_lens=None, sampling_info=types.SimpleNamespace(temperatures=torch.ones(1, 1)),
+    kernel=dict(candidates=cand[:1], target_probs=tp[:1], draft_probs=dp[:1], accept_token_num=acc[:1]))
+lines = lambda: sum(1 for f in glob.glob(os.path.join(accept_stats.DUMP, "accept-*.jsonl")) for _ in open(f))
+before = (lines(), accept_stats._s["calls"], len(calls))
+open(accept_stats.PAUSE, "w").close()
+one_step()
+check("while <dir>/pause exists nothing is written or counted, and the stock kernel runs",
+      (lines(), accept_stats._s["calls"], len(calls)) == (before[0], before[1], before[2] + 1))
+os.remove(accept_stats.PAUSE)
+one_step()
+check("without it the step is written and counted again",
+      (lines(), accept_stats._s["calls"]) == (before[0] + 1, before[1] + 1) and not accept_stats._s["failed"])
+accept_stats.DUMP = os.path.join(accept_stats.DUMP, "absent")
+before = accept_stats._s["calls"]
+one_step()
+check("a rank without the directory writes nothing, counts nothing and makes nothing",
+      accept_stats._s["calls"] == before and not accept_stats._s["failed"] and not os.path.exists(accept_stats.DUMP))
 print("ALL OK" if not bad else f"{bad} FAILED")
 sys.exit(1 if bad else 0)

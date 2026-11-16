@@ -16,7 +16,8 @@ writing, and most of those days were spent changing it. What that means in pract
   them rebuilds a kernel from the image's own source and refuses to boot if that source has changed.
 - The numbers are single boots on one fleet. The defaults changed several times a day; the last change (sharded
   experts) became the default on 2026-11-15 and has hours of serving behind it, not weeks. The larger pool (half the
-  windowed share, FP8 draft pools) has served since 2026-11-16 and is not a launcher default.
+  windowed share, FP8 draft pools) and the three prefill switches have served since 2026-11-16 and are not
+  launcher defaults.
 - There are open problems, listed under [Known problems](#known-problems). One of them is a scheduler hang that
   happened once and was never reproduced.
 
@@ -40,12 +41,13 @@ the row says otherwise. Every row is one boot; conditions and the history of eac
 | decode, one stream, temperature 0.7 | 56.6 tok/s |
 | decode, four / eight streams at a time, greedy | 106 / 130 tok/s for the batch (about 26 / 16 a stream) |
 | prefill, ~15K-token prompts | 2,400–2,500 tok/s |
-| cold prefill of 130K / 260K / 500K tokens | 61 / 142 / 348 s |
+| cold prefill of 30K / 120K tokens | 2,474 / 2,241 tok/s; 3,110 / 2,786 with the three prefill switches the author's fleet serves with since 2026-11-16 (see [Run it](#run-it)) |
+| cold prefill of 130K / 260K / 500K tokens | 61 / 142 / 348 s; with the prefill switches 120K takes 43 s (54 without) and 300K 135 s |
 | decode behind a long context (130K–500K) | 52–55 tok/s on the 600K configuration; 68 at 130K and 60 at 500K on the 793K one |
 | context length | 262,144 by default; 524,288 run through the environment (see [Run it](#run-it)) |
 | KV pool | 493K–805K tokens, sized at each boot; 545K–600K with the 600K cap of the 500K configuration; 793,000 with the settings the author's fleet serves with since 2026-11-16 (see [Run it](#run-it)) |
 | concurrent requests | 8 |
-| tool calls, 283 cases over five wire formats (chat, Anthropic messages, each also streamed, and responses), two trials | 250 right, 20 soft, 13 failed (10 are `tool_choice: none`, 3 slips on the sampled trial); 12 of 12 agent loops |
+| tool calls, 283 cases over five wire formats (chat, Anthropic messages, each also streamed, and responses), two trials | 250 right, 20 soft, 13 failed (10 are `tool_choice: none`, 3 slips on the sampled trial); 12 of 12 agent loops. With the prefill switches: 252 / 20 / 11, and no case of the temperature-0 trial changed its verdict |
 | boot to healthy | about 5 min with a warm kernel cache, about 17 min the first time |
 | request features | tool calls, reasoning with effort levels; OpenAI chat completions and responses, Anthropic `/v1/messages`; extra model names on `/v1/models` and the Ollama-style `/api/tags` and `/api/show` |
 
@@ -92,6 +94,20 @@ bytes, and none of them touches the target's arithmetic:
 
 `NCCL_EXTRA` is the launcher's pass-through for extra `-e NAME=value` arguments of the containers. The numbers are
 in [docs/results.md](docs/results.md#kv-cache-what-a-token-costs-and-what-grows-the-pool-2026-11-1516).
+
+Also off unless set, and served with since 2026-11-16 17:20 UTC: three switches for prefill, all in `NCCL_EXTRA`.
+Together they take a cold prefill from 2,474 to 3,110 tok/s at 30K tokens (+26 %) and from 2,241 to 2,786 at 120K
+(+24 %); decode is unchanged. The first two keep every value of the model bit for bit; the third does not:
+
+| setting | what it does | cost |
+|---|---|---|
+| `SPARK_PREFILL_GLUE=epilogue,stream,gate,qkvr,relbias` | the small steps between a layer's big kernels (residual adds, norms, the closing convolution, the projections of a global layer, the relative bias) in fewer passes over memory, same operations in the same order (`patches/prefill_glue.py`): +11 % at 30K, +10 % at 120K | none: exact (0 differing values against the stock path on every node, NLL equal token by token) |
+| `SPARK_FA4_BIAS_FAR=f2` | the SM120 attention kernel rebuilt from the image's source so that key blocks beyond the reach of the relative bias skip the bias bookkeeping (`patches/fa4_bias_far.py`): 2 % of a 120K prefill, 3.6 % of a 300K one | none: exact (output and log-sum-exp equal to the stock kernel's bit for bit); refuses to boot if that source has changed |
+| `SPARK_FI_MXFP8=1` | the 8 MXFP8 expert layers on FlashInfer's FP8 grouped GEMM instead of the BF16 Marlin one (`patches/fi_mxfp8.py`): +11 % at 30K, +10 % at 120K | not bit-identical: the same products summed in another order. Held-out NLL 0.9840 against 0.9840; per token the difference is 0.006 on average, above 0.1 for 0.5 % of the tokens |
+
+Leave `SPARK_FI_MXFP8=1` out to keep the target's arithmetic as it was; the other two are worth 12 % on their own.
+The numbers and what was tried and dropped are in
+[docs/results.md](docs/results.md#prefill-the-glue-the-far-bias-kernel-and-mxfp8-off-marlin-2026-11-16).
 
 ## What you need
 
@@ -141,13 +157,18 @@ mkdir -p logs && python3 bench/concurrency_check.py && python3 bench/reasoning_c
 ```
 
 The 500K configuration the author's fleet serves since 2026-11-16 (not the launcher's defaults; the three pool
-settings are in the table above, and `--prefill-decode-interval 2` is a scheduling setting still under test):
+settings and the three prefill switches are in the tables above, and `--prefill-decode-interval 2` is a scheduling
+setting still under test):
 
 ```bash
-CTX=524288 MEMFRAC=0.94 NCCL_EXTRA="-e SPARK_WMARK_BOOST=1 -e SPARK_DRAFT_KV_FP8=1" \
+CTX=524288 MEMFRAC=0.94 \
+  NCCL_EXTRA="-e SPARK_WMARK_BOOST=1 -e SPARK_DRAFT_KV_FP8=1 -e SPARK_PREFILL_GLUE=epilogue,stream,gate,qkvr,relbias -e SPARK_FA4_BIAS_FAR=f2 -e SPARK_FI_MXFP8=1" \
   EXTRA_ARGS="--max-total-tokens 793000 --swa-full-tokens-ratio 0.05 --prefill-decode-interval 2" \
   launch/relaunch-inkling2.sh
 ```
+
+The prefill switches are independent of the pool settings and of each other: leave any of them out of `NCCL_EXTRA`
+and that part runs the stock path.
 
 The cap goes with the settings: the same bytes hold 716,000 tokens without `SPARK_DRAFT_KV_FP8=1` and 600,000
 without the ratio either (the configuration most rows of the table above were measured on:
@@ -213,6 +234,8 @@ The other launcher variables (`PORT`, `MAXREQ`, `CHUNK`, `SERVED`, `SERVED_ALIAS
 | `bench/swa_fill.py`, `bench/prefix_fork.py` | the windowed pool run full, then old and recent conversations asked again; what a continued or a forked prompt reuses of the cache |
 | `bench/stale_answer.py`, `bench/recital_rate.py`, `bench/path_compare.py` | multi-turn lookups over a long context; how often a lookup recites; decode path against prefill path |
 | `bench/effort_tokens.py` | thinking tokens and right answers at each reasoning effort |
+| `bench/glue_check.py`, `bench/bias_far_window.py`, `bench/fi_mxfp8_probe.py`, `bench/fi_mxfp8_test.py` | the prefill switches against the stock path on one idle GPU: differing values, bits, timings |
+| `bench/accept_sim.py`, `bench/sampled_arms.py`, `bench/sampled_lab_check.py`, `bench/timers_report.py` | lab tools: gate rules and draft temperatures scored on dumped steps, arms of one boot side by side, the timers' log lines as a table |
 | `bench/*_test.py`, `bench/compile_check*.py`, `bench/emu/` | kernel tests (idle GPU only, their docstrings say so) and the offline checks that run without a GPU |
 | `docs/results.md` | the lab notes: every hook, lever and number, in the order they were found |
 
