@@ -3,10 +3,10 @@ model: thinkingmachines/Inkling-2-Small          # the official NVFP4 checkpoint
 engine: sglang
 engine_base: lmsysorg/sglang@sha256:424c1da97f6d6eef1612006c77b2ca791657a8184c1fbdbc682ebf9485d3b32c   # the dev-inkling-2-small tag as of 2026-11-12
 image: lmsysorg/sglang:dev-inkling-2-small       # unmodified; the hooks in patches/ are mounted and put on PYTHONPATH
-status: experimental          # production | validated | experimental | archived  (three days old, dev image, open problems: see README)
+status: experimental          # production | validated | experimental | archived  (four days old, dev image, open problems: see README)
 nodes: 4 x NVIDIA DGX Spark (GB10, 128 GB), switched RoCE fabric, TP4/EP4
 context_length: 262144        # launcher default; 524288 run through the environment (README, Run it)
-measured: 2026-11-15          # single boots on one fleet, 2026-11-13 to 2026-11-15
+measured: 2026-11-16          # single boots on one fleet, 2026-11-13 to 2026-11-16
 max_running_requests: 8
 numbers:
   decode_tok_s: {code_greedy: 61, code_t07: 56.6}            # one stream, 400-token coding answers
@@ -14,9 +14,9 @@ numbers:
   prefill_tok_s: {15k_unique: [2417, 2482]}
   cold_prefill_s: {130k: 61, 260k: 142, 500k: 348}
   decode_long_context_tok_s: [52, 55]                        # behind 130K-500K of context
-  kv_pool_tokens: {auto: [493000, 805000], capped_600k: [545000, 600000]}   # sized at each boot from the head's free memory
+  kv_pool_tokens: {auto: [493000, 805000], capped_600k: [545000, 600000], grown_fp8_draft: 793000}   # sized at each boot from the head's free memory
   toolcall_suite: {cases: 283, ok: 250, soft: 20, fail: 13, agent_loops: "12/12"}
   boot_to_healthy_s: {warm: 300, cold: 1020}
-features: [tools, thinking, reasoning_effort, dspark, confidence_gate, fp8_kv, sharded_experts, rdma_collectives, reasoning_cache, served_aliases, prometheus_metrics]
+features: [tools, thinking, reasoning_effort, dspark, confidence_gate, fp8_kv, fp8_draft_kv, sharded_experts, rdma_collectives, reasoning_cache, served_aliases, prometheus_metrics]
 blog: https://aidenle.com/recipes/inkling-2-small-sglang-4x-dgx-spark
 license: MIT

@@ -80,6 +80,15 @@ route_balance (SPARK_ROUTE_BALANCE=1, diagnosis windows only, garbage text): pat
 reasoning_cache (SPARK_REASONING_CACHE=1 or a flag file's path, off by default): patches/reasoning_cache.py keeps the
   reasoning of every answer in the API server and puts it back into history turns a client sends without it (the
   template renders an earlier turn's thinking only when it is sent; without it later questions get earlier answers).
+wmark_boost (SPARK_WMARK_BOOST=1, off by default): patches/wmark_boost.py gives the KV pool sizing the host's
+  MemAvailable without the kernel's watermark boost (a reclaim target of a few minutes that hides up to 2.24 GB of
+  page cache here at the second the pool is sized, on some boots and not on others).
+draft_kv_fp8 (SPARK_DRAFT_KV_FP8=1, off by default; with --kv-cache-dtype fp8_e4m3): SGLang gives the DSpark draft a
+  BF16 KV pool beside an FP8 target pool, because FA4 (the draft block's attention) reads K/V in the query dtype
+  only. With this the draft's pool is e4m3 as well (half its bytes) and fa4_sm12x_args sends the draft block's
+  reads to patches/draft_decode.py (the image's Triton decode kernel rebuilt for an e4m3 pool: every valid key, no
+  bias). The draft's K/V are rounded when stored; the target's arithmetic is untouched.
+  SPARK_DRAFT_KV_STATS=1 (diagnosis windows only): patches/draft_kv_stats.py logs what e4m3 does to those values.
 SPARK_FA_DEBUG=1: also log the tensors of a failing SM12x FA4 call.
 MIT License, Copyright (c) 2026 Aiden Le.
 """
@@ -149,6 +158,11 @@ def fa4_sm12x_args(mod):
             q = kwargs.get("q", args[0] if args else None)
             scale_after_add = kwargs.pop("rel_bias_scale_after_add", False)
             presheared = kwargs.pop("rel_bias_presheared", False)
+            if _DRAFT_KV_FP8 and __name == "flash_attn_with_kvcache" and not args and _e4m3(kwargs.get("k_cache")):
+                import draft_decode
+                if draft_decode.handles(kwargs):  # draft_kv_fp8: the draft's block reads its e4m3 pool in place
+                    return _timed("draft_kv", draft_decode.fa4_call)(**kwargs)
+                draft_decode.not_handled(kwargs)  # logged once; the call goes on as any e4m3 cache does
             out = kwargs.get("out")
             widen = out is not None and q is not None and out.dtype != q.dtype
             if widen:
@@ -216,6 +230,44 @@ def _e4m3(tensor):
     return tensor is not None and str(tensor.dtype) == "torch.float8_e4m3fn"
 
 
+# SPARK_DRAFT_KV_FP8=1 (unset = off): the draft's KV pool in e4m3 like the target's, read by patches/draft_decode.py.
+_DRAFT_KV_FP8 = os.environ.get("SPARK_DRAFT_KV_FP8") == "1"
+
+
+if _DRAFT_KV_FP8:
+    @_on_import("sglang.srt.mem_cache.kv_cache_dtype")
+    def draft_kv_fp8(mod):
+        """The draft runner, the pool budget and the pool placement all ask this function for the draft's KV dtype;
+        stock answers the model dtype for an fa4 draft. Answer what it gives a draft whose backend reads FP8."""
+        import logging
+        stock = mod.configure_kv_cache_dtype
+        told = []
+
+        def configure_kv_cache_dtype(**kwargs):
+            asked = kwargs.get("speculative_draft_kv_cache_dtype") or kwargs.get("server_args_kv_cache_dtype")
+            if (kwargs.get("is_draft_worker") and kwargs.get("is_dflash") and asked == "fp8_e4m3"
+                    and kwargs.get("speculative_draft_attention_backend") == "fa4" and _sm12x()):
+                import torch
+                import draft_decode  # noqa: F401  derive the kernel now: a changed image fails the boot
+                resolved, dtype = stock(**{**kwargs, "speculative_draft_attention_backend": "fa4+draft_decode"})
+                if dtype == torch.float8_e4m3fn:
+                    if not told:
+                        told.append(1)
+                        logging.getLogger("spark.draft_kv_fp8").warning(
+                            "[draft_kv_fp8] the draft's KV pool is %s (read by patches/draft_decode.py)", dtype)
+                    return resolved, dtype
+            return stock(**kwargs)
+
+        configure_kv_cache_dtype.__wrapped__ = stock
+        mod.configure_kv_cache_dtype = configure_kv_cache_dtype
+
+    if os.environ.get("SPARK_DRAFT_KV_STATS") == "1":
+        @_on_import("sglang.srt.models.inkling2_mtp")
+        def draft_kv_stats(mod):
+            import draft_kv_stats as stats
+            stats.install(mod)
+
+
 @_on_import("sglang.srt.layers.attention.flashattention_backend")
 def fp8_kv_query(mod):
     if not _sm12x():
@@ -231,6 +283,14 @@ def fp8_kv_query(mod):
 
     prepare_paged_mha_query.__wrapped__ = stock
     cls.prepare_paged_mha_query = prepare_paged_mha_query
+
+
+@_on_import("sglang.srt.utils.common")
+def wmark_boost(mod):
+    if os.environ.get("SPARK_WMARK_BOOST") != "1" or not hasattr(mod, "psutil"):
+        return
+    import wmark_boost as wb
+    mod.psutil = wb.Psutil(mod.psutil)
 
 
 @_on_import("sglang.kernels.ops.inkling2.comm")

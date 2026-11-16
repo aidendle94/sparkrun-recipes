@@ -12,8 +12,9 @@ Adapted third-party code (modified for this recipe; the original notices apply t
     project. Apache License 2.0. It drives the b12x RoCE runtime bundled in the image's FlashInfer (Apache-2.0).
   - patches/sitecustomize.py: the served-alias route handlers mirror SGLang's http_server.py originals (ported from
     this repository's DeepSeek-V4.1 recipe, overlay/served_aliases.py). Copyright SGLang Team. Apache License 2.0.
-  - patches/paged_decode.py: rebuilds SGLang's Triton decode kernel from the source inside the image at import, with
-    the page lookup changed; it carries no copy of that source. The hooks in patches/sitecustomize.py, fi_moe.py,
+  - patches/paged_decode.py and patches/draft_decode.py: rebuild SGLang's Triton decode kernel from the source inside
+    the image at import, with the page lookup (and, for the draft's reader, the masks) changed; they carry no copy of
+    that source. The hooks in patches/sitecustomize.py, fi_moe.py,
     fp8_kv.py, dense_p12.py, dense_i8.py, tp_shard.py and spark_gate.py wrap or replace functions of SGLang's Inkling
     model code and call its and FlashInfer's kernels. Copyright SGLang Team / FlashInfer contributors. Apache License 2.0.
   - launch/relaunch-inkling2.sh and launch/watchdog-inkling2.sh: adapted from this repository's DeepSeek-V4.1 recipe

@@ -1,6 +1,6 @@
 # Inkling-2-Small on four DGX Sparks: lab notes
 
-The working notes behind this recipe, in the order things were built and measured (2026-11-12 to 2026-11-15): what
+The working notes behind this recipe, in the order things were built and measured (2026-11-12 to 2026-11-16): what
 the GB10 hooks do, the bug that produced garbage under concurrency, every decode lever with its numbers, long
 contexts and multi-turn history, the reasoning loop on long lists, the KV cache, reasoning effort, and the first
 day's measurements. "Production" and "the fleet" mean the author's four Sparks; times are UTC. Each number is one
@@ -410,13 +410,94 @@ anywhere. Which questions fail differs from provider to provider and between two
 then 5, four of them shared), as it does between two boots here. Reasoning effort was left unset on both sides; the
 answers that came were as long as ours (median 400 to 500 output tokens against 464).
 
-## KV cache: what a token costs and what could grow the pool (2026-11-15, investigated, nothing changed)
+## KV cache: what a token costs and what grows the pool (2026-11-15/16)
+
+Serving since 2026-11-16 00:34 UTC, through the environment of the relaunch (not the launcher's defaults):
+
+    CTX=524288 MEMFRAC=0.94 NCCL_EXTRA="-e SPARK_WMARK_BOOST=1 -e SPARK_DRAFT_KV_FP8=1" \
+      EXTRA_ARGS="--max-total-tokens 793000 --swa-full-tokens-ratio 0.05 --prefill-decode-interval 2" bash launch/relaunch-inkling2.sh
+
+Two steps, each in the bytes of the one before: the windowed pool at half its share (716,000 tokens, 11-15 22:37
+UTC), then the draft's pools as FP8 (793,000 tokens, below).
+
+### The grown pool (716,000 tokens, 2026-11-15 22:37 UTC)
+
+    CTX=524288 MEMFRAC=0.94 NCCL_EXTRA="-e SPARK_WMARK_BOOST=1" \
+      EXTRA_ARGS="--max-total-tokens 716000 --swa-full-tokens-ratio 0.05 --prefill-decode-interval 2" bash launch/relaunch-inkling2.sh
+
+The pool is 716,000 tokens (windowed pool 35,800 slots) in the bytes the 600,000 cap took: half the windowed pool
+(6,349 bytes a token against 7,578), the cap raised by the same factor, and `SPARK_WMARK_BOOST=1`
+(`patches/wmark_boost.py`), which gives the sizing the host's `MemAvailable` without the kernel's watermark boost
+(below), so that a boosted boot gets the same pool. Nothing in a request's arithmetic changes. Measured on that
+boot against the boots before:
+
+| | 600K cap, ratio 0.1 | 716K cap, ratio 0.05 |
+|---|---|---|
+| pool, windowed pool | 544,644 / 54,464 on the last boot (a boosted one; 600,000 / 60,000 on a full one) | 716,000 / 35,800 (one worker read 2.24 GB of boost at the sizing second and had it added back) |
+| one stream, greedy code (`bench/step_time.py`, against the sign-off boot) | 61.9 tok/s | 61.8 tok/s, step time x1.001, same text on 8 of 8 |
+| 4 / 8 streams | 106 / 130 tok/s | 103-105 / 143 tok/s |
+| windowed pool run full (`bench/swa_fill.py`: 64 new conversations of 1.5K tokens, 8 at a time, then the oldest 8 and the newest 8 again) | 80 of 80 lookups exact; old ones 8.1 s (recomputed), recent ones 2.4 s | 80 of 80 exact; 8.2 s and 2.6 s; the same with 48 conversations of 6K tokens (64 of 64) |
+| 130K context | | lookups exact cold and warm, prefill 2,116 tok/s, decode 69 tok/s |
+| 500K context, twice | prefill 1,433 tok/s; 1 of 2 lookups answered | prefill 1,453 and 1,440 tok/s, decode 56-58 tok/s; 1 of 4 lookups answered, the other three ran out of 4,000 tokens reciting the list (the recital loop above; the 114 records in each of two recitals checked against the prompt are exact and in order) |
+| head memory during a 500K prefill | 1.6 GB available at the lowest | 2.33 GB available, 1.81 GB free at the lowest |
+| soak (`bench/stress.py`, 12 workers, one long context, 15 min) | passed | passed: 54 requests, one recital on a 158K lookup (right when asked alone), no failed health check, peak 387K tokens in use |
+
+What the smaller windowed pool costs: cached prompts whose windows stay alive, about 35 conversation ends of 1,024
+tokens instead of 53 to 58. One that lost its window is prefilled again when it comes back (8 s at 1.5K tokens, 26 s
+at 6K in the fill test); a running request is not affected. The first text check after the boot flagged one prompt
+(the watchdog's probe shared its decode batch, a near-tie at token 80, sane text); the second run and the one at
+the end of the window passed.
+
+Rollback: the relaunch line under "Long contexts" (600,000 cap, no ratio, no `NCCL_EXTRA`).
+
+### The draft's pools as FP8 (793,000 tokens, 2026-11-16 00:34 UTC; `SPARK_DRAFT_KV_FP8=1`, off unless set)
+
+SGLang resets the draft's KV to BF16 because FA4, which the draft's block reads its KV with, wants K and Q of one
+dtype. With `SPARK_DRAFT_KV_FP8=1` (and an e4m3 target pool) the draft's two pools are e4m3 too, and
+`patches/draft_decode.py` is the reader: the image's Triton decode kernel rebuilt at import (the page looked up per
+key, a cast after the K/V loads, the causal mask and the bias replaced by the mask of the valid keys; a second
+small kernel reduces the splits), static shapes, so it runs inside the draft's CUDA graph. The draft's block is 8
+queries a request over the whole prefix and itself, not causal, no bias; a windowed layer arrives as a table of its
+window's slots and is the same call. Every other FA4 call on an e4m3 cache goes on as before (logged once a kind: the
+target's prefill). A pool token costs 5,734 bytes a node instead of 6,349, so the same bytes hold 793,000 tokens
+(windowed pool 39,650): +10.8% on the step before, +32% on a full boot at the 600,000 cap. The target's arithmetic is
+untouched; the draft's K and V are rounded when stored, which can move what it proposes (and, through the
+confidence gate, a near-tie in the text).
+
+Window of 2026-11-16 00:20 to 01:27 UTC (production stopped for the kernel test, a boot with the statistics, then
+the boot that serves):
+
+| | 716K, draft pools BF16 | 793K, draft pools e4m3 |
+|---|---|---|
+| the reader alone (`bench/draft_decode_test.py`, idle head, 68 checks) | | within 2.3e-3 relative L2 of dense fp64 on the stored values, 3.0e-3 of FA4 on the same values as BF16; a captured graph replays what eager computes; stock's tile of 32 keys kept (64 and 128 no faster) |
+| its time against FA4 on BF16, one layer, one call | | windowed layer 26-41 us against 36-37; global layer at 2K keys 61 against 48 us, at 30K 104 against 126, at 200K 525 against 908, at 500K 1,204 against 2,264; 8 requests at 200K 3.5 against 7.1 ms |
+| the draft's K and V at the store (`SPARK_DRAFT_KV_STATS=1`, 89,594 context tokens, every rank) | | K rms 1.3-2.2, largest 19; V rms 0.5-5.0, largest 31 (e4m3 holds 448): nothing saturates, nothing non-finite; relative RMS error of the rounding 2.7% on every layer's K and V; V below 2^-10 (rounds to zero) 0.01-0.15% of the values, K up to 4% (layer 2), small values that carry no weight in the error |
+| pools as allocated (rank 0) | | all four e4m3: target 793,000 (1.51 + 1.51 GB) and 39,650 (0.38 + 0.38), draft 793,000 (0.19 + 0.19) and 39,650 (0.04 + 0.04) |
+| one stream, greedy code (`bench/step_time.py`, against the 716K boot, two boots) | 61.8 tok/s, 58.1 ms a step | 60.2 and 59.0 tok/s; step time x1.001 and x1.007, at equal accept +0.6 ms a step (+1.0%, se 0.5); accepted tokens a step x1.000 (medians, request by request); same text on 6 of 8 |
+| 4 / 8 streams | 103-105 / 143 tok/s | 104 and 95 / 142.5 tok/s |
+| the target's decode path against its prefill path (`bench/bias_consistency.py`, 4 files, 199 tokens each; the target is not meant to move) | | decode NLL 0.001 to 0.013 below the prefill NLL, no logprob off by more than 0.72 (the size these had in earlier windows) |
+| text under concurrency, three runs; reasoning cache | | all passed |
+| tool calls (`bench/toolcall_check.py`, 2 trials) | 13 failures: the 10 `tool_choice: none` cases and 3 sampled slips | the same count and kinds; 12 of 12 agent loops pass |
+| `bench/prefix_fork.py`, `bench/swa_fill.py` | | cached prefixes as before; 80 of 80 lookups exact with the windowed pool run full |
+| 130K context | lookups exact, prefill 2,116 tok/s, decode 69 tok/s | exact cold and warm, 1,984 tok/s, 68 tok/s |
+| 500K context | prefill 1,453 tok/s, decode 56-58 tok/s, 1 of 4 lookups answered | 1,445 tok/s, decode 60.2 tok/s; neither lookup answered: both ran out of 4,000 tokens reciting the list (the recital loop; the cold one recites the same stretch of records as the cold one of the 716K boot) |
+| soak (`bench/stress.py`, 12 workers, one long context, 12 min) | passed | passed: 50 requests, none with a problem, no failed health check, peak 368K tokens in use |
+| head memory | 2.2-3.0 GB available serving, 2.33 GB at the lowest in a 500K prefill | 2.3-3.0 GB available at the stages of the window (2.3 after the 500K prefill and through the soak) |
+
+So: 77,000 more tokens for about 1% of step time on one short stream (two boots agree, each within about one
+standard error of zero), nothing at 4 and 8 streams, and a faster draft at long contexts. Hottest node 88 C; no
+traceback in a rank log.
+
+Rollback: the relaunch line of the 716,000 pool above (no `SPARK_DRAFT_KV_FP8`, cap 716000). The flag without the
+cap is harmless (the same pool tokens in fewer bytes); the cap without the flag asks for more than the bytes hold
+and the engine sizes the pool down.
 
 The KV cache is not replicated: the model has 8 KV heads and under TP4 every node holds 2 of them. A pool token
 costs 7,578 bytes a node: 4,096 for the target's 8 global layers (FP8), 2,048 for its 40 windowed layers (20,480 a
 token, in a pool of 0.1 token slots a token: `--swa-full-tokens-ratio`, 0.1 is the model's default), 1,024 and 410
-for the draft's two pools, which stay BF16 (the engine resets the draft's KV to the model dtype because its
-attention backend wants K and Q of one dtype; `--speculative-draft-kv-cache-dtype` is read before that reset).
+for the draft's two pools, which stay BF16 unless `SPARK_DRAFT_KV_FP8=1` (the engine resets the draft's KV to the
+model dtype because its attention backend wants K and Q of one dtype; `--speculative-draft-kv-cache-dtype` is read
+before that reset; with the flag they are 512 and 205, and with the windowed share halved the token costs 5,734).
 The pool is sized from the host's `MemAvailable` (unified memory), the least over the ranks, minus
 (1 - `--mem-fraction-static`) of the memory before the load: the head, which also runs the API server (1.3 GB),
 the detokenizer (1.0 GB) and whatever else runs there, has about 3.8 GB less than the workers at that point and
@@ -433,9 +514,7 @@ sizes every rank's pool. One GB there is about 130K tokens.
 - `bench/prefix_fork.py` (live, about 12K tokens): a request that continues a cached prompt reuses it to the last
   64 tokens; one that parts from it midway reuses it up to the last 4,096-token chunk boundary before the fork
   (6,000 shared: 4,096 cached; 9,000: 8,192; 2,048: none), and up to its own earlier end the second time.
-- Not booted, in order of what they would give: `--swa-full-tokens-ratio 0.05` (+19% tokens; the scheduler's own
-  worst case at 8 requests is about 25K windowed slots of the 30K left at 600K), an FP8 draft pool (+10%, a patch;
-  the draft's arithmetic only), both (+32%), correcting the boost at sizing, moving clients off the head. A disk
+- Not tried: moving clients off the head. A disk
   tier (the engine's HiCache) needs its 10 GiB host reserve patched and a host staging arena out of the same
   memory, and writes one file a token at page size 1; whether it restores the windowed tail, the conv state and the
   draft's KV is not known. KV page sharding across nodes applies to replicated KV only (not this model); FP4 KV is

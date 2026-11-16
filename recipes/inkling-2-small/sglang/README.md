@@ -9,13 +9,14 @@ node and put on `PYTHONPATH`; they supply what GB10 needs (attention arguments, 
 four boxes, a correct decode kernel at page size 1) and then the speed: about 61 tok/s for one stream, where the
 image's own decode step on the same hardware gave 37.
 
-**Status: experimental.** It has served the author's fleet since 2026-11-12, which is three days at the time of
+**Status: experimental.** It has served the author's fleet since 2026-11-12, which is four days at the time of
 writing, and most of those days were spent changing it. What that means in practice:
 
 - The base is a development image, not an SGLang release. The hooks bind to one build of it (digest below). One of
   them rebuilds a kernel from the image's own source and refuses to boot if that source has changed.
 - The numbers are single boots on one fleet. The defaults changed several times a day; the last change (sharded
-  experts) became the default on 2026-11-15 and has hours of serving behind it, not weeks.
+  experts) became the default on 2026-11-15 and has hours of serving behind it, not weeks. The larger pool (half the
+  windowed share, FP8 draft pools) has served since 2026-11-16 and is not a launcher default.
 - There are open problems, listed under [Known problems](#known-problems). One of them is a scheduler hang that
   happened once and was never reproduced.
 
@@ -29,7 +30,7 @@ ports. **Pool**: the KV cache, counted in tokens, shared by all running and cach
 
 ## What you get
 
-Measured on four Sparks over a switched RoCE fabric, 2026-11-13 to 2026-11-15, with the launcher's defaults unless
+Measured on four Sparks over a switched RoCE fabric, 2026-11-13 to 2026-11-16, with the launcher's defaults unless
 the row says otherwise. Every row is one boot; conditions and the history of each number are in
 [docs/results.md](docs/results.md).
 
@@ -40,9 +41,9 @@ the row says otherwise. Every row is one boot; conditions and the history of eac
 | decode, four / eight streams at a time, greedy | 106 / 130 tok/s for the batch (about 26 / 16 a stream) |
 | prefill, ~15K-token prompts | 2,400–2,500 tok/s |
 | cold prefill of 130K / 260K / 500K tokens | 61 / 142 / 348 s |
-| decode behind a long context (130K–500K) | 52–55 tok/s |
+| decode behind a long context (130K–500K) | 52–55 tok/s on the 600K configuration; 68 at 130K and 60 at 500K on the 793K one |
 | context length | 262,144 by default; 524,288 run through the environment (see [Run it](#run-it)) |
-| KV pool | 493K–805K tokens, sized at each boot; 545K–600K with the 600K cap of the 500K configuration |
+| KV pool | 493K–805K tokens, sized at each boot; 545K–600K with the 600K cap of the 500K configuration; 793,000 with the settings the author's fleet serves with since 2026-11-16 (see [Run it](#run-it)) |
 | concurrent requests | 8 |
 | tool calls, 283 cases over five wire formats (chat, Anthropic messages, each also streamed, and responses), two trials | 250 right, 20 soft, 13 failed (10 are `tool_choice: none`, 3 slips on the sampled trial); 12 of 12 agent loops |
 | boot to healthy | about 5 min with a warm kernel cache, about 17 min the first time |
@@ -79,6 +80,18 @@ The ones that make it faster or larger, all on by default, each with its own off
 
 Each is switched off by setting it empty on the relaunch (`TP_SHARD= DENSE_P12=` is the stack as it served before
 2026-11-15); `KV_DTYPE=auto` is the BF16 pool.
+
+Off unless set, and what the author's fleet has served with since 2026-11-16. They grow the pool in the same
+bytes, and none of them touches the target's arithmetic:
+
+| setting | what it does | cost |
+|---|---|---|
+| `--swa-full-tokens-ratio 0.05` (in `EXTRA_ARGS`) | halves the pool of the 40 windowed layers, which was the slack: a pool token costs 6,349 bytes a node instead of 7,578 | about 35 cached conversation ends keep their window instead of 53–58; one that lost it is prefilled again when it comes back |
+| `SPARK_WMARK_BOOST=1` (in `NCCL_EXTRA`) | sizes the pool from the memory a node has without the kernel's temporary watermark boost, so that every boot gets the same pool (`patches/wmark_boost.py`) | none |
+| `SPARK_DRAFT_KV_FP8=1` (in `NCCL_EXTRA`) | the draft's KV pools as FP8 with a reader of their own (`patches/draft_decode.py`): 5,734 bytes a token, 793,000 tokens where 716,000 fitted | about 1 % of step time for one short stream, nothing at 4 and 8 streams; accepted tokens a step unchanged; the draft is faster behind a long context |
+
+`NCCL_EXTRA` is the launcher's pass-through for extra `-e NAME=value` arguments of the containers. The numbers are
+in [docs/results.md](docs/results.md#kv-cache-what-a-token-costs-and-what-grows-the-pool-2026-11-1516).
 
 ## What you need
 
@@ -127,12 +140,20 @@ curl -s http://<rank-0>:8210/v1/chat/completions -H 'content-type: application/j
 mkdir -p logs && python3 bench/concurrency_check.py && python3 bench/reasoning_cache_check.py --expect on
 ```
 
-The 500K configuration the author's fleet serves (not the launcher's default: the 600K cap leaves room for one
-500K conversation and little else, and `--prefill-decode-interval 2` is a scheduling setting still under test):
+The 500K configuration the author's fleet serves since 2026-11-16 (not the launcher's defaults; the three pool
+settings are in the table above, and `--prefill-decode-interval 2` is a scheduling setting still under test):
 
 ```bash
-CTX=524288 MEMFRAC=0.94 EXTRA_ARGS="--max-total-tokens 600000 --prefill-decode-interval 2" launch/relaunch-inkling2.sh
+CTX=524288 MEMFRAC=0.94 NCCL_EXTRA="-e SPARK_WMARK_BOOST=1 -e SPARK_DRAFT_KV_FP8=1" \
+  EXTRA_ARGS="--max-total-tokens 793000 --swa-full-tokens-ratio 0.05 --prefill-decode-interval 2" \
+  launch/relaunch-inkling2.sh
 ```
+
+The cap goes with the settings: the same bytes hold 716,000 tokens without `SPARK_DRAFT_KV_FP8=1` and 600,000
+without the ratio either (the configuration most rows of the table above were measured on:
+`CTX=524288 MEMFRAC=0.94 EXTRA_ARGS="--max-total-tokens 600000 --prefill-decode-interval 2"`). A cap above what
+the bytes hold is sized down by the engine. The bytes are what the rank-0 node has free at boot, so the cap that
+fits is a property of the site.
 
 Stop: kill the watchdog (the pid is in the last `watchdog started` line of `~/inkling2-watchdog.log`), then
 `launch/launch-inkling2.sh --stop`. The watchdog probes `/health` and a three-token chat completion every 60 s and
@@ -167,7 +188,8 @@ The other launcher variables (`PORT`, `MAXREQ`, `CHUNK`, `SERVED`, `SERVED_ALIAS
   endpoints do the same on the same questions (29 of 200 across four providers against 4 of 40 here). No server
   setting fixes it; a search tool is the right way to look things up in such lists.
 - **The pool differs from boot to boot** (493K–805K) because it is sized from what the head node has free at that
-  moment, and the kernel's watermark boost moves that by gigabytes.
+  moment, and the kernel's watermark boost moves that by gigabytes. `SPARK_WMARK_BOOST=1` corrects the sizing for it (off
+  unless set).
 - **Log-probability requests over long spans can take a node down** (the full-vocabulary logits of every scored
   position). Keep scored spans to a few hundred tokens.
 - **No GPU work beside the serving fleet**, however small: there is no memory for it, and the driver fails
@@ -188,6 +210,7 @@ The other launcher variables (`PORT`, `MAXREQ`, `CHUNK`, `SERVED`, `SERVED_ALIAS
 | `bench/toolcall_check.py` | the tool-call suite (wire formats and agent loops) |
 | `bench/streams.py`, `bench/step_time.py` | decode tok/s against the number of streams; step time of a boot, comparable between boots whose text differs |
 | `bench/longctx.py`, `bench/longctx_edges.py`, `bench/stress.py` | long contexts end to end, their edges, mixed load |
+| `bench/swa_fill.py`, `bench/prefix_fork.py` | the windowed pool run full, then old and recent conversations asked again; what a continued or a forked prompt reuses of the cache |
 | `bench/stale_answer.py`, `bench/recital_rate.py`, `bench/path_compare.py` | multi-turn lookups over a long context; how often a lookup recites; decode path against prefill path |
 | `bench/effort_tokens.py` | thinking tokens and right answers at each reasoning effort |
 | `bench/*_test.py`, `bench/compile_check*.py`, `bench/emu/` | kernel tests (idle GPU only, their docstrings say so) and the offline checks that run without a GPU |
