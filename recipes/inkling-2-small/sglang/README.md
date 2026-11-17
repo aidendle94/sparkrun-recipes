@@ -161,12 +161,12 @@ mkdir -p logs && python3 bench/concurrency_check.py && python3 bench/reasoning_c
 ```
 
 With nothing set, the launcher starts the 500K configuration the author's fleet serves since 2026-11-16: 524,288
-tokens of context, `MEMFRAC=0.94`, a pool capped at 793,000 tokens, the three prefill switches. The fleet's own
-line adds one scheduling setting that is still under test and therefore not a default:
-
-```bash
-EXTRA_ARGS="--prefill-decode-interval 2" launch/relaunch-inkling2.sh
-```
+tokens of context, `MEMFRAC=0.94`, a pool capped at 793,000 tokens, the three prefill switches and one scheduling
+setting, `--prefill-decode-interval 2` (`PREFILL_DECODE_INTERVAL`): after a prefill batch the scheduler runs two
+decode rounds before it takes the next one, so requests that are already decoding keep getting tokens through a
+long prefill. A new request still waits for the whole prefill ahead of it. The setting has been on the fleet's line
+since the 500K stress test and was not measured against a boot without it; `PREFILL_DECODE_INTERVAL=` leaves the
+scheduling to the engine.
 
 The cap goes with the pool settings: the same bytes hold 716,000 tokens with `DRAFT_KV_FP8=` and 600,000 with
 `SWA_RATIO=` as well, and the launcher picks the cap accordingly. A cap above what the bytes hold is sized down by
@@ -178,12 +178,11 @@ Earlier configurations with today's launcher:
 
 ```bash
 # 600,000-token pool, no prefill switches (what most rows of the table above were measured on)
-SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= \
-  EXTRA_ARGS="--prefill-decode-interval 2" launch/relaunch-inkling2.sh
+SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= launch/relaunch-inkling2.sh
 
-# the defaults before 2026-11-17: 262,144 tokens of context, the pool sized at each boot
+# the defaults before 2026-11-17: 262,144 tokens of context, the pool sized at each boot, the engine's scheduling
 CTX=262144 MEMFRAC=0.93 POOL= SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= \
-  launch/relaunch-inkling2.sh
+  PREFILL_DECODE_INTERVAL= launch/relaunch-inkling2.sh
 ```
 
 `NCCL_EXTRA` (extra `-e NAME=value` arguments of the containers) and `EXTRA_ARGS` (extra server arguments) come

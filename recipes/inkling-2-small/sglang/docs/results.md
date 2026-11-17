@@ -10,10 +10,15 @@ tools in `bench/`, the hooks in `patches/`. The summary and the way to run it ar
 ## Launcher defaults since 2026-11-17
 
 The 500K configuration the fleet has served since 2026-11-16 17:20 UTC is what the launcher starts when nothing is
-set. `--prefill-decode-interval 2` is the one part of the serving line that is not a default (a scheduling setting
-still under test), so the serving line is now
+set, so the serving line is now
 
-    EXTRA_ARGS="--prefill-decode-interval 2" bash launch/relaunch-inkling2.sh
+    bash launch/relaunch-inkling2.sh
+
+The last part of the old line, the scheduling setting `--prefill-decode-interval 2`, became a default later the
+same day (`PREFILL_DECODE_INTERVAL`). After a prefill batch the scheduler runs two decode rounds before it takes
+the next one, so requests that are already decoding keep getting tokens through a long chunked prefill; it is
+skipped while nothing is decoding, and a new request still waits for the whole prefill ahead of it. It has been on
+the serving line since the 500K stress test of 2026-11-14 and was never measured against a boot without it.
 
 | variable (default) | container setting | empty means |
 |---|---|---|
@@ -26,6 +31,7 @@ still under test), so the serving line is now
 | `PREFILL_GLUE` (epilogue,stream,gate,qkvr,relbias) | `SPARK_PREFILL_GLUE` | stock's glue |
 | `BIAS_FAR` (f2) | `SPARK_FA4_BIAS_FAR` | the image's forward kernel |
 | `FI_MXFP8` (1) | `SPARK_FI_MXFP8=1` | the MXFP8 expert layers on Marlin: the target's arithmetic as it was |
+| `PREFILL_DECODE_INTERVAL` (2) | `--prefill-decode-interval` | the engine's scheduling: no decode rounds held between prefill batches |
 
 `POOL`, when it is not set, is the cap that was measured for the pool settings in force, the same bytes each time:
 793,000 with FP8 KV, `DRAFT_KV_FP8=1` and `SWA_RATIO=0.05`; 716,000 with `DRAFT_KV_FP8=`; 600,000 with `SWA_RATIO=`
@@ -39,11 +45,11 @@ the same four `docker run` commands come from (dry-runs compared byte for byte):
 
 | configuration | line with the launcher since 2026-11-17 |
 |---|---|
-| serving since 2026-11-16 17:20 UTC (793,000, three prefill switches) | `EXTRA_ARGS="--prefill-decode-interval 2" bash launch/relaunch-inkling2.sh` |
-| 793,000 without the prefill switches (KV section) | `PREFILL_GLUE= BIAS_FAR= FI_MXFP8= EXTRA_ARGS="--prefill-decode-interval 2" bash launch/relaunch-inkling2.sh` |
-| 716,000 (KV section) | `DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= EXTRA_ARGS="--prefill-decode-interval 2" bash launch/relaunch-inkling2.sh` |
-| 600,000 (Long contexts) | `SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= EXTRA_ARGS="--prefill-decode-interval 2" bash launch/relaunch-inkling2.sh` |
-| the launcher's defaults before 2026-11-17 (262,144 context, pool sized at boot) | `CTX=262144 MEMFRAC=0.93 POOL= SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= bash launch/relaunch-inkling2.sh` |
+| serving since 2026-11-16 17:20 UTC (793,000, three prefill switches) | `bash launch/relaunch-inkling2.sh` |
+| 793,000 without the prefill switches (KV section) | `PREFILL_GLUE= BIAS_FAR= FI_MXFP8= bash launch/relaunch-inkling2.sh` |
+| 716,000 (KV section) | `DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= bash launch/relaunch-inkling2.sh` |
+| 600,000 (Long contexts) | `SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= bash launch/relaunch-inkling2.sh` |
+| the launcher's defaults before 2026-11-17 (262,144 context, pool sized at boot, no interval) | `CTX=262144 MEMFRAC=0.93 POOL= SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= PREFILL_DECODE_INTERVAL= bash launch/relaunch-inkling2.sh` |
 
 ## GB10 hooks (`patches/sitecustomize.py`)
 
@@ -379,8 +385,8 @@ defaults were 262,144 and an automatic pool until 2026-11-17; the line as it was
 
     CTX=524288 MEMFRAC=0.94 EXTRA_ARGS="--max-total-tokens 600000 --prefill-decode-interval 2" bash launch/relaunch-inkling2.sh
 
-The pool is fixed at 600,000 tokens. `--prefill-decode-interval 2` is a scheduling setting added for the test boot,
-not a decided default. Measured on that boot (`bench/longctx.py`, `bench/stress.py`, `bench/longctx_edges.py`):
+The pool is fixed at 600,000 tokens. `--prefill-decode-interval 2` is a scheduling setting added for the test boot
+(a launcher default since 2026-11-17, `PREFILL_DECODE_INTERVAL`). Measured on that boot (`bench/longctx.py`, `bench/stress.py`, `bench/longctx_edges.py`):
 
 | | |
 |---|---|

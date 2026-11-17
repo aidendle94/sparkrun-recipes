@@ -22,6 +22,7 @@
 #      PREFILL_GLUE (epilogue,stream,gate,qkvr,relbias, the default since 2026-11-17 | empty = off: the per-layer glue of a prefill chunk in fewer passes over memory, patches/prefill_glue.py; exact; cold prefill +11% at 30,000 tokens, +10% at 120,000)
 #      BIAS_FAR (f2, the default since 2026-11-17 | empty = off: the SM120 attention kernel derived from the image's source, its far key blocks compiled without the bias state, patches/fa4_bias_far.py; exact; 2% of a 120,000-token prefill, 3.6% of a 300,000-token one)
 #      FI_MXFP8 (1, the default since 2026-11-17 | empty = off, which keeps the target's arithmetic as it was: the MXFP8 expert layers on FlashInfer's MXFP8 grouped GEMM instead of Marlin, patches/fi_mxfp8.py; does nothing without FI_MOE=1 and fp8 in TP_SHARD; not bit-identical (the order of the sums), held-out NLL unchanged; cold prefill +11% at 30,000 tokens, +10% at 120,000)
+#      PREFILL_DECODE_INTERVAL (2, the default since 2026-11-17 | empty = off, the engine's own scheduling: --prefill-decode-interval, the decode rounds the scheduler runs after a prefill batch before it takes the next one, so that requests already decoding keep getting tokens through a long prefill; skipped while nothing is decoding; a new request still waits for the whole prefill; not measured against a boot without it)
 #      SERVED_ALIASES (empty: extra ids listed by /v1/models, comma-separated) MTP (1|0: DSpark with the bundled draft, ~1.7x decode) EXTRA_ARGS
 # MIT License, Copyright (c) 2026 Aiden Le.
 set -o pipefail
@@ -34,7 +35,7 @@ HEAD=${NODES[0]}; PORT=${PORT:-8210}; DIST_PORT=${DIST_PORT:-20200}; NAME=inklin
 IMAGE=${INKLING_IMAGE:-lmsysorg/sglang:dev-inkling-2-small}; CTX=${CTX:-524288}; CHUNK=${CHUNK:-4096}; MAXREQ=${MAXREQ:-8}
 MEMFRAC=${MEMFRAC:-0.94}; SERVED=${SERVED:-inkling-2-small}; MTP=${MTP:-1}; KV_DTYPE=${KV_DTYPE:-fp8_e4m3}; GATE=${GATE-0.4}; DENSE_I8=${DENSE_I8-draft,dhead,dfree}; DENSE_P12=${DENSE_P12-attn,head,free}; REASONING_CACHE=${REASONING_CACHE-1}; TP_SHARD=${TP_SHARD-half,fp8}
 ROCE_AR=${ROCE_AR:-1}; FI_MOE=${FI_MOE:-1}; PAGED_DECODE=${PAGED_DECODE:-1}; ROCE_AR_MAX=${ROCE_AR_MAX:-1MB}; ROCE_SPIN=${ROCE_SPIN:-300000000}
-DRAFT_KV_FP8=${DRAFT_KV_FP8-1}; WMARK_BOOST=${WMARK_BOOST-1}; FI_MXFP8=${FI_MXFP8-1}; SWA_RATIO=${SWA_RATIO-0.05}; PREFILL_GLUE=${PREFILL_GLUE-epilogue,stream,gate,qkvr,relbias}; BIAS_FAR=${BIAS_FAR-f2}
+DRAFT_KV_FP8=${DRAFT_KV_FP8-1}; WMARK_BOOST=${WMARK_BOOST-1}; FI_MXFP8=${FI_MXFP8-1}; SWA_RATIO=${SWA_RATIO-0.05}; PREFILL_GLUE=${PREFILL_GLUE-epilogue,stream,gate,qkvr,relbias}; BIAS_FAR=${BIAS_FAR-f2}; PREFILL_DECODE_INTERVAL=${PREFILL_DECODE_INTERVAL-2}
 [ "$DRAFT_KV_FP8" = 1 ] || DRAFT_KV_FP8=; [ "$WMARK_BOOST" = 1 ] || WMARK_BOOST=; [ "$FI_MXFP8" = 1 ] || FI_MXFP8=   # the hooks read "1" and nothing else as on
 if [ -z "${POOL+set}" ]; then case "$KV_DTYPE/$DRAFT_KV_FP8/$SWA_RATIO" in
   fp8_e4m3/1/0.05) POOL=793000;; fp8_e4m3//0.05) POOL=716000;; fp8_e4m3/*/|fp8_e4m3/*/0.1) POOL=600000;;
@@ -69,7 +70,7 @@ run_cmd() {
  --tp 4 --ep-size 4 --nnodes 4 --node-rank $r --dist-init-addr $HEAD:$DIST_PORT --host 0.0.0.0 --port $PORT \
  --attention-backend fa4 --mem-fraction-static $MEMFRAC --chunked-prefill-size $CHUNK --context-length $CTX \
  --max-running-requests $MAXREQ --cuda-graph-max-bs-decode $MAXREQ --cuda-graph-backend-prefill disabled --cuda-graph-max-bs-prefill $MAXREQ \
- --watchdog-timeout 1800 --enable-metrics --kv-cache-dtype $KV_DTYPE $SPEC_ARGS ${POOL:+--max-total-tokens $POOL} ${SWA_RATIO:+--swa-full-tokens-ratio $SWA_RATIO} ${EXTRA_ARGS:-}"
+ --watchdog-timeout 1800 --enable-metrics --kv-cache-dtype $KV_DTYPE $SPEC_ARGS ${POOL:+--max-total-tokens $POOL} ${SWA_RATIO:+--swa-full-tokens-ratio $SWA_RATIO} ${PREFILL_DECODE_INTERVAL:+--prefill-decode-interval $PREFILL_DECODE_INTERVAL} ${EXTRA_ARGS:-}"
 }
 if [ $DRY = 1 ]; then for r in 0 1 2 3; do echo "== rank $r"; run_cmd $r || exit 1; echo; done; exit 0; fi
 echo "== preflight"; bad=""
