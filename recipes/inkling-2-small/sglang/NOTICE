@@ -4,7 +4,8 @@ Copyright (c) 2026 Aiden Le. Licensed under the MIT License (LICENSE at the top 
 This recipe runs an unmodified SGLang image, lmsysorg/sglang:dev-inkling-2-small, and adds Python hooks that are
 mounted into the container and imported at interpreter start (patches/). The hooks, the launcher, the watchdog, the
 benches and the documentation were written for this recipe; the third-party material below is adapted under its own
-licence. Nothing third-party is redistributed.
+licence. Apart from the three short functions named under patches/stable_kernels.py, nothing third-party is
+redistributed.
 
 Adapted third-party code (modified for this recipe; the original notices apply to those parts):
   - patches/roce_collectives.py: a port to SGLang's GroupCoordinator of the vLLM adapter b12x_roce_all_reduce.py by
@@ -21,6 +22,10 @@ Adapted third-party code (modified for this recipe; the original notices apply t
     fi_moe.py, fi_mxfp8.py, prefill_glue.py, fp8_kv.py, dense_p12.py, dense_i8.py, tp_shard.py, spark_gate.py and
     sampled_lab.py wrap or replace functions of SGLang's Inkling model code and call its and FlashInfer's kernels.
     Copyright SGLang Team / FlashInfer contributors. Apache License 2.0.
+  - patches/stable_kernels.py: modified copies of three short Triton functions of SGLang
+    (sglang/kernels/ops/inkling2/attention.py: _tau_kernel, _gate_sink_kernel, _sigmoid), with the batch's row count
+    and strides turned from compile-time constants into arguments; the file states the change. Copyright SGLang
+    Team. Apache License 2.0 (https://www.apache.org/licenses/LICENSE-2.0).
   - launch/relaunch-inkling2.sh and launch/watchdog-inkling2.sh: adapted from this repository's DeepSeek-V4.1 recipe
     (launch/relaunch.sh, launch/watchdog.sh; same author, MIT).
 

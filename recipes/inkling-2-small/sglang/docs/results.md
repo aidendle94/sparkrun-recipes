@@ -51,6 +51,38 @@ the same four `docker run` commands come from (dry-runs compared byte for byte):
 | 600,000 (Long contexts) | `SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= bash launch/relaunch-inkling2.sh` |
 | the launcher's defaults before 2026-11-17 (262,144 context, pool sized at boot, no interval) | `CTX=262144 MEMFRAC=0.93 POOL= SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= PREFILL_DECODE_INTERVAL= bash launch/relaunch-inkling2.sh` |
 
+## Two outages on 2026-11-17 and the kernels compiled while serving
+
+Two of the image's Triton kernels take a property of the batch as a compile-time constant: `_tau_kernel` the number
+of positions, `_gate_sink_kernel` the strides of its inputs. Triton compiles and loads one CUDA module for every
+value, so each prefill of a size the process had not seen ran ptxas and loaded a module on every rank in the middle
+of serving. One node's cache held 816 `_tau_kernel` variants after five days; a 14.5-hour boot added 71.
+
+- 07:52:16 UTC: the rank-0 node froze without a line in any log and was power-cycled at 08:16. The other ranks
+  compiled a 533-row variant at 07:52:16.7 and a 652-row one at 07:52:18.6; on rank 0 the first entry exists with
+  empty files and the second does not exist. Memory was flat on the 10-minute samples up to 07:50 (2.1 GB free, no
+  reclaim, no swap-out in 14.5 hours).
+- 09:09:20 UTC: one rank's scheduler died with `Triton Error [CUDA]: operation not permitted` in
+  `CompiledKernel._init_handles`, loading a 474-row variant compiled in the same second. The watchdog relaunched
+  (9.5 minutes down). No driver line in any kernel log; rank 0's memory flat on a 2-second record.
+
+Why the driver fails there is not known, and that the freeze has the same cause is an inference from the timing.
+What is fixed is the trigger:
+
+| variable (default since 2026-11-17) | what |
+|---|---|
+| `STABLE_KERNELS` (tau,gate_sink) | `patches/stable_kernels.py`: the two kernels, statement for statement, with those values as arguments. Exact: 422 comparisons on a GPU, all equal (`bench/stable_kernels_test.py`); 12 compiled variants where the stock kernels needed 268 for the same inputs |
+| `KERNEL_LOAD_GUARD` (5) | `patches/kernel_load_guard.py`: a load refused with that error is tried again after `torch.cuda.synchronize`, up to five times, and logged |
+
+On the boot of 18:32 UTC: all four ranks log both hooks; `bench/concurrency_check.py` and
+`bench/reasoning_cache_check.py` clean; `bench/shape_sweep.py` sent 57 prompts of 55 different lengths (29 to 5,370
+tokens) and no rank compiled a `_tau_kernel` or `_gate_sink_kernel` variant (three stable modules a rank since the
+boot, nothing else). `STABLE_KERNELS= KERNEL_LOAD_GUARD=` gives the launcher's commands of before (dry-run).
+
+`bench/head_mon.py` writes a line of memory, pressure and temperature every 2 s to `~/inkling2-headmon.log` and
+fsyncs it, so a freeze leaves its last seconds on disk. It does not start by itself after a reboot. After a crash,
+save `docker logs inkling2` on every node before relaunching: the relaunch removes the containers.
+
 ## GB10 hooks (`patches/sitecustomize.py`)
 
 The dev image targets Hopper and SM100. On SM12x:

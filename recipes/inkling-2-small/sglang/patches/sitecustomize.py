@@ -109,6 +109,11 @@ fa4_bias_far (SPARK_FA4_BIAS_FAR=f1|f2, off by default; f2 saves 2% of a 120,000
   patches/fa4_bias_far.py derives the SM120 FA4 forward kernel with the far key blocks of a call with a relative
   bias compiled without the bias code (the same multiplies in the same order: the same bits), and gives the derived
   kernels their own persistent cache directory.
+stable_kernels (SPARK_STABLE_KERNELS=tau,gate_sink, off by default): patches/stable_kernels.py binds two of the
+  image's Triton kernels with the batch's row count and strides as arguments where the image compiles them in, so a
+  prefill of a new size no longer compiles and loads a CUDA module in the middle of serving (the same bits).
+kernel_load_guard (SPARK_KERNEL_LOAD_GUARD=<retries>, off by default): patches/kernel_load_guard.py loads a Triton
+  kernel again when the driver refuses it with "operation not permitted", where the rank died before.
 SPARK_FA_DEBUG=1: also log the tensors of a failing SM12x FA4 call.
 MIT License, Copyright (c) 2026 Aiden Le.
 """
@@ -975,6 +980,21 @@ if _TIMERS or _GRAPH_TIMERS:
     def timers_attn_res(mod):
         for name in ("attention_input", "mlp_input", "finalize_layer", "finalize_layer_with"):
             _wrap_method(mod.Inkling2AttnResState, name, "attn_res")
+
+
+_STABLE_KERNELS = os.environ.get("SPARK_STABLE_KERNELS", "")
+if _STABLE_KERNELS:
+    @_on_import("sglang.kernels.ops.inkling2.attention")
+    def stable_kernels_bind(mod):
+        import stable_kernels
+        stable_kernels.install(mod, stable_kernels.parse(_STABLE_KERNELS))
+
+_KERNEL_LOAD_GUARD = os.environ.get("SPARK_KERNEL_LOAD_GUARD", "")
+if _KERNEL_LOAD_GUARD:
+    @_on_import("triton.compiler.compiler")
+    def kernel_load_guard_wrap(mod):
+        import kernel_load_guard
+        kernel_load_guard.install(mod, int(_KERNEL_LOAD_GUARD))
 
 
 sys.meta_path.insert(0, _Finder())

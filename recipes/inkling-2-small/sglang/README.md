@@ -108,7 +108,22 @@ Set `FI_MXFP8=` to keep the target's arithmetic as it was; the other two are wor
 and what was tried and dropped are in
 [docs/results.md](docs/results.md#prefill-the-glue-the-far-bias-kernel-and-mxfp8-off-marlin-2026-11-16).
 
-Each of the twelve is switched off by setting it empty on the relaunch (`KV_DTYPE=auto` for the BF16 pool). The
+And two that keep the fleet up (defaults since 2026-11-17). Two of the image's Triton kernels take the size of the
+batch as a compile-time constant, so every prefill of a new size compiled and loaded a CUDA module on every node
+while serving; one node's cache held 816 variants of one of them after five days. Both outages of the author's
+fleet on 2026-11-17 began at such a load: one node froze, and hours later the driver refused a load with
+`Triton Error [CUDA]: operation not permitted` and the server process of that node died.
+
+| launcher variable (default) | what it does | cost |
+|---|---|---|
+| `STABLE_KERNELS=tau,gate_sink` (`SPARK_STABLE_KERNELS`) | the same two kernels with the batch's row count and strides as arguments (`patches/stable_kernels.py`): one module a kernel, loaded at the first prefill after the boot | none: the same bits (422 comparisons on a GPU, `bench/stable_kernels_test.py`) |
+| `KERNEL_LOAD_GUARD=5` (`SPARK_KERNEL_LOAD_GUARD`) | a kernel load the driver refuses with that error is tried again, up to five times, and logged (`patches/kernel_load_guard.py`) | none |
+
+Why the driver fails on such a load is not known; the first switch removes the loads, the second is for the ones
+that remain. The record is in
+[docs/results.md](docs/results.md#two-outages-on-2026-11-17-and-the-kernels-compiled-while-serving).
+
+Each of the twelve before them is switched off by setting it empty on the relaunch (`KV_DTYPE=auto` for the BF16 pool). The
 switches are independent of each other, with two exceptions: `FI_MXFP8` does nothing without `fp8` in `TP_SHARD`,
 and `DRAFT_KV_FP8` does nothing without the FP8 KV cache. `TP_SHARD= DENSE_P12=` is the stack as it served before
 2026-11-15, `PREFILL_GLUE= BIAS_FAR= FI_MXFP8=` as it served before 2026-11-16 17:20 UTC.
@@ -247,6 +262,8 @@ Every launcher variable, these and the others (`PORT`, `MAXREQ`, `CHUNK`, `SERVE
 | `bench/longctx.py`, `bench/longctx_edges.py`, `bench/stress.py` | long contexts end to end, their edges, mixed load |
 | `bench/swa_fill.py`, `bench/prefix_fork.py` | the windowed pool run full, then old and recent conversations asked again; what a continued or a forked prompt reuses of the cache |
 | `bench/stale_answer.py`, `bench/recital_rate.py`, `bench/path_compare.py` | multi-turn lookups over a long context; how often a lookup recites; decode path against prefill path |
+| `bench/stable_kernels_test.py`, `bench/shape_sweep.py` | the stable kernels against the image's on one GPU, bit for bit; prompts of many lengths, after which the kernel cache shows whether a prefill size still compiles anything |
+| `bench/head_mon.py` | a line of memory, pressure and temperature every 2 s, fsynced, so a freeze leaves its last seconds on disk |
 | `bench/effort_tokens.py` | thinking tokens and right answers at each reasoning effort |
 | `bench/glue_check.py`, `bench/bias_far_window.py`, `bench/fi_mxfp8_probe.py`, `bench/fi_mxfp8_test.py` | the prefill switches against the stock path on one idle GPU: differing values, bits, timings |
 | `bench/accept_sim.py`, `bench/sampled_arms.py`, `bench/sampled_lab_check.py`, `bench/timers_report.py` | lab tools: gate rules and draft temperatures scored on dumped steps, arms of one boot side by side, the timers' log lines as a table |
