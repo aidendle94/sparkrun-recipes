@@ -1,11 +1,49 @@
 # Inkling-2-Small on four DGX Sparks: lab notes
 
-The working notes behind this recipe, in the order things were built and measured (2026-11-12 to 2026-11-16): what
+The working notes behind this recipe, in the order things were built and measured (2026-11-12 to 2026-11-17): what
 the GB10 hooks do, the bug that produced garbage under concurrency, every decode lever with its numbers, long
 contexts and multi-turn history, the reasoning loop on long lists, the KV cache, the prefill switches, reasoning
 effort, and the first day's measurements. "Production" and "the fleet" mean the author's four Sparks; times are
 UTC. Each number is one boot on that fleet unless the text says otherwise. The launch scripts are in `launch/`, the
 tools in `bench/`, the hooks in `patches/`. The summary and the way to run it are in the [README](../README.md).
+
+## Launcher defaults since 2026-11-17
+
+The 500K configuration the fleet has served since 2026-11-16 17:20 UTC is what the launcher starts when nothing is
+set. `--prefill-decode-interval 2` is the one part of the serving line that is not a default (a scheduling setting
+still under test), so the serving line is now
+
+    EXTRA_ARGS="--prefill-decode-interval 2" bash launch/relaunch-inkling2.sh
+
+| variable (default) | container setting | empty means |
+|---|---|---|
+| `CTX` (524288) | `--context-length` | not meant to be empty; `CTX=262144` is the default before 2026-11-17 |
+| `MEMFRAC` (0.94) | `--mem-fraction-static` | not meant to be empty; 0.93 before 2026-11-17 |
+| `SWA_RATIO` (0.05) | `--swa-full-tokens-ratio` | the engine's 0.1 |
+| `WMARK_BOOST` (1) | `SPARK_WMARK_BOOST=1` | the pool sized from the memory the kernel reports, boost included |
+| `DRAFT_KV_FP8` (1) | `SPARK_DRAFT_KV_FP8=1` | the draft's KV pools in BF16 |
+| `POOL` (follows the three before it) | `--max-total-tokens` | no cap: the engine sizes the pool at boot |
+| `PREFILL_GLUE` (epilogue,stream,gate,qkvr,relbias) | `SPARK_PREFILL_GLUE` | stock's glue |
+| `BIAS_FAR` (f2) | `SPARK_FA4_BIAS_FAR` | the image's forward kernel |
+| `FI_MXFP8` (1) | `SPARK_FI_MXFP8=1` | the MXFP8 expert layers on Marlin: the target's arithmetic as it was |
+
+`POOL`, when it is not set, is the cap that was measured for the pool settings in force, the same bytes each time:
+793,000 with FP8 KV, `DRAFT_KV_FP8=1` and `SWA_RATIO=0.05`; 716,000 with `DRAFT_KV_FP8=`; 600,000 with `SWA_RATIO=`
+(or 0.1) as well. For any other combination (`KV_DTYPE=auto`, another ratio) the launcher sets no cap and says so:
+no cap was measured for it. All three caps were measured at `MEMFRAC=0.94`.
+
+`NCCL_EXTRA` and `EXTRA_ARGS` come after the defaults on the command line, so a value given there still wins, and a
+relaunch line of the sections below still starts a fleet. It no longer starts the configuration of its day,
+because the defaults now add to it. The lines of those sections are kept as they were run; with today's launcher
+the same four `docker run` commands come from (dry-runs compared byte for byte):
+
+| configuration | line with the launcher since 2026-11-17 |
+|---|---|
+| serving since 2026-11-16 17:20 UTC (793,000, three prefill switches) | `EXTRA_ARGS="--prefill-decode-interval 2" bash launch/relaunch-inkling2.sh` |
+| 793,000 without the prefill switches (KV section) | `PREFILL_GLUE= BIAS_FAR= FI_MXFP8= EXTRA_ARGS="--prefill-decode-interval 2" bash launch/relaunch-inkling2.sh` |
+| 716,000 (KV section) | `DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= EXTRA_ARGS="--prefill-decode-interval 2" bash launch/relaunch-inkling2.sh` |
+| 600,000 (Long contexts) | `SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= EXTRA_ARGS="--prefill-decode-interval 2" bash launch/relaunch-inkling2.sh` |
+| the launcher's defaults before 2026-11-17 (262,144 context, pool sized at boot) | `CTX=262144 MEMFRAC=0.93 POOL= SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= bash launch/relaunch-inkling2.sh` |
 
 ## GB10 hooks (`patches/sitecustomize.py`)
 
@@ -337,7 +375,7 @@ pairs a boot against a reference boot token by token; stock is 0.9828.
 ## Long contexts and multi-turn history (2026-11-14)
 
 Serving 524,288 tokens of context since 2026-11-14 06:49 UTC through the environment of the relaunch (the launcher's
-defaults are still 262,144 and an automatic pool):
+defaults were 262,144 and an automatic pool until 2026-11-17; the line as it was run):
 
     CTX=524288 MEMFRAC=0.94 EXTRA_ARGS="--max-total-tokens 600000 --prefill-decode-interval 2" bash launch/relaunch-inkling2.sh
 
@@ -457,7 +495,8 @@ answers that came were as long as ours (median 400 to 500 output tokens against 
 
 ## KV cache: what a token costs and what grows the pool (2026-11-15/16)
 
-Serving since 2026-11-16 00:34 UTC, through the environment of the relaunch (not the launcher's defaults):
+Serving since 2026-11-16 00:34 UTC, through the environment of the relaunch (the launcher's defaults since
+2026-11-17; the line as it was run):
 
     CTX=524288 MEMFRAC=0.94 NCCL_EXTRA="-e SPARK_WMARK_BOOST=1 -e SPARK_DRAFT_KV_FP8=1" \
       EXTRA_ARGS="--max-total-tokens 793000 --swa-full-tokens-ratio 0.05 --prefill-decode-interval 2" bash launch/relaunch-inkling2.sh
@@ -496,9 +535,10 @@ at 6K in the fill test); a running request is not affected. The first text check
 (the watchdog's probe shared its decode batch, a near-tie at token 80, sane text); the second run and the one at
 the end of the window passed.
 
-Rollback: the relaunch line under "Long contexts" (600,000 cap, no ratio, no `NCCL_EXTRA`).
+Rollback: the relaunch line under "Long contexts" (600,000 cap, no ratio, no `NCCL_EXTRA`); with the launcher
+since 2026-11-17, the 600,000 line of "Launcher defaults".
 
-### The draft's pools as FP8 (793,000 tokens, 2026-11-16 00:34 UTC; `SPARK_DRAFT_KV_FP8=1`, off unless set)
+### The draft's pools as FP8 (793,000 tokens, 2026-11-16 00:34 UTC; `SPARK_DRAFT_KV_FP8=1`; the launcher sets it since 2026-11-17)
 
 SGLang resets the draft's KV to BF16 because FA4, which the draft's block reads its KV with, wants K and Q of one
 dtype. With `SPARK_DRAFT_KV_FP8=1` (and an e4m3 target pool) the draft's two pools are e4m3 too, and
@@ -570,9 +610,10 @@ sizes every rank's pool. One GB there is about 130K tokens.
 
 ## Prefill: the glue, the far-bias kernel and MXFP8 off Marlin (2026-11-16)
 
-Three switches for prefill, each off unless set, each a variable of the containers (`NCCL_EXTRA="-e NAME=value"`).
-The fleet serves with all three since 2026-11-16 17:20 UTC through the relaunch environment; the launcher's defaults
-are unchanged. Cold prefill of fresh prompts (`bench/prefill_probe.py`, three prompts of 30,000 tokens, one of
+Three switches for prefill, each a variable of the containers and off in the code unless set. The fleet serves
+with all three since 2026-11-16 17:20 UTC, at first through the relaunch environment
+(`NCCL_EXTRA="-e NAME=value"`); since 2026-11-17 the launcher sets them (`PREFILL_GLUE`, `BIAS_FAR`, `FI_MXFP8`;
+each is switched off by setting it empty). Cold prefill of fresh prompts (`bench/prefill_probe.py`, three prompts of 30,000 tokens, one of
 120,000, one of 300,000; one boot a row, the pool settings of the KV section on all of them):
 
 | boot | exact | 30,000 tokens | 120,000 tokens | 300,000 tokens |
@@ -587,8 +628,8 @@ are unchanged. Cold prefill of fresh prompts (`bench/prefill_probe.py`, three pr
 Prefill tok/s repeats to about 2% between boots of one configuration, so the last two rows are the same speed at
 30,000 tokens. Decode is not touched by any of them: only plain prefill batches take the new paths.
 
-The serving line (any of the three left out of `NCCL_EXTRA` runs stock's path for that part; without all three it is
-the line of the KV section):
+The serving line as it was run on 2026-11-16 (any of the three left out of `NCCL_EXTRA` ran stock's path for that
+part; without all three it was the line of the KV section; today's equivalents are under "Launcher defaults"):
 
     CTX=524288 MEMFRAC=0.94 \
       NCCL_EXTRA="-e SPARK_WMARK_BOOST=1 -e SPARK_DRAFT_KV_FP8=1 -e SPARK_PREFILL_GLUE=epilogue,stream,gate,qkvr,relbias -e SPARK_FA4_BIAS_FAR=f2 -e SPARK_FI_MXFP8=1" \

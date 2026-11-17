@@ -14,10 +14,10 @@ writing, and most of those days were spent changing it. What that means in pract
 
 - The base is a development image, not an SGLang release. The hooks bind to one build of it (digest below). One of
   them rebuilds a kernel from the image's own source and refuses to boot if that source has changed.
-- The numbers are single boots on one fleet. The defaults changed several times a day; the last change (sharded
-  experts) became the default on 2026-11-15 and has hours of serving behind it, not weeks. The larger pool (half the
-  windowed share, FP8 draft pools) and the three prefill switches have served since 2026-11-16 and are not
-  launcher defaults.
+- The numbers are single boots on one fleet. The defaults changed several times a day, and the newest have days of
+  serving behind them, not weeks: the sharded experts became the default on 2026-11-15; the 500K configuration
+  (524,288 tokens of context, the 793,000-token pool, the three prefill switches) served for a day through the
+  environment and became the launcher's default on 2026-11-17.
 - There are open problems, listed under [Known problems](#known-problems). One of them is a scheduler hang that
   happened once and was never reproduced.
 
@@ -31,23 +31,23 @@ ports. **Pool**: the KV cache, counted in tokens, shared by all running and cach
 
 ## What you get
 
-Measured on four Sparks over a switched RoCE fabric, 2026-11-13 to 2026-11-16, with the launcher's defaults unless
-the row says otherwise. Every row is one boot; conditions and the history of each number are in
-[docs/results.md](docs/results.md).
+Measured on four Sparks over a switched RoCE fabric, 2026-11-13 to 2026-11-16. Every row is one boot. The
+launcher's defaults are the configuration of the last of those days; a row measured on an earlier one says so.
+Conditions and the history of each number are in [docs/results.md](docs/results.md).
 
 | what | measured |
 |---|---|
 | decode, one stream, greedy, coding questions of 400 tokens | 60–61 tok/s (37 with the image's own decode step, on another set of such questions) |
 | decode, one stream, temperature 0.7 | 56.6 tok/s |
 | decode, four / eight streams at a time, greedy | 106 / 130 tok/s for the batch (about 26 / 16 a stream) |
-| prefill, ~15K-token prompts | 2,400–2,500 tok/s |
-| cold prefill of 30K / 120K tokens | 2,474 / 2,241 tok/s; 3,110 / 2,786 with the three prefill switches the author's fleet serves with since 2026-11-16 (see [Run it](#run-it)) |
-| cold prefill of 130K / 260K / 500K tokens | 61 / 142 / 348 s; with the prefill switches 120K takes 43 s (54 without) and 300K 135 s |
+| prefill, ~15K-token prompts | 2,400–2,500 tok/s (before the prefill switches; not measured again with them) |
+| cold prefill of 30K / 120K tokens | 3,110 / 2,786 tok/s (2,474 / 2,241 without the three prefill switches) |
+| cold prefill of 130K / 260K / 500K tokens | 61 / 142 / 348 s before the prefill switches; with them 120K takes 43 s (54 without) and 300K 135 s |
 | decode behind a long context (130K–500K) | 52–55 tok/s on the 600K configuration; 68 at 130K and 60 at 500K on the 793K one |
-| context length | 262,144 by default; 524,288 run through the environment (see [Run it](#run-it)) |
-| KV pool | 493K–805K tokens, sized at each boot; 545K–600K with the 600K cap of the 500K configuration; 793,000 with the settings the author's fleet serves with since 2026-11-16 (see [Run it](#run-it)) |
+| context length | 524,288 (the default since 2026-11-17; 262,144 before) |
+| KV pool | 793,000 tokens with the defaults (a cap; see [Run it](#run-it)). Before them: 545K–600K with the 600K cap most rows here were measured on, 493K–805K when it was sized at each boot without a cap |
 | concurrent requests | 8 |
-| tool calls, 283 cases over five wire formats (chat, Anthropic messages, each also streamed, and responses), two trials | 250 right, 20 soft, 13 failed (10 are `tool_choice: none`, 3 slips on the sampled trial); 12 of 12 agent loops. With the prefill switches: 252 / 20 / 11, and no case of the temperature-0 trial changed its verdict |
+| tool calls, 283 cases over five wire formats (chat, Anthropic messages, each also streamed, and responses), two trials | 250 right, 20 soft, 13 failed (10 are `tool_choice: none`, 3 slips on the sampled trial); 12 of 12 agent loops. With the prefill switches (the defaults): 252 / 20 / 11, and no case of the temperature-0 trial changed its verdict |
 | boot to healthy | about 5 min with a warm kernel cache, about 17 min the first time |
 | request features | tool calls, reasoning with effort levels; OpenAI chat completions and responses, Anthropic `/v1/messages`; extra model names on `/v1/models` and the Ollama-style `/api/tags` and `/api/show` |
 
@@ -69,7 +69,8 @@ make it work on GB10 at all:
   FlashInfer's SM120 grouped GEMM with the checkpoint's weights (prefill from about 440 to about 2,000 tok/s).
 - **Collectives**: the model's all-reduces assume NVLink; here they go over RoCE (`patches/roce_collectives.py`).
 
-The ones that make it faster or larger, all on by default, each with its own off switch:
+The ones that make it faster or larger. All are launcher variables, all on by default, each with its own off
+switch:
 
 | launcher variable (default) | what it does | cost |
 |---|---|---|
@@ -80,34 +81,37 @@ The ones that make it faster or larger, all on by default, each with its own off
 | `TP_SHARD=half,fp8` | every node holds all 384 experts at a quarter of their width instead of 96 whole ones, so no node waits for the busiest: −18 % step time | not bit-identical to the stock placement (rounding only; mean NLL unchanged) |
 | `REASONING_CACHE=1` | the server puts an answer's reasoning back into history turns that arrive without it | prompts grow by that reasoning |
 
-Each is switched off by setting it empty on the relaunch (`TP_SHARD= DENSE_P12=` is the stack as it served before
-2026-11-15); `KV_DTYPE=auto` is the BF16 pool.
+Three more grow the pool in the same bytes (defaults since 2026-11-17, served with since 2026-11-16). None of them
+touches the target's arithmetic:
 
-Off unless set, and what the author's fleet has served with since 2026-11-16. They grow the pool in the same
-bytes, and none of them touches the target's arithmetic:
-
-| setting | what it does | cost |
+| launcher variable (default) | what it does | cost |
 |---|---|---|
-| `--swa-full-tokens-ratio 0.05` (in `EXTRA_ARGS`) | halves the pool of the 40 windowed layers, which was the slack: a pool token costs 6,349 bytes a node instead of 7,578 | about 35 cached conversation ends keep their window instead of 53–58; one that lost it is prefilled again when it comes back |
-| `SPARK_WMARK_BOOST=1` (in `NCCL_EXTRA`) | sizes the pool from the memory a node has without the kernel's temporary watermark boost, so that every boot gets the same pool (`patches/wmark_boost.py`) | none |
-| `SPARK_DRAFT_KV_FP8=1` (in `NCCL_EXTRA`) | the draft's KV pools as FP8 with a reader of their own (`patches/draft_decode.py`): 5,734 bytes a token, 793,000 tokens where 716,000 fitted | about 1 % of step time for one short stream, nothing at 4 and 8 streams; accepted tokens a step unchanged; the draft is faster behind a long context |
+| `SWA_RATIO=0.05` (`--swa-full-tokens-ratio`) | halves the pool of the 40 windowed layers, which was the slack: a pool token costs 6,349 bytes a node instead of 7,578 | about 35 cached conversation ends keep their window instead of 53–58; one that lost it is prefilled again when it comes back |
+| `WMARK_BOOST=1` (`SPARK_WMARK_BOOST`) | sizes the pool from the memory a node has without the kernel's temporary watermark boost, so that every boot gets the same pool (`patches/wmark_boost.py`) | none |
+| `DRAFT_KV_FP8=1` (`SPARK_DRAFT_KV_FP8`) | the draft's KV pools as FP8 with a reader of their own (`patches/draft_decode.py`): 5,734 bytes a token, 793,000 tokens where 716,000 fitted | about 1 % of step time for one short stream, nothing at 4 and 8 streams; accepted tokens a step unchanged; the draft is faster behind a long context |
 
-`NCCL_EXTRA` is the launcher's pass-through for extra `-e NAME=value` arguments of the containers. The numbers are
-in [docs/results.md](docs/results.md#kv-cache-what-a-token-costs-and-what-grows-the-pool-2026-11-1516).
+`POOL` is the cap on the pool (`--max-total-tokens`). Unset, it follows these three: 793,000, 716,000 with
+`DRAFT_KV_FP8=`, 600,000 with `SWA_RATIO=` as well, the same bytes each time. The numbers are in
+[docs/results.md](docs/results.md#kv-cache-what-a-token-costs-and-what-grows-the-pool-2026-11-1516).
 
-Also off unless set, and served with since 2026-11-16 17:20 UTC: three switches for prefill, all in `NCCL_EXTRA`.
-Together they take a cold prefill from 2,474 to 3,110 tok/s at 30K tokens (+26 %) and from 2,241 to 2,786 at 120K
-(+24 %); decode is unchanged. The first two keep every value of the model bit for bit; the third does not:
+And three for prefill (defaults since 2026-11-17, served with since 2026-11-16 17:20 UTC). Together they take a
+cold prefill from 2,474 to 3,110 tok/s at 30K tokens (+26 %) and from 2,241 to 2,786 at 120K (+24 %); decode is
+unchanged. The first two keep every value of the model bit for bit; the third does not:
 
-| setting | what it does | cost |
+| launcher variable (default) | what it does | cost |
 |---|---|---|
-| `SPARK_PREFILL_GLUE=epilogue,stream,gate,qkvr,relbias` | the small steps between a layer's big kernels (residual adds, norms, the closing convolution, the projections of a global layer, the relative bias) in fewer passes over memory, same operations in the same order (`patches/prefill_glue.py`): +11 % at 30K, +10 % at 120K | none: exact (0 differing values against the stock path on every node, NLL equal token by token) |
-| `SPARK_FA4_BIAS_FAR=f2` | the SM120 attention kernel rebuilt from the image's source so that key blocks beyond the reach of the relative bias skip the bias bookkeeping (`patches/fa4_bias_far.py`): 2 % of a 120K prefill, 3.6 % of a 300K one | none: exact (output and log-sum-exp equal to the stock kernel's bit for bit); refuses to boot if that source has changed |
-| `SPARK_FI_MXFP8=1` | the 8 MXFP8 expert layers on FlashInfer's FP8 grouped GEMM instead of the BF16 Marlin one (`patches/fi_mxfp8.py`): +11 % at 30K, +10 % at 120K | not bit-identical: the same products summed in another order. Held-out NLL 0.9840 against 0.9840; per token the difference is 0.006 on average, above 0.1 for 0.5 % of the tokens |
+| `PREFILL_GLUE=epilogue,stream,gate,qkvr,relbias` (`SPARK_PREFILL_GLUE`) | the small steps between a layer's big kernels (residual adds, norms, the closing convolution, the projections of a global layer, the relative bias) in fewer passes over memory, same operations in the same order (`patches/prefill_glue.py`): +11 % at 30K, +10 % at 120K | none: exact (0 differing values against the stock path on every node, NLL equal token by token) |
+| `BIAS_FAR=f2` (`SPARK_FA4_BIAS_FAR`) | the SM120 attention kernel rebuilt from the image's source so that key blocks beyond the reach of the relative bias skip the bias bookkeeping (`patches/fa4_bias_far.py`): 2 % of a 120K prefill, 3.6 % of a 300K one | none: exact (output and log-sum-exp equal to the stock kernel's bit for bit); refuses to boot if that source has changed |
+| `FI_MXFP8=1` (`SPARK_FI_MXFP8`) | the 8 MXFP8 expert layers on FlashInfer's FP8 grouped GEMM instead of the BF16 Marlin one (`patches/fi_mxfp8.py`): +11 % at 30K, +10 % at 120K | not bit-identical: the same products summed in another order. Held-out NLL 0.9840 against 0.9840; per token the difference is 0.006 on average, above 0.1 for 0.5 % of the tokens |
 
-Leave `SPARK_FI_MXFP8=1` out to keep the target's arithmetic as it was; the other two are worth 12 % on their own.
-The numbers and what was tried and dropped are in
+Set `FI_MXFP8=` to keep the target's arithmetic as it was; the other two are worth 12 % on their own. The numbers
+and what was tried and dropped are in
 [docs/results.md](docs/results.md#prefill-the-glue-the-far-bias-kernel-and-mxfp8-off-marlin-2026-11-16).
+
+Each of the twelve is switched off by setting it empty on the relaunch (`KV_DTYPE=auto` for the BF16 pool). The
+switches are independent of each other, with two exceptions: `FI_MXFP8` does nothing without `fp8` in `TP_SHARD`,
+and `DRAFT_KV_FP8` does nothing without the FP8 KV cache. `TP_SHARD= DENSE_P12=` is the stack as it served before
+2026-11-15, `PREFILL_GLUE= BIAS_FAR= FI_MXFP8=` as it served before 2026-11-16 17:20 UTC.
 
 ## What you need
 
@@ -156,33 +160,43 @@ curl -s http://<rank-0>:8210/v1/chat/completions -H 'content-type: application/j
 mkdir -p logs && python3 bench/concurrency_check.py && python3 bench/reasoning_cache_check.py --expect on
 ```
 
-The 500K configuration the author's fleet serves since 2026-11-16 (not the launcher's defaults; the three pool
-settings and the three prefill switches are in the tables above, and `--prefill-decode-interval 2` is a scheduling
-setting still under test):
+With nothing set, the launcher starts the 500K configuration the author's fleet serves since 2026-11-16: 524,288
+tokens of context, `MEMFRAC=0.94`, a pool capped at 793,000 tokens, the three prefill switches. The fleet's own
+line adds one scheduling setting that is still under test and therefore not a default:
 
 ```bash
-CTX=524288 MEMFRAC=0.94 \
-  NCCL_EXTRA="-e SPARK_WMARK_BOOST=1 -e SPARK_DRAFT_KV_FP8=1 -e SPARK_PREFILL_GLUE=epilogue,stream,gate,qkvr,relbias -e SPARK_FA4_BIAS_FAR=f2 -e SPARK_FI_MXFP8=1" \
-  EXTRA_ARGS="--max-total-tokens 793000 --swa-full-tokens-ratio 0.05 --prefill-decode-interval 2" \
+EXTRA_ARGS="--prefill-decode-interval 2" launch/relaunch-inkling2.sh
+```
+
+The cap goes with the pool settings: the same bytes hold 716,000 tokens with `DRAFT_KV_FP8=` and 600,000 with
+`SWA_RATIO=` as well, and the launcher picks the cap accordingly. A cap above what the bytes hold is sized down by
+the engine. The bytes are what the rank-0 node has free at boot, so the cap that fits is a property of the site:
+`POOL=<tokens>` sets another, `POOL=` none (the engine then sizes the pool at boot). For a combination no cap was
+measured for (`KV_DTYPE=auto`, another ratio) the launcher sets none and says so.
+
+Earlier configurations with today's launcher:
+
+```bash
+# 600,000-token pool, no prefill switches (what most rows of the table above were measured on)
+SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= \
+  EXTRA_ARGS="--prefill-decode-interval 2" launch/relaunch-inkling2.sh
+
+# the defaults before 2026-11-17: 262,144 tokens of context, the pool sized at each boot
+CTX=262144 MEMFRAC=0.93 POOL= SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= \
   launch/relaunch-inkling2.sh
 ```
 
-The prefill switches are independent of the pool settings and of each other: leave any of them out of `NCCL_EXTRA`
-and that part runs the stock path.
-
-The cap goes with the settings: the same bytes hold 716,000 tokens without `SPARK_DRAFT_KV_FP8=1` and 600,000
-without the ratio either (the configuration most rows of the table above were measured on:
-`CTX=524288 MEMFRAC=0.94 EXTRA_ARGS="--max-total-tokens 600000 --prefill-decode-interval 2"`). A cap above what
-the bytes hold is sized down by the engine. The bytes are what the rank-0 node has free at boot, so the cap that
-fits is a property of the site.
+`NCCL_EXTRA` (extra `-e NAME=value` arguments of the containers) and `EXTRA_ARGS` (extra server arguments) come
+after the defaults on the command line, so a value given there wins.
 
 Stop: kill the watchdog (the pid is in the last `watchdog started` line of `~/inkling2-watchdog.log`), then
 `launch/launch-inkling2.sh --stop`. The watchdog probes `/health` and a three-token chat completion every 60 s and
 relaunches the fleet after three failures with the environment it was started in; before it does, it saves the
 state, logs and Python stacks of every rank under `$LOG_DIR/postmortem/`.
 
-The other launcher variables (`PORT`, `MAXREQ`, `CHUNK`, `SERVED`, `SERVED_ALIASES`, `MTP`, `ROCE_AR`, `FI_MOE`,
-`PAGED_DECODE`) are documented at the top of `launch/launch-inkling2.sh`. Leave `PAGED_DECODE=1`.
+Every launcher variable, these and the others (`PORT`, `MAXREQ`, `CHUNK`, `SERVED`, `SERVED_ALIASES`, `MTP`,
+`ROCE_AR`, `FI_MOE`, `PAGED_DECODE`), is documented at the top of `launch/launch-inkling2.sh`. Leave
+`PAGED_DECODE=1`.
 
 ## Using it as a client
 
@@ -208,9 +222,10 @@ The other launcher variables (`PORT`, `MAXREQ`, `CHUNK`, `SERVED`, `SERVED_ALIAS
   out of tokens copying the list in its reasoning (0 at 60K, 0 on source code). It is the model: the hosted
   endpoints do the same on the same questions (29 of 200 across four providers against 4 of 40 here). No server
   setting fixes it; a search tool is the right way to look things up in such lists.
-- **The pool differs from boot to boot** (493K–805K) because it is sized from what the head node has free at that
-  moment, and the kernel's watermark boost moves that by gigabytes. `SPARK_WMARK_BOOST=1` corrects the sizing for it (off
-  unless set).
+- **The pool depends on what the rank-0 node has free at boot.** Sized without a cap it differed from boot to boot
+  (493K–805K), because the kernel's watermark boost moves the free memory by gigabytes. `WMARK_BOOST=1` (the
+  default since 2026-11-17) corrects the sizing for that, and the default cap of 793,000 is what the author's fleet
+  gets; a node with less memory free gets a smaller pool, and the boot log of rank 0 says how large.
 - **Log-probability requests over long spans can take a node down** (the full-vocabulary logits of every scored
   position). Keep scored spans to a few hundred tokens.
 - **No GPU work beside the serving fleet**, however small: there is no memory for it, and the driver fails

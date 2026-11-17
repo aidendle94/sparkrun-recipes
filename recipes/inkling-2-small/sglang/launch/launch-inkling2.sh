@@ -5,7 +5,7 @@
 #   ./launch-inkling2.sh [--dry-run|--stop]
 # Nothing else may hold the GPUs: the model needs nearly all memory of every node. OTHER_CONTAINER in fleet.env names
 # another engine's container; while it runs on any node the preflight aborts instead of starting next to it.
-# env: PORT (8210) DIST_PORT (20200) INKLING_IMAGE (the image; pin the digest of the README when the tag moves) INKLING_REPO_REL INKLING_SNAP (where the checkpoint is under each home, and its revision) CTX (262144) CHUNK (4096) MAXREQ (8; needs PAGED_DECODE=1 on GB10: without it two requests in a decode batch generate garbage, see README) MEMFRAC (0.93) SERVED (inkling-2-small)
+# env: PORT (8210) DIST_PORT (20200) INKLING_IMAGE (the image; pin the digest of the README when the tag moves) INKLING_REPO_REL INKLING_SNAP (where the checkpoint is under each home, and its revision) CTX (524288; 262144 until 2026-11-17) CHUNK (4096) MAXREQ (8; needs PAGED_DECODE=1 on GB10: without it two requests in a decode batch generate garbage, see README) MEMFRAC (0.94; 0.93 until 2026-11-17) SERVED (inkling-2-small)
 #      ROCE_AR (1|0: b12x one-shot RDMA collectives for the TP group, ~8% faster decode steps)
 #      FI_MOE (1|0: NVFP4 experts on FlashInfer NVFP4 grouped GEMMs, patches/fi_moe.py; prefill 442 -> 1156 tok/s) ROCE_AR_MAX (1MB) ROCE_SPIN (300000000)
 #      PAGED_DECODE (1|0; 0 is SGLang's kernel, wrong at page size 1: decode/verify attention with a page lookup per key, patches/paged_decode.py)
@@ -15,6 +15,13 @@
 #      DENSE_P12 (attn,head,free, the default since 2026-11-15 | empty = off, the rollback: the target's attention projections and unembedding packed into 12 bits a weight without rounding, read by a Triton kernel on forwards of up to 64 rows, BF16 copies of attn freed, patches/dense_p12.py; the same weights, a different order of the sum; see README)
 #      TP_SHARD (half,fp8, the default since 2026-11-15 | 1 | empty = off, the rollback (TP_SHARD= DENSE_P12= is the stack before it); needs FI_MOE=1: every rank holds all 384 experts at a quarter of their width instead of 96 whole ones, so no rank waits for the busiest, patches/tp_shard.py; `half` sums the shards' partial rows as FP16, `fp8` shards the MXFP8 layers too; with DENSE_P12 -18% step time for one stream, +20% / +14% at four / eight; not bit-identical to expert parallelism (rounding), held-out NLL unchanged)
 #      REASONING_CACHE (1 | empty = off | an absolute path = on while that file exists in the head's container: the API server puts an answer's reasoning back into history turns that arrive without it, patches/reasoning_cache.py; without it a client that drops reasoning gets stale answers over long contexts)
+#      DRAFT_KV_FP8 (1, the default since 2026-11-17 | empty = off: the draft's KV cache in e4m3 like the target's, read by patches/draft_decode.py; 793,000 pool tokens where 716,000 fitted and a faster draft behind long contexts, for about 1% of step time on one short stream)
+#      WMARK_BOOST (1, the default since 2026-11-17 | empty = off: the pool is sized without the kernel's temporary watermark boost, patches/wmark_boost.py, so every boot gets the same pool)
+#      SWA_RATIO (0.05, the default since 2026-11-17 | empty = the engine's 0.1: --swa-full-tokens-ratio, the windowed layers' share of the pool; 0.05 halves their cache, so fewer cached conversation ends keep their window)
+#      POOL (--max-total-tokens | empty = no cap, the engine sizes the pool at boot. Unset, it follows the three settings before it, the same bytes each time, so the rank-0 node keeps the memory it had: 793000 with all three, 716000 with DRAFT_KV_FP8=, 600000 with SWA_RATIO= or 0.1, no cap with anything else)
+#      PREFILL_GLUE (epilogue,stream,gate,qkvr,relbias, the default since 2026-11-17 | empty = off: the per-layer glue of a prefill chunk in fewer passes over memory, patches/prefill_glue.py; exact; cold prefill +11% at 30,000 tokens, +10% at 120,000)
+#      BIAS_FAR (f2, the default since 2026-11-17 | empty = off: the SM120 attention kernel derived from the image's source, its far key blocks compiled without the bias state, patches/fa4_bias_far.py; exact; 2% of a 120,000-token prefill, 3.6% of a 300,000-token one)
+#      FI_MXFP8 (1, the default since 2026-11-17 | empty = off, which keeps the target's arithmetic as it was: the MXFP8 expert layers on FlashInfer's MXFP8 grouped GEMM instead of Marlin, patches/fi_mxfp8.py; does nothing without FI_MOE=1 and fp8 in TP_SHARD; not bit-identical (the order of the sums), held-out NLL unchanged; cold prefill +11% at 30,000 tokens, +10% at 120,000)
 #      SERVED_ALIASES (empty: extra ids listed by /v1/models, comma-separated) MTP (1|0: DSpark with the bundled draft, ~1.7x decode) EXTRA_ARGS
 # MIT License, Copyright (c) 2026 Aiden Le.
 set -o pipefail
@@ -24,9 +31,15 @@ FLEET_ENV="${FLEET_ENV:-$HERE/fleet.env}"
 . "$FLEET_ENV"
 REPO_REL=${INKLING_REPO_REL:-.cache/huggingface/hub/models--thinkingmachines--Inkling-2-Small}; SNAP=${INKLING_SNAP:-snapshots/b0e7afb8892a07897c78ce1c5b801a0d9cbd5e7b}
 HEAD=${NODES[0]}; PORT=${PORT:-8210}; DIST_PORT=${DIST_PORT:-20200}; NAME=inkling2
-IMAGE=${INKLING_IMAGE:-lmsysorg/sglang:dev-inkling-2-small}; CTX=${CTX:-262144}; CHUNK=${CHUNK:-4096}; MAXREQ=${MAXREQ:-8}
-MEMFRAC=${MEMFRAC:-0.93}; SERVED=${SERVED:-inkling-2-small}; MTP=${MTP:-1}; KV_DTYPE=${KV_DTYPE:-fp8_e4m3}; GATE=${GATE-0.4}; DENSE_I8=${DENSE_I8-draft,dhead,dfree}; DENSE_P12=${DENSE_P12-attn,head,free}; REASONING_CACHE=${REASONING_CACHE-1}; TP_SHARD=${TP_SHARD-half,fp8}
+IMAGE=${INKLING_IMAGE:-lmsysorg/sglang:dev-inkling-2-small}; CTX=${CTX:-524288}; CHUNK=${CHUNK:-4096}; MAXREQ=${MAXREQ:-8}
+MEMFRAC=${MEMFRAC:-0.94}; SERVED=${SERVED:-inkling-2-small}; MTP=${MTP:-1}; KV_DTYPE=${KV_DTYPE:-fp8_e4m3}; GATE=${GATE-0.4}; DENSE_I8=${DENSE_I8-draft,dhead,dfree}; DENSE_P12=${DENSE_P12-attn,head,free}; REASONING_CACHE=${REASONING_CACHE-1}; TP_SHARD=${TP_SHARD-half,fp8}
 ROCE_AR=${ROCE_AR:-1}; FI_MOE=${FI_MOE:-1}; PAGED_DECODE=${PAGED_DECODE:-1}; ROCE_AR_MAX=${ROCE_AR_MAX:-1MB}; ROCE_SPIN=${ROCE_SPIN:-300000000}
+DRAFT_KV_FP8=${DRAFT_KV_FP8-1}; WMARK_BOOST=${WMARK_BOOST-1}; FI_MXFP8=${FI_MXFP8-1}; SWA_RATIO=${SWA_RATIO-0.05}; PREFILL_GLUE=${PREFILL_GLUE-epilogue,stream,gate,qkvr,relbias}; BIAS_FAR=${BIAS_FAR-f2}
+[ "$DRAFT_KV_FP8" = 1 ] || DRAFT_KV_FP8=; [ "$WMARK_BOOST" = 1 ] || WMARK_BOOST=; [ "$FI_MXFP8" = 1 ] || FI_MXFP8=   # the hooks read "1" and nothing else as on
+if [ -z "${POOL+set}" ]; then case "$KV_DTYPE/$DRAFT_KV_FP8/$SWA_RATIO" in
+  fp8_e4m3/1/0.05) POOL=793000;; fp8_e4m3//0.05) POOL=716000;; fp8_e4m3/*/|fp8_e4m3/*/0.1) POOL=600000;;
+  *) POOL=; echo "note: no pool cap is known for KV_DTYPE=$KV_DTYPE SWA_RATIO=$SWA_RATIO: the engine sizes the pool at boot; the caps were measured with FP8 KV at MEMFRAC=0.94 (set POOL, or MEMFRAC=0.93 WMARK_BOOST= for the sizing before them)" >&2;;
+esac; fi
 SHARD_ENV=""; if [ -n "$TP_SHARD" ]; then
   [ "$FI_MOE" = 1 ] || { echo "ABORT: TP_SHARD needs FI_MOE=1" >&2; exit 1; }
   SHARD_ENV="-e SPARK_TP_SHARD=1"; case ",$TP_SHARD," in *,half,*) SHARD_ENV="$SHARD_ENV -e SPARK_TP_SHARD_HALF=1";; esac; case ",$TP_SHARD," in *,fp8,*) SHARD_ENV="$SHARD_ENV -e SPARK_TP_SHARD_FP8=1";; esac
@@ -51,12 +64,12 @@ run_cmd() {
  -e NCCL_NET=IB -e NCCL_IB_DISABLE=0 -e NCCL_IB_HCA=$RDMA_HCAS -e NCCL_SOCKET_IFNAME=$FABRIC_IFACE -e GLOO_SOCKET_IFNAME=$FABRIC_IFACE \
  -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_IB_ADDR_RANGE=$FABRIC_SUBNET -e NCCL_IB_SUBNET_PREFIX_LEN=${FABRIC_SUBNET#*/} -e NCCL_IB_GID_INDEX=$gid \
  -e NCCL_CROSS_NIC=1 -e NCCL_IB_MERGE_NICS=0 -e NCCL_IB_SUBNET_AWARE_ROUTING=1 -e NCCL_CUMEM_ENABLE=0 -e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=1 -e NCCL_DEBUG=WARN \
- -e NCCL_BUFFSIZE=1048576 -e NCCL_LL128_BUFFSIZE=262144 -e NCCL_PROTO=^LL128 -e NCCL_MAX_NCHANNELS=8 ${GATE:+-e SPARK_GATE=$GATE} ${DENSE_I8:+-e SPARK_DENSE_I8=$DENSE_I8} ${DENSE_P12:+-e SPARK_DENSE_P12=$DENSE_P12} $SHARD_ENV ${NCCL_EXTRA:-} ${REASONING_CACHE:+-e SPARK_REASONING_CACHE=$REASONING_CACHE} \
+ -e NCCL_BUFFSIZE=1048576 -e NCCL_LL128_BUFFSIZE=262144 -e NCCL_PROTO=^LL128 -e NCCL_MAX_NCHANNELS=8 ${GATE:+-e SPARK_GATE=$GATE} ${DENSE_I8:+-e SPARK_DENSE_I8=$DENSE_I8} ${DENSE_P12:+-e SPARK_DENSE_P12=$DENSE_P12} $SHARD_ENV ${WMARK_BOOST:+-e SPARK_WMARK_BOOST=1} ${DRAFT_KV_FP8:+-e SPARK_DRAFT_KV_FP8=1} ${PREFILL_GLUE:+-e SPARK_PREFILL_GLUE=$PREFILL_GLUE} ${BIAS_FAR:+-e SPARK_FA4_BIAS_FAR=$BIAS_FAR} ${FI_MXFP8:+-e SPARK_FI_MXFP8=1} ${NCCL_EXTRA:-} ${REASONING_CACHE:+-e SPARK_REASONING_CACHE=$REASONING_CACHE} \
  --entrypoint python3 $IMAGE -m sglang.launch_server --model-path /models/repo/$SNAP --served-model-name $SERVED --trust-remote-code \
  --tp 4 --ep-size 4 --nnodes 4 --node-rank $r --dist-init-addr $HEAD:$DIST_PORT --host 0.0.0.0 --port $PORT \
  --attention-backend fa4 --mem-fraction-static $MEMFRAC --chunked-prefill-size $CHUNK --context-length $CTX \
  --max-running-requests $MAXREQ --cuda-graph-max-bs-decode $MAXREQ --cuda-graph-backend-prefill disabled --cuda-graph-max-bs-prefill $MAXREQ \
- --watchdog-timeout 1800 --enable-metrics --kv-cache-dtype $KV_DTYPE $SPEC_ARGS ${EXTRA_ARGS:-}"
+ --watchdog-timeout 1800 --enable-metrics --kv-cache-dtype $KV_DTYPE $SPEC_ARGS ${POOL:+--max-total-tokens $POOL} ${SWA_RATIO:+--swa-full-tokens-ratio $SWA_RATIO} ${EXTRA_ARGS:-}"
 }
 if [ $DRY = 1 ]; then for r in 0 1 2 3; do echo "== rank $r"; run_cmd $r || exit 1; echo; done; exit 0; fi
 echo "== preflight"; bad=""
