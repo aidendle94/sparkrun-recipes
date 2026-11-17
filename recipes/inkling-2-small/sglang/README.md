@@ -154,6 +154,12 @@ hf download thinkingmachines/Inkling-2-Small --revision b0e7afb8892a07897c78ce1c
 #    lmsysorg/sglang@sha256:424c1da97f6d6eef1612006c77b2ca791657a8184c1fbdbc682ebf9485d3b32c  (2026-11-12)
 #    If the tag has moved since and a boot fails in a hook, pull that digest and set INKLING_IMAGE to it.
 docker pull lmsysorg/sglang:dev-inkling-2-small
+#    Or that pinned build with this recipe's hooks already inside (one small layer on top, see the Dockerfile):
+#      docker pull aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.0
+#      export INKLING_IMAGE=aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.0     # before launching
+#    The launcher runs either one: it mounts its own patches/ over the image's, so the two cannot drift apart.
+#    The author's fleet has served from the upstream tag only. The hooks image has passed a file and import
+#    check, not yet a fleet boot.
 
 # 2. The site file: nodes, users, devices. Every line of the example says how to find its value.
 cp launch/fleet.env.example launch/fleet.env
@@ -253,6 +259,7 @@ Every launcher variable, these and the others (`PORT`, `MAXREQ`, `CHUNK`, `SERVE
 | `launch/launch-inkling2.sh` | one container per node (`inkling2`), RoCE/NCCL environment, the hooks on PYTHONPATH; `--dry-run`, `--stop` |
 | `launch/relaunch-inkling2.sh` | disarm the watchdog, launch, wait for /health, re-arm the watchdog (use this to restart) |
 | `launch/watchdog-inkling2.sh` | probes and relaunches (log `~/inkling2-watchdog.log`) |
+| `Dockerfile` | the hooks image: the pinned base plus `patches/` on `PYTHONPATH`, published as `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.0` (no hook is switched on in it: the launcher's variables do that) |
 | `launch/fleet.env.example` | the site file; copy to `launch/fleet.env` (git-ignored) |
 | `patches/sitecustomize.py` | installs the hooks at interpreter start in every rank; the other files in `patches/` are the hooks |
 | `bench/concurrency_check.py` | reads the text of overlapping requests against single-stream references. **Run it after any change to a decode path** |

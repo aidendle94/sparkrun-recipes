@@ -3,6 +3,7 @@ model: thinkingmachines/Inkling-2-Small          # the official NVFP4 checkpoint
 engine: sglang
 engine_base: lmsysorg/sglang@sha256:424c1da97f6d6eef1612006c77b2ca791657a8184c1fbdbc682ebf9485d3b32c   # the dev-inkling-2-small tag as of 2026-11-12
 image: lmsysorg/sglang:dev-inkling-2-small       # unmodified; the hooks in patches/ are mounted and put on PYTHONPATH
+image_with_hooks: aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.0   # the same pinned base + patches/ (Dockerfile); file and import check only, no fleet boot yet
 status: experimental          # production | validated | experimental | archived  (four days old, dev image, open problems: see README)
 nodes: 4 x NVIDIA DGX Spark (GB10, 128 GB), switched RoCE fabric, TP4/EP4
 context_length: 524288        # launcher default since 2026-11-17 (262144 before)
