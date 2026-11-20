@@ -158,6 +158,10 @@ STACKS
   for r in 1 2 3; do
     timeout 150 sh -c "ssh -o BatchMode=yes -o ConnectTimeout=10 '${USERS[$r]}@${NODES[$r]}' 'docker exec --privileged -i $NAME sh -s' < '$TMP/stacks.sh'" > "$d/rank$r-stacks.txt" 2>&1 &
   done
+  # What every rank waits for (bench/stall_evidence.sh): the collective recorder's [stall] lines (SPARK_STALL_DUMP),
+  # the CPU time of each scheduler thread (main thread + NCCL progress thread busy = an NCCL operation is pending;
+  # main thread alone = a wait inside the RDMA runtime), GPU power, py-spy with locals. Bounded like the rest.
+  [ -f "$HERE/../bench/stall_evidence.sh" ] && { FLEET_ENV="$FLEET_ENV" timeout 170 bash "$HERE/../bench/stall_evidence.sh" "$d" stall > "$d/stall-evidence.log" 2>&1 & }
   wait
   log "evidence captured in $d: $(ls "$d" | tr '\n' ' ')"
 }

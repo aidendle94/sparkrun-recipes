@@ -322,7 +322,7 @@ def _st(category, fn):
 
 
 def experts_forward(x, ids, weights, start, w13, s13, a13, d13, w2, s2, a2, d2, caps, gemm=None,
-                    out_dtype=torch.float32, shard=None, exchange=None, half=None):
+                    out_dtype=torch.float32, shard=None, exchange=None, half=None, pack=None):
     """Per-token sums of this rank's routed experts (source_partial semantics), accumulated in FP32 and stored as
     `out_dtype` (FP32, or BF16 as the stock Hopper path sends above 512 tokens). x (tokens, hidden) BF16; ids,
     weights (tokens, top_k); w*/s* NVFP4 weights (experts, n, k // 2) and 128x4-layout scales; a*, d* amax and outer
@@ -332,7 +332,9 @@ def experts_forward(x, ids, weights, start, w13, s13, a13, d13, w2, s2, a2, d2, 
     -> the same with every rank's row, for the full-width amax; None = each shard's own amax.
     `half` = (alpha, shift), alpha FP32 (experts,) holding 2^-shift (half_shift of w2's width; made once at load: never
     from Python data under a graph capture): the down projection's accumulator is stored as FP16 scaled by alpha and
-    its rows are summed without the BF16 rounding (see the module docstring); None = BF16 rows, stock's arithmetic."""
+    its rows are summed without the BF16 rounding (see the module docstring); None = BF16 rows, stock's arithmetic.
+    `pack` = (w13, w2) scales packed by patches/scale_pack.py (s13 and s2 are then ignored): before each GEMM the
+    scales of the experts that have rows are expanded into the shared scratch tensor the GEMM reads (the same bytes)."""
     if gemm is None:
         from flashinfer.gemm import group_gemm_nvfp4_nt_groupwise as gemm
     tokens, top_k = ids.shape
@@ -356,7 +358,18 @@ def experts_forward(x, ids, weights, start, w13, s13, a13, d13, w2, s2, a2, d2, 
                   hidden // 16, 1024, triton.next_power_of_2(hidden // 16))
     acc = torch.empty((rows, n13), dtype=torch.bfloat16, device=device)
     swap = n < 16384
-    _st("f_gemm13", gemm)(a1, w13, a1_sf, s13, m_indptr, tile_m=128, tile_n=64, tile_k=256, swap_ab=swap, out=acc)
+    in_kernel = False
+    if pack is not None:
+        import scale_pack
+        # the forked GEMM (kernels/csf_gemm) reads the packed scales itself, for the swap_ab layout only; without it,
+        # or for the other layout, the routed experts' scales are expanded into the shared scratch first
+        in_kernel = scale_pack.kernel_ready()
+        if not (in_kernel and swap):
+            s13 = _st("f_expand", scale_pack.expand)(pack[0], m_indptr)
+    if in_kernel and swap:
+        _st("f_gemm13", scale_pack.gemm_packed)(a1, w13, a1_sf, pack[0], m_indptr, out=acc)
+    else:
+        _st("f_gemm13", gemm)(a1, w13, a1_sf, s13, m_indptr, tile_m=128, tile_n=64, tile_k=256, swap_ab=swap, out=acc)
     a2_rows = torch.empty((rows, inter // 2), dtype=torch.uint8, device=device)
     a2_sf = sf_buffer((sf_rows, inter // 16), dtype=torch.uint8, device=device)
     h_amax = torch.empty(rows, dtype=torch.float32, device=device)
@@ -374,10 +387,15 @@ def experts_forward(x, ids, weights, start, w13, s13, a13, d13, w2, s2, a2, d2, 
                                              h_amax, parts, start, n, top_k, inter, 256, *caps, world, num_warps=4,
                                              enable_fp_fusion=False)
     y = torch.empty((tokens, w2.shape[1]), dtype=out_dtype, device=device)
+    if pack is not None and not in_kernel:
+        s2 = _st("f_expand", scale_pack.expand)(pack[1], m_indptr)
     if half is None:
         out2 = torch.empty((rows, w2.shape[1]), dtype=torch.bfloat16, device=device)
-        _st("f_gemm2", gemm)(a2_rows, w2, a2_sf, s2, m_indptr, tile_m=128, tile_n=64, tile_k=256, swap_ab=True, out=out2,
-                             **narrow)
+        if in_kernel:
+            _st("f_gemm2", scale_pack.gemm_packed)(a2_rows, w2, a2_sf, pack[1], m_indptr, out=out2)
+        else:
+            _st("f_gemm2", gemm)(a2_rows, w2, a2_sf, s2, m_indptr, tile_m=128, tile_n=64, tile_k=256, swap_ab=True,
+                                 out=out2, **narrow)
         _st("f_combine", _combine[(tokens, triton.cdiv(w2.shape[1], 1024))])(out2, slots, flat, h_amax, a2, d2, y, start, top_k,
                                                             w2.shape[1], 1024, enable_fp_fusion=False)
         return y
@@ -386,8 +404,11 @@ def experts_forward(x, ids, weights, start, w13, s13, a13, d13, w2, s2, a2, d2, 
         raise ValueError(f"half: shift {shift} for width {inter} (wants {half_shift(inter)}), {alpha.numel()} scales "
                          f"for {num_local} experts")
     out2 = torch.empty((rows, w2.shape[1]), dtype=torch.float16, device=device)
-    _st("f_gemm2", gemm)(a2_rows, w2, a2_sf, s2, m_indptr, alpha=alpha, tile_m=128, tile_n=64, tile_k=256, swap_ab=True,
-                         out=out2, **narrow)
+    if in_kernel:
+        _st("f_gemm2", scale_pack.gemm_packed)(a2_rows, w2, a2_sf, pack[1], m_indptr, alpha=alpha, out=out2)
+    else:
+        _st("f_gemm2", gemm)(a2_rows, w2, a2_sf, s2, m_indptr, alpha=alpha, tile_m=128, tile_n=64, tile_k=256,
+                             swap_ab=True, out=out2, **narrow)
     _st("f_combine", _combine_wide[(tokens, triton.cdiv(w2.shape[1], 1024))])(
         out2, slots, flat, h_amax, a2, d2, y, start, float(2 ** shift), top_k, w2.shape[1], 1024, enable_fp_fusion=False)
     return y

@@ -9,17 +9,20 @@ node and put on `PYTHONPATH`; they supply what GB10 needs (attention arguments, 
 four boxes, a correct decode kernel at page size 1) and then the speed: about 61 tok/s for one stream, where the
 image's own decode step on the same hardware gave 37.
 
-**Status: experimental.** It has served the author's fleet since 2026-11-12, which is four days at the time of
-writing, and most of those days were spent changing it. What that means in practice:
+**Status: experimental.** It has served the author's fleet since 2026-11-12, which is eight days at the time of
+writing (2026-11-20), and most of those days were spent changing it. What that means in practice:
 
 - The base is a development image, not an SGLang release. The hooks bind to one build of it (digest below). One of
-  them rebuilds a kernel from the image's own source and refuses to boot if that source has changed.
-- The numbers are single boots on one fleet. The defaults changed several times a day, and the newest have days of
-  serving behind them, not weeks: the sharded experts became the default on 2026-11-15; the 500K configuration
+  them rebuilds a kernel from the image's own source and refuses to boot if that source has changed; the forked
+  GEMM of the packed block scales is compiled from the image's sources and its build stops in the same case.
+- The numbers are single boots on one fleet. The defaults changed several times a day, and the newer ones have days
+  of serving behind them, not weeks: the sharded experts became the default on 2026-11-15; the 500K configuration
   (524,288 tokens of context, the 793,000-token pool, the three prefill switches) served for a day through the
-  environment and became the launcher's default on 2026-11-17.
-- There are open problems, listed under [Known problems](#known-problems). One of them is a scheduler hang that
-  happened once and was never reproduced.
+  environment and became the launcher's default on 2026-11-17; the packed block scales became the default on
+  2026-11-19. The newest, the confidence head, became the default on 2026-11-20, the day this page was written,
+  with about two hours of serving behind it.
+- There are open problems, listed under [Known problems](#known-problems). One of them is a silent stall of the
+  whole fleet that has happened twice and whose cause is not found.
 
 If you want a recipe that has soaked, use [`deepseek-v4.1-flash/sglang`](../../deepseek-v4.1-flash/sglang/).
 
@@ -31,8 +34,11 @@ ports. **Pool**: the KV cache, counted in tokens, shared by all running and cach
 
 ## What you get
 
-Measured on four Sparks over a switched RoCE fabric, 2026-11-13 to 2026-11-16. Every row is one boot. The
-launcher's defaults are the configuration of the last of those days; a row measured on an earlier one says so.
+Measured on four Sparks over a switched RoCE fabric, 2026-11-13 to 2026-11-20. Every number is one boot. All rows but
+two were measured by 2026-11-16, on the configuration of that day or, where a row says so, an earlier one. The
+launcher's defaults are that configuration plus four switches added since: two on 2026-11-17 against kernels
+compiled and loaded while serving (exact; no row here), then the packed block scales (2026-11-19) and the confidence
+head (2026-11-20), which have a row each, measured against the configuration without them.
 Conditions and the history of each number are in [docs/results.md](docs/results.md).
 
 | what | measured |
@@ -40,6 +46,8 @@ Conditions and the history of each number are in [docs/results.md](docs/results.
 | decode, one stream, greedy, coding questions of 400 tokens | 60–61 tok/s (37 with the image's own decode step, on another set of such questions) |
 | decode, one stream, temperature 0.7 | 56.6 tok/s |
 | decode, four / eight streams at a time, greedy | 106 / 130 tok/s for the batch (about 26 / 16 a stream) |
+| decode, one stream, greedy, with the confidence head (the default since 2026-11-20; a test boot and the serving boot after it, 16 coding questions of 400 tokens) | 61.64 tok/s on the test boot and 61.79 on the serving boot, against 60.41 and 60.81 on the boots without it before and after (60.61 on average): x1.017 and x1.019, net of the head's own cost. These are medians over the 16 questions; the step time at equal accept is 1.5 % and 1.2 % lower. Those boots carry the packed block scales, which cost about 1 % of a step: the boots of 2026-11-19 with neither default ran 61.31 and 60.95, so for one greedy stream the two newest defaults together are about level with the stack before them (the serving boot against them: x1.008 and x1.014). Inside the test boot, on a mixed set of 16 short prompts (8 of those coding questions, 8 general ones) run back to back under the head and under the gate's own rule: x1.023 greedy and x1.050 at temperature 1.0, not net (both arms carried the head's cost); net at temperature 1.0 was not measured (about x1.036 estimated) |
+| memory with the packed block scales (the default since 2026-11-19) | 3.0–3.4 GB more available on every node; the same text and the same NLL token for token. One stream's step is about 1 % longer (0.5 to 0.7 ms on three boots) |
 | prefill, ~15K-token prompts | 2,400–2,500 tok/s (before the prefill switches; not measured again with them) |
 | cold prefill of 30K / 120K tokens | 3,110 / 2,786 tok/s (2,474 / 2,241 without the three prefill switches) |
 | cold prefill of 130K / 260K / 500K tokens | 61 / 142 / 348 s before the prefill switches; with them 120K takes 43 s (54 without) and 300K 135 s |
@@ -123,10 +131,34 @@ Why the driver fails on such a load is not known; the first switch removes the l
 that remain. The record is in
 [docs/results.md](docs/results.md#two-outages-on-2026-11-17-and-the-kernels-compiled-while-serving).
 
-Each of the twelve before them is switched off by setting it empty on the relaunch (`KV_DTYPE=auto` for the BF16 pool). The
-switches are independent of each other, with two exceptions: `FI_MXFP8` does nothing without `fp8` in `TP_SHARD`,
-and `DRAFT_KV_FP8` does nothing without the FP8 KV cache. `TP_SHARD= DENSE_P12=` is the stack as it served before
-2026-11-15, `PREFILL_GLUE= BIAS_FAR= FI_MXFP8=` as it served before 2026-11-16 17:20 UTC.
+And two since then (defaults since 2026-11-19 and 2026-11-20). The first gives memory back, the second makes the
+gate choose its rows better:
+
+| launcher variable (default) | what it does | cost |
+|---|---|---|
+| `SCALE_PACK=1` (`SPARK_SCALE_PACK`, `SPARK_CSF_GEMM`) | the block scales of the 40 NVFP4 expert layers stay packed in memory, 56 % of their bytes (`patches/scale_pack.py`), and a fork of FlashInfer's grouped GEMM, compiled from the image's own sources, reads them inside the kernel: 3.0–3.4 GB more available memory on every node | none in the results: the same bytes into the GEMM, the same text on 16 of 16 prompts, NLL equal token by token. About 1 % of step time for one stream: 0.5 to 0.7 ms a step longer on three boots than on the boots without it; none seen at four and eight streams (one boot; runs differ by up to 7 % there). The module has to be built once per image ([Run it](#run-it), step 2); without it the launcher leaves the packing off and says so |
+| `GATE_HEAD=gate-head-mlp-reg.pt` (`SPARK_GATE_HEAD`) | the gate's row count comes from a small trained head that reads the draft's hidden state, computed inside the draft's CUDA graph (`patches/spark_gate_head.py`; the head file is in `patches/`). Net of its own cost, for one greedy stream: x1.017 on the test boot and x1.019 on the serving boot, against the boots without it. Inside the test boot, against the gate's own rule with both arms carrying the head's cost: x1.023 greedy and x1.050 at temperature 1.0 for one stream (net at temperature 1.0 not measured, about x1.036 estimated) | exact for sampled requests like the gate, and greedy text identical on 16 of 16 prompts one at a time; its tail in the draft graph costs about 0.75 ms a step (se 0.32), most of it the statistics; measured on short prompts only (see [Known problems](#known-problems)) |
+
+The pool was not raised for the memory the packing frees: it is margin. The format, the kernel and the numbers of
+the packing are in
+[docs/results.md](docs/results.md#packed-block-scales-and-the-forked-gemm-2026-11-19-the-launchers-default-scale_pack-turns-it-off);
+how the head was trained, its test boot and what that boot did not measure are in
+[the section after it](docs/results.md#a-confidence-head-for-the-gate-2026-11-1920-the-launchers-default-since-2026-11-20-1147-utc-gate_head-turns-it-off).
+
+One more change is not a launcher switch. Since 2026-11-18 every rank logs what it is waiting for when a forward
+does not return or the scheduler stops making forwards (`[stall]` lines; `SPARK_STALL_DUMP`, 60 s by default),
+prints a running checksum of its forwards that must be equal on the four ranks (`[sig]` lines), and the watchdog
+saves each rank's view before it relaunches (`bench/stall_evidence.sh`). It is there for a stall whose cause is not
+found: see [Known problems](#known-problems) and
+[docs/results.md](docs/results.md#the-silent-stall-and-what-every-rank-records-since-2026-11-18).
+
+Every switch of these tables is turned off by setting it empty on the relaunch (`KV_DTYPE=auto` for the BF16
+pool). They are independent of each other, with four exceptions: `FI_MXFP8` does nothing without `fp8` in
+`TP_SHARD`, `DRAFT_KV_FP8` does nothing without the FP8 KV cache, `SCALE_PACK` needs `TP_SHARD`, and `GATE_HEAD`
+needs `GATE`; in the last two cases the launcher turns the switch off and says so. Lever by lever: `GATE_HEAD=` is
+the gate's own rule, as served before 2026-11-20; `SCALE_PACK=` the block scales as loaded, as served before
+2026-11-19; `PREFILL_GLUE= BIAS_FAR= FI_MXFP8=` prefill as served before 2026-11-16 17:20 UTC; `TP_SHARD=
+DENSE_P12=` the experts and the dense weights as served before 2026-11-15.
 
 ## What you need
 
@@ -142,6 +174,8 @@ and `DRAFT_KV_FP8` does nothing without the FP8 KV cache. `TP_SHARD= DENSE_P12=`
   from rank 0 to the other three; permission to pass `/dev/infiniband` into a container and to lift the memlock
   limit.
 - On rank 0: `bash`, `ssh`, `scp`, `curl`, `flock`, `nvidia-smi`, and Python 3 (standard library only) for `bench/`.
+  The one-time build of step 2 of [Run it](#run-it) runs in the image and wants the node idle (several GB of
+  memory, eight cores for about 40 s on the author's node).
 - Nothing else on the GPUs. The weights take 92–93 GB of each node and the pool takes what is left.
 
 ## Run it
@@ -158,25 +192,52 @@ docker pull lmsysorg/sglang:dev-inkling-2-small
 #      docker pull aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.0
 #      export INKLING_IMAGE=aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.0     # before launching
 #    The launcher runs either one: it mounts its own patches/ over the image's, so the two cannot drift apart.
+#    That tag was built on 2026-11-17, before the packed block scales, the stall recorder and the confidence
+#    head: its own /patches are the hooks of that day, and it holds neither the head file nor kernels/. Under
+#    the launcher it runs today's hooks all the same, because of that mount.
 #    The author's fleet has served from the upstream tag only. The hooks image has passed a file and import
 #    check, not yet a fleet boot.
 
-# 2. The site file: nodes, users, devices. Every line of the example says how to find its value.
+# 2. Once per image, on rank 0, with nothing serving on that node: build the forked grouped GEMM that reads the
+#    packed block scales (SCALE_PACK, a default). About 40 s on a Spark and no GPU, but several GB of memory.
+#    It compiles from the image's own CUTLASS and FlashInfer sources and stops if a line it patches has changed.
+#    The one argument is the output directory; use the image you are going to launch (INKLING_IMAGE).
+mkdir -p "$HOME/inkling2-csf-build"
+docker run --rm --network none --memory 16g --cpus 8 \
+  -v "$PWD/kernels/csf_gemm":/k:ro -v "$HOME/inkling2-csf-build":/out \
+  --entrypoint /opt/sglang/bin/python3 lmsysorg/sglang:dev-inkling-2-small /k/build_csf_gemm.py /out
+cp "$HOME/inkling2-csf-build/spark_csf_gemm_sm120.so" patches/
+#    Without that file the launcher prints "note: patches/spark_csf_gemm_sm120.so is not built
+#    (kernels/csf_gemm/build_csf_gemm.py): the packing is off for this launch" and starts the stack without the
+#    packing: the same text, 3.0-3.4 GB less available memory on every node, one stream's step about 1 % shorter.
+#    Build it again when the image changes: the module belongs to the image it was built from.
+
+# 3. The site file: nodes, users, devices. Every line of the example says how to find its value.
 cp launch/fleet.env.example launch/fleet.env
 
-# 3. Print the four docker run commands without starting anything. This already needs ssh to every rank:
+# 4. Print the four docker run commands without starting anything. This already needs ssh to every rank:
 #    the RoCE-v2 GID index is probed on each node.
 launch/launch-inkling2.sh --dry-run
 
-# 4. Launch: disarms the watchdog, copies patches/ to every node, removes a previous inkling2 container, starts
-#    ranks 3..0, waits for /health, arms the watchdog.
+# 5. Launch: disarms the watchdog, copies the hooks, the built module and the head file to every node, removes a
+#    previous inkling2 container, starts ranks 3..0, waits for /health, arms the watchdog.
 launch/relaunch-inkling2.sh
 
-# 5. First request (port 8210 on rank 0).
+# 6. What the gate and the two newest defaults logged, on every rank (run it on each node; rank 0 shown):
+docker logs inkling2 2>&1 | grep -E 'scale_pack\] forked GEMM|gate head\]|\[gate\] (armed|SPARK_GATE|row counts)'
+#    Expected, six lines a rank: "nothing is expanded" twice (w13_scale, w2_scale), "[gate] armed: tau=0.4 ...",
+#    "[gate head] armed on 4 rank(s): ...", "[gate] row counts from the confidence head" and "[gate head]
+#    warm-ups: ranks differ=0". Without the module of step 2 the two "forked GEMM" lines are missing (four lines
+#    a rank); the launcher's note about it is in the relaunch log ($LOG_DIR/inkling2-relaunch-*.log) and on the
+#    terminal only in step 4. "NOT used" means the module failed its check and the scales are expanded per call
+#    (the same results, a 7.5 % slower step). "[gate head] ... NOT armed: <why>" means the gate runs its own
+#    rule. "[gate] SPARK_GATE=... NOT armed: <why>" means there is no gate at all, whatever the head's lines say.
+
+# 7. First request (port 8210 on rank 0).
 curl -s http://<rank-0>:8210/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model":"inkling-2-small","messages":[{"role":"user","content":"Is 91 prime?"}],"max_tokens":400}'
 
-# 6. Read the text of overlapping requests. Do this after every boot of a changed configuration: a broken
+# 8. Read the text of overlapping requests. Do this after every boot of a changed configuration: a broken
 #    decode path looks fast and healthy in every counter.
 mkdir -p logs && python3 bench/concurrency_check.py && python3 bench/reasoning_cache_check.py --expect on
 ```
@@ -187,7 +248,18 @@ setting, `--prefill-decode-interval 2` (`PREFILL_DECODE_INTERVAL`): after a pref
 decode rounds before it takes the next one, so requests that are already decoding keep getting tokens through a
 long prefill. A new request still waits for the whole prefill ahead of it. The setting has been on the fleet's line
 since the 500K stress test and was not measured against a boot without it; `PREFILL_DECODE_INTERVAL=` leaves the
-scheduling to the engine.
+scheduling to the engine. On top of that configuration come the two kernel switches of 2026-11-17
+(`STABLE_KERNELS`, `KERNEL_LOAD_GUARD`), the packed block scales (since 2026-11-19, if the module of step 2 is
+built) and the confidence head (since 2026-11-20).
+
+The two newest defaults have a rollback line each. `GATE_HEAD=` takes exactly the head's variable out of the four
+`docker run` commands and `SCALE_PACK=` exactly the packing's two; with both empty the commands are those of the
+launcher before 2026-11-19, token for token (dry-runs compared):
+
+```bash
+GATE_HEAD= launch/relaunch-inkling2.sh               # the gate's own rule: the stack before 2026-11-20
+SCALE_PACK= GATE_HEAD= launch/relaunch-inkling2.sh   # and the block scales as loaded: the stack before 2026-11-19
+```
 
 The cap goes with the pool settings: the same bytes hold 716,000 tokens with `DRAFT_KV_FP8=` and 600,000 with
 `SWA_RATIO=` as well, and the launcher picks the cap accordingly. A cap above what the bytes hold is sized down by
@@ -199,12 +271,18 @@ Earlier configurations with today's launcher:
 
 ```bash
 # 600,000-token pool, no prefill switches (what most rows of the table above were measured on)
-SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= launch/relaunch-inkling2.sh
+SCALE_PACK= GATE_HEAD= SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= \
+  launch/relaunch-inkling2.sh
 
 # the defaults before 2026-11-17: 262,144 tokens of context, the pool sized at each boot, the engine's scheduling
-CTX=262144 MEMFRAC=0.93 POOL= SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= \
-  PREFILL_DECODE_INTERVAL= launch/relaunch-inkling2.sh
+SCALE_PACK= GATE_HEAD= CTX=262144 MEMFRAC=0.93 POOL= SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= \
+  BIAS_FAR= FI_MXFP8= PREFILL_DECODE_INTERVAL= launch/relaunch-inkling2.sh
 ```
+
+Both lines carry `SCALE_PACK= GATE_HEAD=` since 2026-11-20: without them the two newest defaults would ride on
+the older configuration. The two kernel switches of 2026-11-17 (`STABLE_KERNELS`, `KERNEL_LOAD_GUARD`) stay on in
+both lines on purpose: they are exact and they keep the fleet up. With `STABLE_KERNELS= KERNEL_LOAD_GUARD=` in front
+as well, the lines give the commands of their day token for token (dry-runs compared).
 
 `NCCL_EXTRA` (extra `-e NAME=value` arguments of the containers) and `EXTRA_ARGS` (extra server arguments) come
 after the defaults on the command line, so a value given there wins.
@@ -212,7 +290,8 @@ after the defaults on the command line, so a value given there wins.
 Stop: kill the watchdog (the pid is in the last `watchdog started` line of `~/inkling2-watchdog.log`), then
 `launch/launch-inkling2.sh --stop`. The watchdog probes `/health` and a three-token chat completion every 60 s and
 relaunches the fleet after three failures with the environment it was started in; before it does, it saves the
-state, logs and Python stacks of every rank under `$LOG_DIR/postmortem/`.
+state, logs and Python stacks of every rank under `$LOG_DIR/postmortem/`, and since 2026-11-18 what each rank was
+waiting for (`stall-rank<N>.txt`, written by `bench/stall_evidence.sh`).
 
 Every launcher variable, these and the others (`PORT`, `MAXREQ`, `CHUNK`, `SERVED`, `SERVED_ALIASES`, `MTP`,
 `ROCE_AR`, `FI_MOE`, `PAGED_DECODE`), is documented at the top of `launch/launch-inkling2.sh`. Leave
@@ -220,8 +299,10 @@ Every launcher variable, these and the others (`PORT`, `MAXREQ`, `CHUNK`, `SERVE
 
 ## Using it as a client
 
-- **Temperature.** A chat request without a `temperature` is sampled at 0.7 (the server's default; the model ships
-  no generation config). For lookups in long contexts and for agent work, send 0.
+- **Temperature.** A chat or messages request without a `temperature` is sampled at 1.0 (the engine's default for
+  those endpoints; the Responses API defaults to 0.7; the model ships no generation config). This page said 0.7
+  for chat requests until 2026-11-20: a capture that recorded each request's sampling parameters showed 1.0. For
+  lookups in long contexts and for agent work, send 0.
 - **History.** The model's template shows an earlier turn's thinking only if the client sends it back
   (`reasoning_content`, or the thinking blocks on `/v1/messages`). Without it, over a long context, the model
   answers a later question with an earlier answer. The reasoning cache covers clients that drop it, for chat
@@ -235,8 +316,26 @@ Every launcher variable, these and the others (`PORT`, `MAXREQ`, `CHUNK`, `SERVE
 
 ## Known problems
 
-- **A silent scheduler hang, once** (2026-11-13, under concurrent agent loops): the server stopped answering with
-  every container up. It was not reproduced. The watchdog recovers from it and now captures the stacks.
+- **A silent stall of the whole fleet, twice** (2026-11-13 under concurrent agent loops, 2026-11-18 on parallel
+  requests of one conversation): the server stopped answering with every container up and every rank alive, both
+  times while a new request was prefilled beside running decodes. The cause is not found, and a load test written
+  to provoke it did not. The watchdog recovers from it; since 2026-11-18 every rank also records what it is
+  waiting for, so that the next one leaves evidence. No fix exists.
+- **The confidence head is new and narrowly measured.** It became the default on 2026-11-20, the day it was
+  trained and tested. Its test boot ran short prompts only, 24 in all, 400 tokens each: 16 coding questions for the
+  step times across boots, and a mixed set of 16 (8 general questions and 8 of those coding questions) for the
+  comparison inside the boot. Not measured on the fleet: agent turns with tools, long contexts, and temperature 0.7
+  (4 prompts in a side check: x0.97 per prompt, the four between x0.88 and x1.03, x0.96 over all tokens). The
+  four-stream samples are 4 and 3 batches, too few for an interval, and the one greedy batch of four in that side
+  check ran x0.91. The ratios inside the test boot are not net of the head's own cost; net was measured for one
+  greedy stream only, on two boots (x1.017 and x1.019), where two boots of one configuration have differed by up to
+  0.9 % in step time. Against the boots of 2026-11-19, before the packed block scales, the head and the packing
+  together are about level for one greedy stream: the head gives back what the packing costs. The head that ships
+  is fit on three fifths of one capture of templated prompts, not on all of it. Its tail costs about 0.75 ms a step,
+  most of it statistics that one fused kernel could read in a single pass; that kernel is not built and its gain is
+  an estimate. That it leaves sampled output exact rests, as for the gate itself, on how the engine's accept treats
+  the capped row; a second reading of the engine's code confirmed that, and no test pins it. `GATE_HEAD=` goes back
+  to the gate's own rule.
 - **A short request waits behind a long prefill** for the whole prefill (338 s behind a 500K one).
 - **The reasoning loop on long lists.** At 130K tokens of near-identical record lines, about 1 lookup in 10 runs
   out of tokens copying the list in its reasoning (0 at 60K, 0 on source code). It is the model: the hosted
@@ -249,8 +348,13 @@ Every launcher variable, these and the others (`PORT`, `MAXREQ`, `CHUNK`, `SERVE
 - **Log-probability requests over long spans can take a node down** (the full-vocabulary logits of every scored
   position). Keep scored spans to a few hundred tokens.
 - **No GPU work beside the serving fleet**, however small: there is no memory for it, and the driver fails
-  allocations instead of evicting page cache.
-- **Heat.** Long all-node load reached 88–89 °C on the hottest node.
+  allocations instead of evicting page cache. No compile either: the build of the forked GEMM (step 2 of
+  [Run it](#run-it)) on a node that was serving took the author's fleet down on 2026-11-19.
+- **Heat.** Long all-node load reached 88–89 °C on the hottest node in the measurements up to 2026-11-16. On
+  2026-11-19 and 2026-11-20 the check, capture and test loads took the rank-0 node to 95–98 °C although its GPU
+  clock was capped (2,176 MHz; 1,958 for the long capture): a temperature guard stopped the checks of the first
+  serving boot with the packing (98 °C) and the first capture (97 °C), the later load clients were paced by that
+  temperature, and one test phase was cut at 95 °C.
 
 ## Files
 
@@ -258,10 +362,17 @@ Every launcher variable, these and the others (`PORT`, `MAXREQ`, `CHUNK`, `SERVE
 |---|---|
 | `launch/launch-inkling2.sh` | one container per node (`inkling2`), RoCE/NCCL environment, the hooks on PYTHONPATH; `--dry-run`, `--stop` |
 | `launch/relaunch-inkling2.sh` | disarm the watchdog, launch, wait for /health, re-arm the watchdog (use this to restart) |
-| `launch/watchdog-inkling2.sh` | probes and relaunches (log `~/inkling2-watchdog.log`) |
-| `Dockerfile` | the hooks image: the pinned base plus `patches/` on `PYTHONPATH`, published as `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.0` (no hook is switched on in it: the launcher's variables do that) |
+| `launch/watchdog-inkling2.sh` | probes and relaunches (log `~/inkling2-watchdog.log`); before a relaunch it saves every rank's state, stacks and stall evidence |
+| `Dockerfile` | the hooks image: the pinned base plus `patches/` on `PYTHONPATH`, published as `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.0` (no hook is switched on in it: the launcher's variables do that). The published tag was built on 2026-11-17 and holds the hooks of that day |
 | `launch/fleet.env.example` | the site file; copy to `launch/fleet.env` (git-ignored) |
-| `patches/sitecustomize.py` | installs the hooks at interpreter start in every rank; the other files in `patches/` are the hooks |
+| `patches/sitecustomize.py` | installs the hooks at interpreter start in every rank; the other `.py` files in `patches/` are the hooks |
+| `patches/gate-head-mlp-reg.pt` | the confidence head the launcher's `GATE_HEAD` names: a 256-unit MLP, 4.7 MB, sha256 `0bc7b3d52da6c1bd...`, read by `patches/spark_gate_head.py`. Trained by the author on the draft's hidden states (see [docs/results.md](docs/results.md)); no weight of the model is in it |
+| `kernels/csf_gemm/build_csf_gemm.py` | builds the forked grouped GEMM of the packed block scales from the image's sources into `spark_csf_gemm_sm120.so`. The module is not in the repository (`patches/*.so` is git-ignored): it belongs to the image it was built from |
+| `bench/scale_pack_test.py`, `bench/csf_gemm_test.py`, `bench/dhead4_test.py` | the packing on real checkpoint scales, without a GPU; the forked GEMM against FlashInfer's, bit for bit (one GPU, the fleet stopped); the quantizer of an optional 4-bit draft head (`dhead4` in `DENSE_I8`, not a default and not measured to pay) |
+| `bench/stall_evidence.sh`, `bench/stall_hunt.py`, `bench/stall_dump_check.py` | what every rank is doing right now (the watchdog runs it before a relaunch); a load test that tries to provoke the silent stall (planned windows only: it disarms the watchdog when it succeeds); the recorder checked on a CPU |
+| `patches/conf_capture.py`, `bench/conf_capture_run.py`, `bench/conf_capture_check.py`, `bench/conf_capture_rank_check.py`, `bench/conf_capture_align_check.py`, `bench/conf_capture_test.py` | training data for a confidence head: the recorder (capture windows only), its load generator, the checks of a capture, the recorder's CPU test |
+| `bench/conf_head_train.py`, `bench/conf_head_selftest.py`, `bench/cc_build_features.py`, `bench/cc_lab.py`, `bench/cc-run.sh`, `bench/exp_base.py`, `bench/exp_combo.py`, `bench/cc_count_ops.py` | training a head, CPU only: the first trainer and its self-test; the harness (features, folds, gate rules, the simulation, one capped container a node), the baselines, the script every head of the results comes from, operation counts |
+| `bench/cc_export_head.py`, `bench/gate_head_test.py`, `bench/gate_head_capture_check.py`, `bench/gate_run.py`, `bench/gate_ab_report.py` | from a trained head to the engine: the export with its parity check, CPU checks of the engine code, a test boot's recorded rows against a recomputation, the A/B inside one boot (`gate_run.py --head`) and its summary |
 | `bench/concurrency_check.py` | reads the text of overlapping requests against single-stream references. **Run it after any change to a decode path** |
 | `bench/reasoning_cache_check.py` | whether the server restores a history turn's reasoning, over six wire formats |
 | `bench/toolcall_check.py` | the tool-call suite (wire formats and agent loops) |
@@ -277,9 +388,12 @@ Every launcher variable, these and the others (`PORT`, `MAXREQ`, `CHUNK`, `SERVE
 | `bench/*_test.py`, `bench/compile_check*.py`, `bench/emu/` | kernel tests (idle GPU only, their docstrings say so) and the offline checks that run without a GPU |
 | `docs/results.md` | the lab notes: every hook, lever and number, in the order they were found |
 
-The tools that talk to the server use ordinary requests and say in their docstring whether they are safe on a
-serving fleet. Most write their results to `logs/` in this directory (create it once). `bench/window.py` also
+The tools that talk to the server use ordinary requests, and most say in their docstring whether they are safe on
+a serving fleet. Most write their results to `logs/` in this directory (create it once). `bench/window.py` also
 reads `logs/code_prompt.json`, a chat request body with a source file as its first message, which you supply.
+The capture checks and the training tools of the confidence head need numpy or torch: they run with the image's
+Python in a CPU-only container, and their docstrings give the command. A capture is not in the repository, so
+training a head of your own starts with a capture window on your own fleet.
 
 ## Licence
 

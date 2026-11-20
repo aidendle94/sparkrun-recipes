@@ -1,11 +1,13 @@
 # Inkling-2-Small on four DGX Sparks: lab notes
 
-The working notes behind this recipe, in the order things were built and measured (2026-11-12 to 2026-11-17): what
-the GB10 hooks do, the bug that produced garbage under concurrency, every decode lever with its numbers, long
-contexts and multi-turn history, the reasoning loop on long lists, the KV cache, the prefill switches, reasoning
-effort, and the first day's measurements. "Production" and "the fleet" mean the author's four Sparks; times are
-UTC. Each number is one boot on that fleet unless the text says otherwise. The launch scripts are in `launch/`, the
-tools in `bench/`, the hooks in `patches/`. The summary and the way to run it are in the [README](../README.md).
+The working notes behind this recipe (2026-11-12 to 2026-11-20). First what the launcher starts and what took the
+fleet down: the defaults, two outages, the silent stall and its recorder. Then by subject: what the GB10 hooks do,
+the bug that produced garbage under concurrency, every decode lever with its numbers, the packed block scales, the
+confidence head for the gate, long contexts and multi-turn history, the reasoning loop on long lists, the KV
+cache, the prefill switches, reasoning effort, and the first day's measurements. "Production" and "the fleet" mean
+the author's four Sparks; times are UTC. Each number is one boot on that fleet unless the text says otherwise. The
+launch scripts are in `launch/`, the tools in `bench/`, the hooks in `patches/`, the build script of the forked
+GEMM in `kernels/`. The summary and the way to run it are in the [README](../README.md).
 
 ## Launcher defaults since 2026-11-17
 
@@ -40,8 +42,9 @@ no cap was measured for it. All three caps were measured at `MEMFRAC=0.94`.
 
 `NCCL_EXTRA` and `EXTRA_ARGS` come after the defaults on the command line, so a value given there still wins, and a
 relaunch line of the sections below still starts a fleet. It no longer starts the configuration of its day,
-because the defaults now add to it. The lines of those sections are kept as they were run; with today's launcher
-the same four `docker run` commands come from (dry-runs compared byte for byte):
+because the defaults now add to it. The lines of those sections are kept as they were run; with the launcher of
+2026-11-17 the same four `docker run` commands came from these lines (dry-runs compared byte for byte; for the
+launcher of 2026-11-20 see the end of the next subsection):
 
 | configuration | line with the launcher since 2026-11-17 |
 |---|---|
@@ -50,6 +53,27 @@ the same four `docker run` commands come from (dry-runs compared byte for byte):
 | 716,000 (KV section) | `DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= bash launch/relaunch-inkling2.sh` |
 | 600,000 (Long contexts) | `SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= bash launch/relaunch-inkling2.sh` |
 | the launcher's defaults before 2026-11-17 (262,144 context, pool sized at boot, no interval) | `CTX=262144 MEMFRAC=0.93 POOL= SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= PREFILL_DECODE_INTERVAL= bash launch/relaunch-inkling2.sh` |
+
+### Two more defaults since: packed block scales (2026-11-19) and the confidence head (2026-11-20)
+
+Both are on when nothing is set, so the serving line is unchanged.
+
+| variable (default) | container setting | empty means |
+|---|---|---|
+| `SCALE_PACK` (1, serving since 2026-11-19 18:33 UTC) | `SPARK_SCALE_PACK=1` and `SPARK_CSF_GEMM=/patches/spark_csf_gemm_sm120.so` | the block scales as loaded and FlashInfer's own grouped GEMM: the stack before 2026-11-19 |
+| `GATE_HEAD` (gate-head-mlp-reg.pt, serving since 2026-11-20 11:47 UTC) | `SPARK_GATE_HEAD=/patches/gate-head-mlp-reg.pt` | the gate's own rule, the draft's token probability against `GATE`: the stack before 2026-11-20 |
+
+The launcher copies the module and the head file to every node with the hooks. It turns either switch off by
+itself, with a note on stderr, when what the switch needs is missing: the packing without `FI_MOE=1` and `TP_SHARD`
+or while `patches/spark_csf_gemm_sm120.so` is not built, the head without `GATE` or without its file. A launch
+without the built module runs with the block scales as loaded, as before 2026-11-19; it is not a failed boot.
+
+`SCALE_PACK= GATE_HEAD=` gives the four `docker run` commands of the launcher before them, token for token (dry-runs
+compared; the bytes differ by the spaces the two empty settings leave). The lines of the table above give the
+commands of their day only with these two in front as well, and with `STABLE_KERNELS= KERNEL_LOAD_GUARD=` (the two
+kernel switches of 2026-11-17, see "Two outages on 2026-11-17"), which those lines never carried: with all four in
+front, token for token (dry-runs against the launcher the table was written with). The two sections are below:
+"Packed block scales and the forked GEMM" and "A confidence head for the gate".
 
 ## Two outages on 2026-11-17 and the kernels compiled while serving
 
@@ -82,6 +106,52 @@ boot, nothing else). `STABLE_KERNELS= KERNEL_LOAD_GUARD=` gives the launcher's c
 `bench/head_mon.py` writes a line of memory, pressure and temperature every 2 s to `~/inkling2-headmon.log` and
 fsyncs it, so a freeze leaves its last seconds on disk. It does not start by itself after a reboot. After a crash,
 save `docker logs inkling2` on every node before relaunching: the relaunch removes the containers.
+
+## The silent stall, and what every rank records since 2026-11-18
+
+Twice the fleet stopped answering with every container up and every server process alive: on 2026-11-13, under the
+concurrent agent loops of the tool-call suite, and on 2026-11-18, on parallel requests of one conversation. Both
+times a new request was being prefilled beside running decodes, and both times the watchdog relaunched the fleet.
+The cause is not found. The load test written to provoke it (`bench/stall_hunt.py`: short prefills joining running
+decodes, long contexts, forks of a shared prefix, cancelled requests) did not stall the fleet on 2026-11-18.
+
+A stall of this kind leaves nothing in a log. Every rank schedules for itself from the same broadcast requests and
+must run the same forwards in the same order; if one rank decides differently, the collectives wait for each other,
+the schedulers sit in a GPU sync or a socket and the GPUs idle. The RDMA wait itself gives up after
+`B12X_ROCE_SPIN_LIMIT` polls (300 million: 133 s measured) and then only fills the error words of the runtime's
+control record: nothing is logged, nothing is raised. So the hooks record what they can see:
+
+- `patches/roce_collectives.py`, `SPARK_STALL_DUMP` (seconds; default 60, 0 = off; not a launcher variable, pass
+  another value through `NCCL_EXTRA`). A daemon thread on every rank logs one `[stall] rank N: ...` line when a
+  model forward has not returned for that long, or when no new forward began while the scheduler still holds running
+  or waiting requests (a decode replay returns at once and the scheduler blocks later, reading its result or in the
+  next request broadcast: the stall induced on 2026-11-18 12:48 UTC), and again at twice and at three times the
+  limit. The line holds what the forward was (mode, rows, tokens, a checksum of the request ids and, at a prefill,
+  each request's cached prefix and new tokens), the collectives issued since it began, which CUDA streams still
+  have work queued, the RDMA runtime's doorbell sequence, its error words and the arrival flags of every peer, the
+  proxy's counters, and the last 24 forwards. It reads host memory only, so it works while the main thread is
+  blocked.
+- Every 4,096 forwards a rank logs `[sig] rank N forwards=K crc=...`, a running checksum of those forward notes.
+  The four ranks must print the same value: a difference is a rank that scheduled differently, before anything
+  stalls.
+- At its first forward after a boot every rank logs `[stall] watch armed on rank N, limit 60 s; ...` with its state
+  at that moment, so the readout is known to work before a stall needs it.
+- The watchdog, before it relaunches, also runs `bench/stall_evidence.sh` into its postmortem directory:
+  `stall-rank<N>.txt` with that rank's `[stall]` lines, its last log lines, the CPU time of every thread of the
+  scheduler over 3 s, GPU power, the RDMA error counters and py-spy stacks with locals.
+
+How to read the four ranks together. A rank whose arrival flag from peer p is behind its own doorbell is waiting
+for p; equal doorbells with every flag in mean the stall is not in the RDMA runtime (NCCL, or a local kernel).
+Collectives since the forward began: 0 on every rank means the forward waits for work queued before it, equal
+non-zero counts that every rank reached the same collective, unequal counts that one rank is behind. Among the
+scheduler's threads, the main thread busy together with NCCL's progress thread is a pending NCCL operation; the
+main thread alone is a wait inside the RDMA runtime.
+
+`bench/stall_dump_check.py` checks the recorder on a CPU against a stand-in runtime. `bench/stall_hunt.py` is a
+load test for a planned window (other users wait behind it): when no request finishes for `--quiet` seconds and
+`/health` no longer answers 200, it disarms the watchdog, so that the stalled processes stay for inspection, and
+exits; relaunch by hand afterwards. Since the recorder went in, the fleet has not stalled (as of 2026-11-20): it
+has been read on induced stalls only, and the problem is open.
 
 ## GB10 hooks (`patches/sitecustomize.py`)
 
@@ -359,8 +429,10 @@ fleet, gated, 24 questions (`bench/sampled_run.py`): x1.002 at temperature 0.7 (
 same x1.002 on a second boot without the flag) and x1.005 at 1.0. The flag runs cleanly on GB10 (texts read, no errors),
 but the gate already drops the drafts where the joint rule would help, so there is nothing to gain: left off.
 For reference, sampled requests on the gated default: 40.7 tok/s at temperature 0.7 (66.9 ms steps, 2.74 tokens per
-step, 3.8 verify rows), 21.2 per stream at four streams. Chat requests without a `temperature` are sampled at 0.7
-(the server's default; the model ships no generation config).
+step, 3.8 verify rows), 21.2 per stream at four streams. Chat requests without a `temperature` are sampled at 1.0
+(the engine's default for chat completions and messages; the model ships no generation config). Until 2026-11-20
+this paragraph said 0.7, which is the default of the Responses API: see the capture under "A confidence head for
+the gate".
 
 **Sampled decode at temperature 1.0** (the publisher evaluates at temperature 1.0, top_p 1; window of 2026-11-16).
 On the serving configuration one stream runs 53.4 tok/s greedy, 50.3 at temperature 0.7 and 48.5 at 1.0 (24
@@ -405,10 +477,302 @@ a step on the serving configuration):
   times slower than stock's pair of launches at 1 to 8 rows. It stays a prefill part.
 
 What is left for decode is tokens per step, that is how well the draft's confidence predicts the target (see the
-sampled-decode paragraph above), not the step.
+sampled-decode paragraph above), not the step. The confidence head of 2026-11-19/20 (its own section, below) is
+that work.
 
 `bench/nll_texts.py` scores held-out text (58 spans of 199 tokens, windows only: it asks for input logprobs) and
 pairs a boot against a reference boot token by token; stock is 0.9828.
+
+## Packed block scales and the forked GEMM (2026-11-19; the launcher's default, `SCALE_PACK=` turns it off)
+
+A rank holds 191 MB of e4m3 block scales for every NVFP4 expert layer (7.6 GB for the 40 layers; a boot's log
+prints them in units of 2^20 bytes, 182.2 and 7,290.0), one byte for 16 weights, and they carry about 4 bits each.
+`patches/scale_pack.py` keeps them packed in the 128x4 tile layout the kernels read: one base byte and 32 four-bit
+offsets for a group of 32 scales, and the 2.4-3.6% of groups whose bytes span more than 15 stored raw (56.0% of the
+bytes; every layer is expanded once at the load and compared with the checkpoint's bytes). The idea of keeping the
+scales resident in a compressed layout is from NVIDIA's hyperflare-inference
+(github.com/NVIDIA/hyperflare-inference, Apache-2.0; no code taken); the format, the decode routine and the code are
+this recipe's.
+
+Expanding the routed experts' scales into a scratch tensor before each GEMM (the fallback path of `scale_pack.py`)
+costs memory traffic: +7.5% a decode step on this fleet, measured on that path and on no other project's code. So the
+GEMM reads the packed form itself.
+`kernels/csf_gemm/build_csf_gemm.py` derives a fork of CUTLASS's `sm120_blockscaled_mma_array_tma.hpp` and of
+FlashInfer's grouped NVFP4 wrapper from the image's own sources (exact text replacements: a changed upstream line
+fails the build) and compiles `patches/spark_csf_gemm_sm120.so` (about 40 s, no GPU, several GB of memory: never
+beside the serving fleet). In the stock kernel TMA copies a CTA's scale tile (128 rows x 16 scales = 2,048 bytes a
+k tile) into a shared-memory stage; in the fork the producer warp writes that stage instead, each lane expanding two
+groups from global memory (one 16-byte vector load of a group's codes and one byte, both groups' loads issued before
+any arithmetic: a load stalls the warp, and with scalar loads the kernel was 5% slower), then lane 0 issues the TMA
+loads of A, B and the activation scales with the stage's byte count reduced by the scale tile. Consumers are
+untouched. swap_ab layout only (every decode call and every prefill below 16,384 routed rows); the other layout
+expands. At the load `scale_pack` runs the fork on the layer's real weights with packed and with plain scales and
+uses it only if the bytes are equal (it logs `nothing is expanded` or `NOT used`).
+
+The module is built once per image, on rank 0, in the image the fleet runs and with nothing serving on that node:
+
+    mkdir -p "$HOME/inkling2-csf-build"
+    docker run --rm --network none --memory 16g --cpus 8 \
+      -v "$PWD/kernels/csf_gemm":/k:ro -v "$HOME/inkling2-csf-build":/out \
+      --entrypoint /opt/sglang/bin/python3 lmsysorg/sglang:dev-inkling-2-small /k/build_csf_gemm.py /out
+    cp "$HOME/inkling2-csf-build/spark_csf_gemm_sm120.so" patches/
+
+The script's one argument is an output directory: it writes the derived sources under `gen/`, the compiler's work
+files under `ws/` and `spark_csf_gemm_sm120.so` beside them (`--no-compile` stops after the sources). The launcher
+copies `patches/spark_csf_gemm_sm120.so` to every node with the hooks and names it in `SPARK_CSF_GEMM`. The module
+is not in the repository (`patches/*.so` is git-ignored): it belongs to the image it was built from, so build it
+again when the image changes. On 2026-11-19 a compile of it on a node that was serving left that node too little
+memory and took the fleet down: stop the fleet first.
+
+What a boot logs, on every rank: `[scale_pack] forked GEMM on w13_scale: packed scales give the stock bytes: the
+kernel reads them, nothing is expanded`, the same for `w2_scale`, and `[scale_pack] 40 expert layers: block scales
+... packed to ... (56.0%), every expert checked against the checkpoint's bytes`. `NOT used (<why>)` in the first two
+means the module loaded and failed its check on that rank. A rank that does not find the file logs neither of the
+two. In both cases the scales are expanded before each GEMM, with the same results and the 7.5% slower step. A file
+that is there and cannot be loaded (a module built for another image, say) is not caught: by the code it stops the
+boot. That case was not observed.
+
+Measured (2026-11-19, the GPUs of all four nodes capped at 2,176 MHz): `bench/csf_gemm_test.py` (one GPU, fleet
+stopped): same bytes as the stock kernel for both projections, BF16 and FP16 output, 485 against 507 us a call (w13)
+and 289 against 303 (w2). Fleet, one boot against the plain boot of that morning, 16 coding questions of 400 tokens:
+same text on 16 of 16 one-stream prompts, NLL identical token for token (10,547 tokens), one stream 56.55 against
+56.06 ms a step (+1.0%, se 0.5% by the tool's fit), four and eight streams 30.6 and 19.9 against 27.7 and 19.6
+tok/s a stream (x1.07 and x1.01 request by request; two runs of one boot differ by up to 7% at these widths),
+3.0-3.4 GB more MemAvailable a node (the pool is not raised: it is margin). A cold prefill of 49,843 tokens ran at
+2,770 tok/s against 2,719 on the plain boot, once each, on the fork's first build (the one with scalar loads); the
+build that ships was not timed on that prompt.
+
+The one-stream difference is the packing's cost and not noise. The 16 prompts took the same number of steps on both
+boots, and prompt by prompt the packed boot is 0.59 ms a step slower (se 0.09, slower on 16 of 16). The two serving
+boots of 2026-11-20, which carry the packing, ran 56.69 and 56.55 ms on the same prompts: 0.68 and 0.47 ms slower
+than that plain boot (se 0.19 and 0.02). Another plain boot of that morning had been within 0.04 ms of it (se 0.06;
+that one ran before the rank-0 GPU was capped). So the packing costs about 0.5 to 0.7 ms a step, 1%, for one stream.
+At four and eight streams none was seen, on the one boot measured there, where two runs differ by more than 1%.
+
+`bench/scale_pack_test.py` checks the packing on real checkpoint scales and on edge cases without a GPU;
+`bench/csf_gemm_test.py` needs one GPU and the fleet stopped.
+
+## A confidence head for the gate (2026-11-19/20; the launcher's default since 2026-11-20 11:47 UTC, `GATE_HEAD=` turns it off)
+
+The gate (`GATE=0.4`, under Decode levers) verifies K of a request's 8 rows and takes K from the probability the
+draft gave its own tokens. That number predicts poorly what the target accepts (log loss 0.503 on the capture
+below), and the sampled-decode window had found the room there: in how well the draft's confidence predicts the
+target. A small trained head predicts it better. For each drafted position j it gives the probability p_j that the
+target takes draft j given that it took the drafts before it, and the gate's row count becomes
+
+    K = 1 + the number of leading positions j with p_1 x ... x p_j >= thr_j
+
+where thr_j is the measured step time of one more verify row times a rate tuned on held-out requests (the "leading
+rows" rule). The head that ships is a 256-unit MLP (`patches/gate-head-mlp-reg.pt`, 4.7 MB, sha256
+`0bc7b3d52da6c1bd...`). Position j reads the draft's final hidden state of that position (4,608 numbers, from one
+forward over mask embeddings: no drafted token reaches it) and 24 numbers of the draft's own step distributions:
+the log probability of the drafted tokens up to j, the two largest log probabilities and the entropy up to j + 1,
+the drafted token's probability at the request's temperature, the temperature, the greedy flag and the position.
+
+**Exactness.** The head never reads draft j + 1 or a later draft, the target's logits or the coins of the accept,
+and K is a stopping rule over j. Those are the conditions under which a gate leaves sampled decoding exact, by the
+argument that holds for the gate's own rule: at the capped row the engine emits the token of the uncapped rejection
+chain (the draft if it was accepted, else the residual sample), never a fresh sample. A second reading of the
+engine's accept code on 2026-11-20 (automated reviewers, not a second person) confirmed that and noted that no test
+pins it: a kernel that resampled at the capped row would bias sampled output under any gate. Greedy requests are
+exact under any rule, since a verified token is the target's argmax whatever the row count; their text can still
+move at near-ties with the shape of the batch, as it does without a gate.
+
+**In the engine** (`patches/spark_gate_head.py`, `SPARK_GATE_HEAD=<file>`; `patches/spark_gate.py` takes its row
+counts from it). The head runs in the tail of the draft's CUDA graph, right after the draft wrote its step logits
+and tokens, and K lands in a buffer the gate only copies. The ranks must verify the same rows, and they do not
+rely on computing the same bits:
+
+- at arming every rank runs the head on one seeded input and the ranks vote: the file, the vocabulary width read
+  and the bits of that result must be equal on all of them, or no rank arms and the gate keeps its own rule
+  everywhere;
+- every step the ranks exchange their K through one small all-reduce and all of them use rank 0's; a counter adds
+  the request-steps on which a rank's K was not rank 0's, and the gate's log line prints it (`ranks differ=0`).
+
+The head refuses to arm, and logs why, on anything it was not built for (a missing or unreadable file, another
+hidden size or vocabulary, a greedy-only draft, vocabulary-sharded step logits). After the vote there is no
+fallback: an error in the tail stops the boot. A boot with the head logs on every rank
+
+    [gate head] armed on 4 rank(s): /patches/gate-head-mlp-reg.pt (sha 0bc7b3d52da6c1bd, mlp-reg), hidden 4608, vocabulary 201024 (200058 read), thresholds [0.4302, 0.309, 0.3132, 0.2208, 0.2172, 0.2328, 0.2334], self-test 7d92deca3985c582, K exchanged every step: True
+    [gate] row counts from the confidence head
+
+and then `[gate] steps=... mean K=... hash=... ranks differ=0` every 1,024 steps. `NOT armed: <why>` in the first
+line means the gate runs its own rule.
+
+**The capture** (2026-11-19 21:19 to 2026-11-20 00:06 UTC). `patches/conf_capture.py` (`SPARK_CONF_CAPTURE=<dir>`,
+capture windows only) records, on the one rank that has the directory, every decode step of the requests whose id
+starts with a given prefix: the draft's hidden state of the 7 drafted positions, nine numbers a position from the
+draft's and the target's distributions, and the step's outcome. Requests of other clients are never recorded. The
+load (`bench/conf_capture_run.py`) was 2,316 requests in 155 minutes, all finished, 334,158 completion tokens: 650
+general questions, 500 coding tasks, 330 agent turns with tool definitions, 500 tasks on a source file of 1-8K
+tokens, 336 questions on 14 shared contexts of 15-104K tokens; 1,377 without a temperature, 702 greedy, 237 at
+temperature 0.7. It gave 93,958 request-steps (657,706 drafted positions, 6.1 GB of hidden states). Every request
+ran with all 8 rows verified, so each position has its label: for a greedy request whether the draft was the
+target's argmax, for a sampled one the acceptance probability min(1, p/q) itself, without the coin. A first capture
+an hour earlier had been stopped by a temperature guard after 141 requests (6,068 request-steps); a small head
+trained on it alone already simulated at x1.035, so more data made the estimate firm and did not raise it.
+
+A chat or messages request without a `temperature` is sampled at 1.0 on this server: that is the engine's default
+for those two endpoints (0.7 is its default for the Responses API), and the recorder wrote 1.0 for every such
+request. Where older paragraphs of these notes say 0.7 for chat requests, they were wrong.
+
+Checks on the capture (`bench/conf_capture_check.py`, `bench/conf_capture_rank_check.py`): a greedy request's
+accepted drafts are the leading run of target-argmax drafts in 27,525 of 27,525 rows; for sampled requests the
+share of steps that accept at least j drafts is within one standard error of what the recorded p/q predict, at
+every position; a recorded hidden row puts its own drafted token in the top 1% of the vocabulary for 96.1-97.5% of
+positions and another request's token for 36%. `bench/conf_capture_align_check.py` reports FAILED on this capture
+only because its margin (+0.2 between a row's own token and its neighbours') is too strict for a block draft, whose
+neighbouring positions score 90-95%: read the rank check. 1,680 rows (1.8%) were steps the scheduler ran after a
+request's end and are left out.
+
+**Training** (2026-11-20, CPU only, the fleet serving). 5-fold cross-validation over requests, shared long contexts
+and identical prompts kept in one fold: 92,278 held-out request-steps. The gain is simulated for one stream: the
+tokens a step and the step time of the rows a rule would have verified, with step times measured on the fleet at
+1, 2, 4, 6 and 8 verify rows (3, 5 and 7 interpolated), against the gate's own rule on the same steps (57.75
+tok/s). "Whole families held out": each of the five prompt families (agent, coding, file, general, long) is judged
+by heads that never trained on it. Intervals resample whole shared contexts and sets of identical prompts.
+
+| head | log loss | gain, requests held out | gain, whole families held out |
+|---|---|---|---|
+| the gate's own rule (token probability) | 0.503 | x1.000 | |
+| logistic regression on the gate's own numbers, no hidden state (under-trained, a lower bound) | 0.3879 | x1.0124 (1.0113-1.0136) | x1.0059 (1.0047-1.0071) |
+| 256-unit MLP on 256 principal directions of the hidden state and those numbers | 0.3421 | x1.0402 (1.0385-1.0418) | x1.0312 (1.0297-1.0326) |
+| **the same MLP with a better training recipe: the configuration of the head that ships** | 0.3379 | x1.0426 (1.0409-1.0444) | x1.0341 (1.0327-1.0355) |
+| a two-stream model over all 7 positions, the same recipe | 0.3314 | x1.0446 (1.0427-1.0467) | x1.0353 (1.0338-1.0370) |
+| ceiling: the true outcomes as predictions | | x1.1466 | x1.1457 |
+
+- The recipe is full shuffling of the training rows, input dropout 0.5 on the hidden-state directions, 24 epochs
+  instead of 8, target-side numbers as extra training targets (never inputs) and a uniform extra loss weight on all
+  7 positions: `exp_combo.py --cfg 'mlp-reg:idrop=0.5,ep=24,lam=0.3,aux=p4+a6+p5,auxw=0.3,drop=0.1'`. By sampling
+  class that configuration gains x1.051 without a temperature, x1.040 at temperature 0.7 and x1.030 greedy.
+- The two-stream model's edge over it is 0.16-0.19 point, for 54 tensor operations a step where the MLP has 4
+  (`bench/cc_count_ops.py`). That edge was not expected to survive the model's own run time at one stream, so the
+  MLP was wired in.
+- The gate is limited by information, not by training or by the rule: with the true outcomes as predictions the
+  rule reaches x1.1463 of the x1.1466 ceiling, and more data did not help (12.5 / 25 / 50 / 100% of the training
+  requests give x1.0330 / 1.0373 / 1.0399 / 1.0406 in a quick run on two folds). Most of the remaining 10 points
+  need the target's verdict, which a gate cannot read.
+- The drafted token as an input helps only on traffic like the capture's and costs a little elsewhere: left out.
+- Agent turns are the exception among the families: the recipe adds nothing there, and a head that also reads the
+  other positions adds 0.4-0.7 point. That family is narrow (330 requests from 14 templates and one tool set), and
+  such a head is the next one to test for an agent workload.
+
+**The test boot** (2026-11-20, 10:18 to 11:06 UTC): the serving defaults, the head, and request-id overrides so
+that the same prompts ran back to back under the gate's own rule, under the head and with all 8 rows; step times of
+the plain serving boot were taken before and after. It works as built:
+
+- the head armed on all four ranks from one file, and the seeded self-test gave the same bits on every rank;
+- the engine's rows are the trained head's: on 1,874 recorded request-steps (greedy, temperature 1.0 and 0.7, alone
+  and four at a time) K from the draft graph equals K recomputed on a CPU from the recorded hidden states in every
+  one (`bench/gate_head_capture_check.py`);
+- the ranks agree: over 27,552 steps (37,635 request-steps) no rank computed another K than rank 0;
+- greedy text does not depend on the rule: 16 of 16 outputs of 400 tokens are identical under the head, under the
+  gate's own rule and with all 8 rows, alone. Four at a time, greedy outputs leave the 8-row reference at near-ties
+  under either rule (the gate's own rule 0 of 16 identical, the head 1 of 16): the known effect of batching;
+- `bench/concurrency_check.py` passed; no traceback and no `[stall]` report in a rank's log.
+
+The head against the gate's own rule inside that boot (`bench/gate_run.py --head`, `bench/gate_ab_report.py`; the
+first 16 prompts of `bench/trace_run.py`, 8 coding and 8 general questions; 400 tokens a request, tok/s per stream;
+the two arms of a pair ran back to back on the same prompt):
+
+| phase | units | gate's own rule | head | ratio per prompt or batch (bootstrap interval) | over all tokens | tokens a step | ms a step |
+|---|---|---|---|---|---|---|---|
+| greedy, alone | 16 prompts | 54.10 | 55.34 | x1.025 (1.013-1.040) | x1.023 | x0.970 | x0.948 |
+| temperature 1.0, alone | 16 prompts | 49.12 | 51.60 | x1.057 (1.013-1.098) | x1.050 | x1.081 | x1.029 |
+| greedy, four at a time | 4 batches | 25.45 | 26.80 | x1.040 (0.994-1.086) | x1.053 | x1.005 | x0.955 |
+| temperature 1.0, four at a time | 3 batches | 24.22 | 25.45 | x1.021 (1.010-1.033) | x1.051 | x1.071 | x1.020 |
+
+The interval is a percentile bootstrap over the prompts or the batches. With 4 and 3 batches it is little more than
+the range of the batch ratios (0.973 to 1.100, and 1.010 to 1.033) and is not a 95% interval: a t interval is 0.95
+to 1.13 for the greedy batches and 0.99 to 1.05 for the sampled ones. The two four-at-a-time rows show a direction,
+not a size.
+
+In that boot both arms replay the head's tail in the draft graph and only the gate's own rule also runs its eager
+computation, so these ratios are the head's choice of rows plus the eager rule it replaces (0.28 ms), not net of
+the tail's own cost. The simulation had said x1.030 for greedy requests and x1.051 for requests without a
+temperature: the measurement agrees. Across boots (greedy, alone, 16 coding prompts of 400 tokens,
+`bench/step_time.py`; the same text in all four runs):
+
+| boot and rule | ms a step | tokens a step | tok/s | at equal accept, against the two plain boots |
+|---|---|---|---|---|
+| plain serving boot, before | 56.69 | 3.42 | 60.41 | |
+| plain serving boot, after | 56.55 | 3.42 | 60.81 | (-0.21 ms, se 0.36, against the one before) |
+| test boot, the gate's own rule | 58.08 | 3.42 | 59.97 | +0.75 ms a step (se 0.32) = +1.3% |
+| test boot, the head | 56.05 | 3.42 | 61.64 | -0.89 ms a step (se 0.33) = -1.5% |
+
+The plain serving boots of this table carry the packed block scales (the default since the day before). The plain
+boot of the packing section (56.06 ms a step, 61.31 tok/s) carries neither of the two. The ms, tokens and tok/s
+columns are medians over the 16 prompts.
+
+- The head's tail costs about 0.75 ms a step at one stream (the gate's own rule in the test boot against the plain
+  boots; a little of it is the test boot's own switches). Most of it is eight passes with torch kernels over a
+  request's 7 x 200,058 step logits, for the two largest log probabilities, the entropy and the tempered
+  probability. One fused kernel would read them once; it is not built.
+- Net over the plain serving boots, greedy, one stream: x1.017 (61.64 against 60.61 tok/s, the mean of the two).
+- Net for the other phases was not measured across boots. Taking the tail's 1.3% off the ratio inside the boot
+  gives about x1.036 at temperature 1.0 alone: an estimate, not a measurement. Four at a time there is none: the
+  tail's cost at four streams was not measured, and those ratios show a direction only.
+- The serving boot after the deployment (healthy 11:47 UTC; the same 16 coding prompts): 56.09 ms a step, 3.42
+  tokens a step, 61.79 tok/s, the same text on 16 of 16; at equal accept -0.72 ms a step (se 0.30) = -1.2% against
+  the two plain boots. By the median tok/s, the measure of the figure above, that boot is x1.019 net (61.79 against
+  60.61), a second boot for it. Over all tokens the two boots are x1.015 and x1.012.
+  `bench/concurrency_check.py` passed on it, and the four ranks printed equal row-count lines over 3,072 steps with
+  `ranks differ=0`.
+- For scale: two boots of one configuration have differed by up to about 0.5 ms a step (0.9%). The net gain at
+  equal accept (0.9 and 0.7 ms a step) is one and a half to two times that, seen on two boots.
+- Against the stack before both of the newest defaults: the two plain boots of 2026-11-19, without the packing and
+  without the head, ran the same prompts at 56.06 and 56.12 ms a step and 61.31 and 60.95 tok/s, with the same text
+  on 16 of 16. The serving boot with both runs 56.09 ms and 61.79 tok/s. For one greedy stream the head gives back
+  what the packing costs, and the two together come out x1.008 and x1.014 by the median tok/s (x1.002 over all
+  tokens): about level.
+
+What this does not show:
+
+- Short prompts only, 24 in all, 400 tokens each: 16 coding questions (the step times across boots) and a mixed
+  set of 16 for the comparison inside the boot, 8 general questions and 8 of those coding questions. No agent turns
+  with tools and no long contexts ran on the test boot; for them there is the simulation on the capture and nothing
+  else.
+- Temperature 0.7 was only in the recorded check (4 prompts a phase, the recorder running): x0.97 per prompt (the
+  four prompts ran x0.88 to x1.03), x0.96 over all tokens. Not measured. The other phases of that check: x1.02
+  greedy and x1.05 at temperature 1.0 alone (four prompts each, x0.94 to x1.19 and x0.81 to x1.24), and x0.91 for
+  its one greedy batch of four.
+- Four at a time: 4 and 3 batches (the last phase was cut when the rank-0 node reached 95 C), too few for an
+  interval (see the note under the table). The thresholds come from one-stream step times and were used unchanged;
+  79% of the captured steps ran four requests at a time, where an extra row costs less.
+- The head is the training harness's fold-1 model, fit on three fifths of the capture, not a head fit on all rows.
+  The capture is one load of templated prompts with mostly truncated outputs (77% of the requests hit their token
+  limit, 89% of the completion tokens were reasoning).
+- The step times behind the thresholds were measured on the capture boot with the rank-0 GPU capped at 1,958 MHz
+  (2,176 on the test boot).
+- About 45 minutes of serving on the test boot. As the default it serves since 2026-11-20 11:47 UTC: about two
+  hours when this was written.
+
+**How the head was made, file by file.** The recorder is `patches/conf_capture.py`; its load generator
+`bench/conf_capture_run.py` (paced by the node's temperature; `--corpus` wants a directory of source files for its
+file tasks); the checks of a capture `bench/conf_capture_check.py`, `conf_capture_rank_check.py` and
+`conf_capture_align_check.py`; `conf_capture_test.py` runs the recorder on a CPU. The first trainer, on the raw
+capture, is `bench/conf_head_train.py` (`conf_head_selftest.py` is its self-test). The harness of the training
+program: `bench/cc_build_features.py` (a compact feature set from a capture: 256 principal directions of the hidden
+state), `bench/cc_lab.py` (folds, gate rules, the simulation), `bench/exp_base.py` (baselines), `bench/exp_combo.py`
+(every head of the table is one `--cfg` line), `bench/cc_count_ops.py` (operations a step) and `bench/cc-run.sh`
+(one capped CPU container a node: 3 GB, 6 CPUs, refused under 7 GB of available memory). Export and checks:
+`bench/cc_export_head.py` (trains the configuration with `exp_combo.py`, folds the projection and the
+standardisations into the first layer, writes the head file and compares the engine's functions with the trainer's
+predictions), `bench/gate_head_test.py` (CPU checks of the engine code), `bench/gate_head_capture_check.py` (a test
+boot's recorded rows against a CPU recomputation). The A/B is `bench/gate_run.py --head` with
+`bench/gate_ab_report.py`.
+
+The head that ships is fold 1 of the configuration above, exported with `cc_export_head.py --name mlp-reg`. Its
+`meta` entry names the configuration, the rate (60 tok/s), the thresholds and the sha256 of the `exp_combo.py` and
+`cc_lab.py` that trained it; they are the files in `bench/`. The harness scripts expect to sit in one directory
+with `spark_gate_head.py`, `spark_gate.py` and `conf_capture.py` (the container's `/c`), with a feature set in `/d`
+and an output directory in `/o`: `cc-run.sh` mounts them that way. Not in the repository: the capture (6.1 GB of
+hidden states), the feature sets, the scratch scripts of the experiment lanes that `exp_combo.py`'s docstring names,
+`spark_gate_before.py`, which `gate_head_test.py` compares the gate against (it is `patches/spark_gate.py` as it
+was before the head: in a clone of the GitHub repository,
+`git show 3d7e798:recipes/inkling-2-small/sglang/patches/spark_gate.py > spark_gate_before.py` makes it), and the
+author's lab record, which the docstring of `bench/cc_lab.py` cites as
+`research/2026-11-19-confidence-head/RESULTS.md`: this section is its public form.
 
 ## Long contexts and multi-turn history (2026-11-14)
 
@@ -529,7 +893,7 @@ provider): 29 of 200 lookups at 130K ran out of tokens (4 to 8 of 40 a run, reci
 empty answers in about equal parts) against 4 of 40 here, none of 80 at 60K against none here, and no wrong answer
 anywhere. Which questions fail differs from provider to provider and between two runs on one provider (Modal: 7,
 then 5, four of them shared), as it does between two boots here. Reasoning effort was left unset on both sides; the
-answers that came were as long as ours (median 400 to 500 output tokens against 464).
+answers that came were as long as this fleet's (median 400 to 500 output tokens against 464).
 
 ## KV cache: what a token costs and what grows the pool (2026-11-15/16)
 

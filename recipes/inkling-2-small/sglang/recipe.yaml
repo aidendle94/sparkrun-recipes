@@ -3,11 +3,11 @@ model: thinkingmachines/Inkling-2-Small          # the official NVFP4 checkpoint
 engine: sglang
 engine_base: lmsysorg/sglang@sha256:424c1da97f6d6eef1612006c77b2ca791657a8184c1fbdbc682ebf9485d3b32c   # the dev-inkling-2-small tag as of 2026-11-12
 image: lmsysorg/sglang:dev-inkling-2-small       # unmodified; the hooks in patches/ are mounted and put on PYTHONPATH
-image_with_hooks: aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.0   # the same pinned base + patches/ (Dockerfile); file and import check only, no fleet boot yet
-status: experimental          # production | validated | experimental | archived  (four days old, dev image, open problems: see README)
+image_with_hooks: aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.0   # the same pinned base + patches/ as of 2026-11-17 (Dockerfile): built before scale_pack, the stall recorder and the confidence head, so its own /patches are older than this tree (the launcher mounts the current patches/ over them); file and import check only, no fleet boot yet
+status: experimental          # production | validated | experimental | archived  (eight days old, dev image, open problems: see README)
 nodes: 4 x NVIDIA DGX Spark (GB10, 128 GB), switched RoCE fabric, TP4/EP4
 context_length: 524288        # launcher default since 2026-11-17 (262144 before)
-measured: 2026-11-16          # single boots on one fleet, 2026-11-13 to 2026-11-16
+measured: 2026-11-20          # single boots on one fleet, 2026-11-13 to 2026-11-20; everything but scale_pack and confidence_head below by 2026-11-16, without those two
 max_running_requests: 8
 numbers:
   decode_tok_s: {code_greedy: 61, code_t07: 56.6}            # one stream, 400-token coding answers
@@ -19,6 +19,8 @@ numbers:
   kv_pool_tokens: {auto: [493000, 805000], capped_600k: [545000, 600000], grown_fp8_draft: 793000}   # 793000 is the launcher's default cap since 2026-11-17; auto = sized at each boot from rank 0's free memory, no cap
   toolcall_suite: {cases: 283, ok: 250, soft: 20, fail: 13, agent_loops: "12/12"}
   boot_to_healthy_s: {warm: 300, cold: 1020}
-features: [tools, thinking, reasoning_effort, dspark, confidence_gate, fp8_kv, fp8_draft_kv, sharded_experts, prefill_glue, rdma_collectives, reasoning_cache, served_aliases, prometheus_metrics]
+  scale_pack: {mem_available_gain_gb_per_node: [3.0, 3.4], step_ms_c1: {packed: 56.55, plain: 56.06}, scale_bytes_kept: 0.56}   # SCALE_PACK, the launcher's default since 2026-11-19: exact (same text on 16 of 16 prompts, NLL identical token for token); one stream's step is about 1% longer (+1.0%, se 0.5%, on its test boot; 0.5 to 0.7 ms on three boots); needs the module built by kernels/csf_gemm/build_csf_gemm.py; the pool is not raised
+  confidence_head: {net_greedy_c1: 1.017, decode_tok_s_greedy_c1: 61.64, serving_boot_tok_s_greedy_c1: 61.79, head_vs_gate_rule_same_boot_not_net: {greedy_c1: 1.023, t10_c1: 1.050}, tail_ms_per_step: 0.75}   # GATE_HEAD, the launcher's default since 2026-11-20. net = one greedy stream on the test boot against the two plain boots of that day (60.41 and 60.81 tok/s), 16 coding questions of 400 tokens; the serving boot after the deployment ran the same questions (x1.019); both ratios are medians over the questions against the mean of the two plain boots, which carry scale_pack (the boots of 2026-11-19 with neither ran 60.95 and 61.31). head_vs_gate_rule_same_boot_not_net = tok/s ratios over all tokens of a mixed set of 16 short prompts inside the test boot, both arms carrying the head's cost (its tail in the draft graph, about 0.75 ms a step, se 0.32); four streams ran 4 and 3 batches, too few to quote; agent turns, long contexts and temperature 0.7 not measured
+features: [tools, thinking, reasoning_effort, dspark, confidence_gate, confidence_head, fp8_kv, fp8_draft_kv, sharded_experts, packed_block_scales, prefill_glue, rdma_collectives, stall_recorder, reasoning_cache, served_aliases, prometheus_metrics]
 blog: https://aidenle.com/recipes/inkling-2-small-sglang-4x-dgx-spark
 license: MIT

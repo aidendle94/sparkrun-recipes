@@ -4,8 +4,8 @@ Copyright (c) 2026 Aiden Le. Licensed under the MIT License (LICENSE at the top 
 This recipe runs an unmodified SGLang image, lmsysorg/sglang:dev-inkling-2-small, and adds Python hooks that are
 mounted into the container and imported at interpreter start (patches/). The hooks, the launcher, the watchdog, the
 benches and the documentation were written for this recipe; the third-party material below is adapted under its own
-licence. Apart from the three short functions named under patches/stable_kernels.py, nothing third-party is
-redistributed.
+licence. Apart from the three short functions named under patches/stable_kernels.py and the excerpts named under
+kernels/csf_gemm/build_csf_gemm.py, nothing third-party is redistributed.
 
 Adapted third-party code (modified for this recipe; the original notices apply to those parts):
   - patches/roce_collectives.py: a port to SGLang's GroupCoordinator of the vLLM adapter b12x_roce_all_reduce.py by
@@ -19,8 +19,9 @@ Adapted third-party code (modified for this recipe; the original notices apply t
     blocks split, the far blocks compiled without the bias state). patches/fused_epilogue.py, fused_stream.py and
     fused_relbias.py are Triton kernels written for this recipe that reproduce, operation for operation, SGLang's
     short-convolution, residual-add, attn_res, RMSNorm and bias-shear kernels. The hooks in patches/sitecustomize.py,
-    fi_moe.py, fi_mxfp8.py, prefill_glue.py, fp8_kv.py, dense_p12.py, dense_i8.py, tp_shard.py, spark_gate.py and
-    sampled_lab.py wrap or replace functions of SGLang's Inkling model code and call its and FlashInfer's kernels.
+    fi_moe.py, fi_mxfp8.py, prefill_glue.py, fp8_kv.py, dense_p12.py, dense_i8.py, tp_shard.py, scale_pack.py,
+    spark_gate.py, spark_gate_head.py, conf_capture.py and sampled_lab.py wrap or replace functions of SGLang's
+    Inkling model and speculative-decoding code and call its and FlashInfer's kernels.
     Copyright SGLang Team / FlashInfer contributors. Apache License 2.0.
   - patches/stable_kernels.py: modified copies of three short Triton functions of SGLang
     (sglang/kernels/ops/inkling2/attention.py: _tau_kernel, _gate_sink_kernel, _sigmoid), with the batch's row count
@@ -28,12 +29,44 @@ Adapted third-party code (modified for this recipe; the original notices apply t
     Team. Apache License 2.0 (https://www.apache.org/licenses/LICENSE-2.0).
   - launch/relaunch-inkling2.sh and launch/watchdog-inkling2.sh: adapted from this repository's DeepSeek-V4.1 recipe
     (launch/relaunch.sh, launch/watchdog.sh; same author, MIT).
+  - kernels/csf_gemm/build_csf_gemm.py: builds, on the user's machine and from the sources inside the image, a
+    grouped NVFP4 GEMM derived from two files: CUTLASS's
+    include/cutlass/gemm/collective/sm120_blockscaled_mma_array_tma.hpp (Copyright (c) 2025 - 2026 NVIDIA CORPORATION
+    & AFFILIATES, BSD 3-Clause License) and FlashInfer's include/flashinfer/gemm/group_gemm_nvfp4_groupwise_sm120.cuh
+    (Copyright (c) 2026 by FlashInfer team, Apache License 2.0). Both are changed by exact text replacement at build
+    time; neither file is in this repository, and neither is the module built from them. What the script itself
+    carries of them, in modified form: the lines it searches for (short excerpts of both files, the anchors of its
+    replacements); a rearranged copy of the producer loop of the CUTLASS header's load() (CSF_LOOP: the stock loop's
+    acquire, barrier and TMA copy statements around the new decode call, without the TMA copy of the weights' scale
+    factors); and a binding source (SOURCE) written after FlashInfer's csrc/group_gemm_nvfp4_groupwise_sm120.cu and
+    its instantiation template. The decode routine (DECODE) and the packed format (patches/scale_pack.py) were
+    written for this recipe. The module a user builds is a derived work of both projects and links the CUDA
+    runtime: their terms apply to whoever passes it on.
+    FlashInfer's distribution carries a NOTICE file. Its attribution notices, which apply to the excerpts above:
+    "FlashInfer / Copyright 2025-2026 NVIDIA / Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)".
+    The other entries of that file name components (the KDA kernels and others) of which this recipe carries nothing.
+
+Trained for this recipe: patches/gate-head-mlp-reg.pt, a 256-unit confidence head for the speculative-decoding gate
+(docs/results.md). It was fit by the author on hidden states and step distributions that the draft bundled with
+thinkingmachines/Inkling-2-Small produced on the author's fleet for a generated load (bench/conf_capture_run.py; no
+request of another client was recorded). The file holds the head's own parameters, with a projection fitted on
+those hidden states folded in; it holds no weight of the model.
+
+bench/exp_combo.py carries no licence line of its own: the head file records the sha256 of the script that trained
+it, so its bytes are left as they were. It is under the same MIT terms as the rest of this recipe.
 
 Method references (no code taken): block verification follows Sun et al., "Block Verification Accelerates
-Speculative Decoding", arXiv 2403.10444 (bench/bv_exact.py checks it under this recipe's gate).
+Speculative Decoding", arXiv 2403.10444 (bench/bv_exact.py checks it under this recipe's gate). The packed block
+scales (patches/scale_pack.py) take the idea of keeping compressed scale factors resident from the compressed scale
+layout of NVIDIA's hyperflare-inference (github.com/NVIDIA/hyperflare-inference, Apache License 2.0); the format, the
+Triton expansion kernel, the decode routine and the code are this recipe's, and the forked GEMM is the derived work
+described above.
 
-Not part of this repository: SGLang (Apache-2.0), FlashInfer (Apache-2.0), PyTorch (BSD-3-Clause), Triton (MIT),
-NVIDIA CUDA components (NVIDIA EULA). They come from the image, which is used unmodified under its own licences.
-The model weights (thinkingmachines/Inkling-2-Small) are not included anywhere and come under their own terms.
+Not part of this repository: SGLang (Apache-2.0), FlashInfer (Apache-2.0), CUTLASS (BSD-3-Clause, bundled with
+FlashInfer), PyTorch (BSD-3-Clause), Triton (MIT), NVIDIA CUDA components (NVIDIA EULA). They come from the image,
+which is used unmodified under its own licences.
+The model weights (thinkingmachines/Inkling-2-Small; Apache License 2.0 by its model card) are not included
+anywhere and come under their own terms.
 
-The Apache License 2.0 text is in licenses/Apache-2.0.txt at the top of this repository.
+The Apache License 2.0 text is in licenses/Apache-2.0.txt and the CUTLASS notice with the BSD 3-Clause License in
+licenses/BSD-3-Clause-CUTLASS.txt, both at the top of this repository.

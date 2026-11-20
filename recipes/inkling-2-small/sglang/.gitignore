@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 launch/fleet.env
+patches/*.so
 logs/
 bench/logs/
 *.log

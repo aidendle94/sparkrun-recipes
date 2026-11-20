@@ -7,8 +7,14 @@
 # every switch of the README still turns off by setting its launcher variable empty.
 # Build on a Spark (arm64), from this directory:
 #   docker build --build-context repo=../../.. -t sglang-inkling2-spark:local .
-# The published tag aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.0 is this file built on the pinned base.
-# launch/launch-inkling2.sh runs either image: it mounts its own copy of patches/ over /patches.
+# The published tag aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.0 is this file built on the pinned base
+# from the tree of 2026-11-17. That was before the packed block scales (patches/scale_pack.py), the stall recorder
+# and the confidence head (patches/spark_gate_head.py, patches/gate-head-mlp-reg.pt): the tag's own /patches are the
+# hooks of that day, and it has not been rebuilt. A build of today's tree copies today's patches/, the head file
+# included. The forked GEMM's module (patches/spark_csf_gemm_sm120.so) is never copied: it is built per image by
+# kernels/csf_gemm/build_csf_gemm.py and .dockerignore leaves it out. kernels/ is not copied either.
+# launch/launch-inkling2.sh runs either image: it mounts its own copy of patches/ over /patches, so under the
+# launcher the published tag runs today's hooks all the same.
 ARG BASE=lmsysorg/sglang@sha256:424c1da97f6d6eef1612006c77b2ca791657a8184c1fbdbc682ebf9485d3b32c
 FROM ${BASE}
 ARG REVISION=unknown

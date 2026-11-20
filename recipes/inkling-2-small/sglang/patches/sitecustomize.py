@@ -420,6 +420,9 @@ def moe_marlin(mod):
             if _TP_SHARD and getattr(self, "_spark_shard", None) is not None:
                 import tp_shard
                 self._spark_half = tp_shard.half_scales(self, fi_moe)  # None unless SPARK_TP_SHARD_HALF=1
+            if os.environ.get("SPARK_SCALE_PACK") == "1":
+                import scale_pack
+                self._spark_pack = scale_pack.adopt(self)  # the block scales packed (exact); expanded per call
 
         swizzle_nvfp4_scales.__wrapped__ = stock_swizzle
         cls.swizzle_nvfp4_scales = swizzle_nvfp4_scales
@@ -460,7 +463,7 @@ def moe_marlin(mod):
                 self.w13_outer_scale_denominator, self.w2_weight, self.w2_scale, self.w2_amax,
                 self.w2_outer_scale_denominator, (self.gate_cap, self.up_cap),
                 out_dtype=torch.bfloat16 if bf16 else torch.float32, shard=shard, exchange=exchange,
-                half=getattr(self, "_spark_half", None))
+                half=getattr(self, "_spark_half", None), pack=getattr(self, "_spark_pack", None))
             combined = mod.multicast_all_reduce(sums, group)
             if not combine:
                 return mod.RoutedOutput(combined, self._identity[: ids.shape[0]], 1)
@@ -664,6 +667,9 @@ _T = {"events": [], "depth": 0, "route": []}
 _TRACE = bool(os.environ.get("SPARK_TRACE"))
 # SPARK_GATE=<tau> (0 or unset = off): confidence-gated verify rows, patches/spark_gate.py.
 _GATE = float(os.environ.get("SPARK_GATE") or 0) > 0
+# SPARK_GATE_HEAD=<head file> (unset or empty = off; needs SPARK_GATE): the gate's row count from a learned confidence
+# head computed in the draft graph's tail, patches/spark_gate_head.py.
+_GATE_HEAD = _GATE and bool(os.environ.get("SPARK_GATE_HEAD"))
 # SPARK_DENSE_FQ=<bits> (0 or unset = off; quality windows only): fake-quantized dense weights, patches/dense_fq.py.
 _DENSE_FQ = int(os.environ.get("SPARK_DENSE_FQ") or 0) > 0
 # SPARK_DENSE_I8=<parts> (unset or empty = off): int8 dense weights on the decode path, patches/dense_i8.py.
@@ -681,6 +687,8 @@ _FI_MXFP8 = os.environ.get("SPARK_FI_MXFP8") == "1"
 _ROUTE_BALANCE = os.environ.get("SPARK_ROUTE_BALANCE") == "1"
 # SPARK_ACCEPT_STATS=1 (diagnosis windows only): expected accepted lengths of sampled steps, patches/accept_stats.py.
 _ACCEPT_STATS = os.environ.get("SPARK_ACCEPT_STATS") == "1"
+# SPARK_CONF_CAPTURE=<dir> (capture windows only): training data for a draft confidence head, patches/conf_capture.py.
+_CONF_CAPTURE = bool(os.environ.get("SPARK_CONF_CAPTURE"))
 # SPARK_SAMPLED_LAB=1 (diagnosis windows only; needs SPARK_GATE and SPARK_GATE_RID=1): a request id chooses the gate
 # rule and the draft temperature of its request, patches/sampled_lab.py.
 _SAMPLED_LAB = _GATE and os.environ.get("SPARK_SAMPLED_LAB") == "1" and os.environ.get("SPARK_GATE_RID") == "1"
@@ -806,6 +814,19 @@ if _GATE:
         spark_gate.install_model(mod)
 
 
+if _GATE_HEAD:  # after the gate's hooks: the head hands the gate its row counts
+    @_on_import("sglang.srt.speculative.dspark_components.dspark_draft_sampler")
+    def gate_head_sampler(mod):
+        import spark_gate
+        import spark_gate_head
+        spark_gate_head.install_sampler(mod, spark_gate)
+
+    @_on_import("sglang.srt.speculative.dspark_components.dspark_draft")
+    def gate_head_proposer(mod):
+        import spark_gate_head
+        spark_gate_head.install_proposer(mod)
+
+
 if _SAMPLED_LAB:  # after the gate's hooks: the lab wraps what they installed
     @_on_import("sglang.srt.speculative.dspark_components.dspark_draft")
     def sampled_lab_draft(mod):
@@ -825,6 +846,23 @@ if _REASONING_CACHE:
     def reasoning_history(mod):
         import reasoning_cache
         reasoning_cache.install(mod)
+
+
+if _CONF_CAPTURE:
+    @_on_import("sglang.srt.models.inkling2_mtp")
+    def conf_capture_model(mod):
+        import conf_capture
+        conf_capture.install_model(mod)
+
+    @_on_import("sglang.srt.speculative.dspark_components.dspark_draft_sampler")
+    def conf_capture_sampler(mod):
+        import conf_capture
+        conf_capture.install_sampler(mod)
+
+    @_on_import("sglang.srt.speculative.dspark_components.dspark_observability")
+    def conf_capture_observer(mod):
+        import conf_capture
+        conf_capture.install_observer(mod)
 
 
 if _ACCEPT_STATS:

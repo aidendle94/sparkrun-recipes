@@ -24,6 +24,10 @@ With SGLANG_DSPARK_SHARDED_ACCEPT the draft's logits stay on each rank's vocab s
 SPARK_GATE_KMIN (default 1): the smallest K. SPARK_GATE_RID=1 (windows only): a request id "gate-k<n>-..." forces
 K = n for that request and "gate-t<tau>-..." gives it its own tau (bench/gate_run.py measures step time against K).
 SPARK_GATE_PARTS=mask or =cap (diagnosis only, wrong results below K = 8): only that half of the gate.
+SPARK_GATE_LOG_EVERY (default 1024): steps between two "[gate] steps=... hash=..." lines of a rank.
+SPARK_GATE_HEAD=<file> (off by default): K comes from a learned confidence head computed in the draft graph's tail,
+patches/spark_gate_head.py; with SPARK_GATE_RID a "gate-t<tau>-..." request keeps the rule above and any other request
+uses the head ("gate-h1-..." names it).
 MIT License, Copyright (c) 2026 Aiden Le.
 """
 import logging
@@ -37,11 +41,11 @@ TAU = float(os.environ.get("SPARK_GATE") or 0)
 KMIN = max(1, int(os.environ.get("SPARK_GATE_KMIN") or 1))
 RID = os.environ.get("SPARK_GATE_RID") == "1"
 PARTS = set((os.environ.get("SPARK_GATE_PARTS") or "mask,cap").split(","))
-LOG_EVERY = 1024
-_RID = re.compile(r"gate-([kt])([0-9.]+)-")
+LOG_EVERY = max(1, int(os.environ.get("SPARK_GATE_LOG_EVERY") or 1024))  # steps between two [gate] lines of a rank
+_RID = re.compile(r"gate-([kth])([0-9.]+)-")
 _log = logging.getLogger("spark_gate")
 _s = {"epilogue": None, "sampler": None, "reqs": None, "src": None, "index": {}, "over": {}, "steps": 0,
-      "requests": 0, "hash": None, "ksum": None}
+      "requests": 0, "hash": None, "ksum": None, "head": None, "differ": None}
 
 
 def _log_tau(tau):
@@ -50,6 +54,14 @@ def _log_tau(tau):
 
 def epilogue():
     return _s["epilogue"]
+
+
+def set_head(rows, differ=None):
+    """patches/spark_gate_head.py, once its head is armed on every rank: rows(bs) = the head's K [bs] int64 of the
+    step whose draft graph was just replayed, or None when that step has none (then all 8 rows are verified);
+    differ() = the requests whose K was not the same on every rank so far (printed in the [gate] line)."""
+    _s["head"], _s["differ"] = rows, differ
+    _log.warning("[gate] row counts from %s", "the confidence head" if rows is not None else "the draft's token probability")
 
 
 def _cap(ep, verify_lens):
@@ -73,7 +85,8 @@ def _refusal(ep, mod):
 
 
 def _overrides(bs, device):
-    """SPARK_GATE_RID: per-request (log tau [bs, 1], forced K [bs] or 0) from the request ids."""
+    """SPARK_GATE_RID: per-request (log tau [bs, 1], forced K [bs] or 0, asks for the token rule [bs], any of them
+    does) from the request ids."""
     reqs = (_s["reqs"] or [])[:bs]
     key = tuple(m.groups() if m else None for m in (_RID.match(str(r.rid)) for r in reqs)) + (None,) * (bs - len(reqs))
     got = _s["over"].get(key)
@@ -82,8 +95,10 @@ def _overrides(bs, device):
             _s["over"].clear()
         tau = [_log_tau(float(o[1])) if o and o[0] == "t" else _log_tau(TAU) for o in key]
         force = [min(8, max(1, int(float(o[1])))) if o and o[0] == "k" else 0 for o in key]
+        token = [bool(o) and o[0] == "t" for o in key]
         got = _s["over"][key] = (torch.tensor(tau, dtype=torch.float32, device=device).view(bs, 1),
-                                 torch.tensor(force, dtype=torch.int64, device=device))
+                                 torch.tensor(force, dtype=torch.int64, device=device),
+                                 torch.tensor(token, dtype=torch.bool, device=device), any(token))
     return got
 
 
@@ -99,13 +114,24 @@ def _rows(ep, bs):
             _log.warning("[gate] SGLANG_DSPARK_SHARDED_ACCEPT keeps the draft's logits on vocab shards: every step "
                          "verifies 8 rows")
         return None
-    tokens = sampler.out[: bs * ep.gamma].view(bs, ep.gamma, 1)
-    logp = torch.empty((bs, ep.gamma), dtype=torch.float32, device=logits.device)
-    for b in range(bs):  # a request at a time: 6 MB of float32 logits, not 45 MB at eight requests
-        z = logits[b].float()
-        logp[b] = z.gather(-1, tokens[b]).squeeze(-1) - torch.logsumexp(z, -1)
-    tau, force = _overrides(bs, logits.device) if RID else (_log_tau(TAU), None)
-    k = ((logp.cumsum(-1) >= tau).sum(-1) + 1).clamp_(min=KMIN)
+    tau, force, token, any_token = _overrides(bs, logits.device) if RID else (_log_tau(TAU), None, None, False)
+    kh = None
+    if _s["head"] is not None:  # the confidence head's K, computed in the draft graph's tail
+        kh = _s["head"](bs)
+        if kh is None:
+            return None
+    if kh is None or any_token:  # the token rule: for every request, or for those whose id asks for it
+        tokens = sampler.out[: bs * ep.gamma].view(bs, ep.gamma, 1)
+        logp = torch.empty((bs, ep.gamma), dtype=torch.float32, device=logits.device)
+        for b in range(bs):  # a request at a time: 6 MB of float32 logits, not 45 MB at eight requests
+            z = logits[b].float()
+            logp[b] = z.gather(-1, tokens[b]).squeeze(-1) - torch.logsumexp(z, -1)
+        k = (logp.cumsum(-1) >= tau).sum(-1) + 1
+        if kh is not None:
+            k = torch.where(token, k, kh)
+    else:
+        k = kh
+    k = k.clamp(min=KMIN)
     if force is not None:
         k = torch.where(force > 0, force, k)
     if _s["hash"] is None:
@@ -117,8 +143,9 @@ def _rows(ep, bs):
     _s["steps"] += 1
     _s["requests"] += bs
     if _s["steps"] % LOG_EVERY == 0:
-        _log.warning("[gate] steps=%d requests=%d mean K=%.2f hash=%d", _s["steps"], _s["requests"],
-                     _s["ksum"].item() / _s["requests"], _s["hash"].item())
+        _log.warning("[gate] steps=%d requests=%d mean K=%.2f hash=%d%s", _s["steps"], _s["requests"],
+                     _s["ksum"].item() / _s["requests"], _s["hash"].item(),
+                     "" if _s["differ"] is None else " ranks differ=%d" % _s["differ"]())
     return k
 
 

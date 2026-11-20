@@ -13,6 +13,11 @@ SPARK_DENSE_I8 lists the parts:
           markov_head). The target computes what it computed before: only the acceptance can move.
   dhead   the draft's pass through the unembedding reads int8 codes; the BF16 unembedding the target reads is left
           as loaded.
+  dhead4  like dhead, with 4-bit codes: the draft's pass reads the unembedding as NVFP4-style values (e2m1 codes, two
+          a byte, one e4m3 block scale for 16 of them, one float32 scale an output row: 4.5 bits a weight, 130 MB a
+          rank where the int8 codes are 232). `_lin_f4` unpacks them in registers (code x block scale is exact in
+          BF16) and runs the same tl.dot. Only the acceptance can move. Not measured to pay: the head is ~1 ms of a
+          56 ms step at int8.
   attn    the target's layers.N.attn.qkvr and wo_ud. Where q, k and v come from three different sources, stock
           projects all three through the whole of qkvr (3 x M rows) and keeps a third of each; here one launch
           computes every output from its own source (M rows, the weight read once).
@@ -71,6 +76,136 @@ def _lin_i8(X, W, S, B, T, Y, M, K, SX, SW, SY, XS, BM: tl.constexpr, BN: tl.con
     if HAS_B:
         acc = acc + tl.load(B + cols, cmask, other=0).to(tl.float32)[None, :]
     tl.store(Y + rows[:, None] * SY + cols[None, :], acc.to(Y.dtype.element_ty), rmask[:, None] & cmask[None, :])
+
+
+@triton.jit
+def _e2m1(c):
+    """4-bit e2m1 codes (sign in bit 3) -> float32."""
+    m = (c & 7).to(tl.int32)
+    small = m.to(tl.float32) * 0.5
+    big = (1.0 + 0.5 * (m & 1).to(tl.float32)) * tl.where(m >= 6, 4.0, 2.0)
+    v = tl.where(m < 4, small, big)
+    return tl.where((c & 8) != 0, -v, v)
+
+
+@triton.jit
+def _lin_f4(X, W, BS, S, T, Y, M, K, SX, SW, SB, SY, XS, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    """_lin_i8 for 4-bit weights: W [N, K / 2] packed e2m1 pairs (low nibble first), BS [N, K / 16] e4m3 block scale
+    bytes, S [N] float32. No bias (the draft's unembedding has none)."""
+    rows = tl.program_id(0) * BM + tl.arange(0, BM)
+    block = tl.program_id(1)
+    first = tl.load(T + 3 * block)
+    count = tl.load(T + 3 * block + 1)
+    source = tl.load(T + 3 * block + 2)
+    cols = first + tl.arange(0, BN)
+    rmask = rows < M
+    cmask = tl.arange(0, BN) < count
+    ks = tl.arange(0, BK)
+    kp = tl.arange(0, BK // 2)
+    kb = tl.arange(0, BK // 16)
+    xp = X + source * XS + rows[:, None] * SX
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for tile in range(K // BK):
+        x = tl.load(xp + (tile * BK + ks)[None, :], rmask[:, None], other=0)
+        p = tl.load(W + cols[:, None] * SW + (tile * (BK // 2) + kp)[None, :], cmask[:, None], other=0)
+        w = tl.reshape(tl.join(_e2m1(p & 15), _e2m1(p >> 4)), (BN, BK // 16, 16))
+        b = tl.load(BS + cols[:, None] * SB + (tile * (BK // 16) + kb)[None, :], cmask[:, None], other=0).to(tl.int32)
+        e = (b >> 3) & 15
+        mant = (b & 7).to(tl.float32) * 0.125
+        scale = tl.where(e == 0, mant * 0.015625, (1.0 + mant) * tl.exp2((e - 7).to(tl.float32)))
+        w = tl.reshape(w * scale[:, :, None], (BN, BK)).to(tl.bfloat16)
+        acc = tl.dot(x, tl.trans(w), acc)
+    acc = acc * tl.load(S + cols, cmask, other=0)[None, :]
+    tl.store(Y + rows[:, None] * SY + cols[None, :], acc.to(Y.dtype.element_ty), rmask[:, None] & cmask[None, :])
+
+
+class Fp4:
+    """A weight as NVFP4-style codes: packed [N, K / 2] uint8, block scales [N, K / 16] uint8 (e4m3 bytes), float32
+    scales [N] (the row's amax / 2688), and the block table."""
+    __slots__ = ("codes", "blocks", "scale", "table", "freed")
+
+    def __init__(self, codes, blocks, scale):
+        self.codes, self.blocks, self.scale, self.freed = codes, blocks, scale, False
+        self.table = block_table([(0, codes.shape[0], 0)], codes.device)
+
+
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _e4m3_values(device):
+    b = torch.arange(0x7F, device=device)
+    e, m = (b >> 3) & 15, (b & 7).float() / 8
+    return torch.where(e == 0, m * 2.0 ** -6, (1 + m) * torch.pow(2.0, (e - 7).float()))
+
+
+def decode_f4(q, first=0, count=None):
+    """Rows [first, first + count) of an Fp4 weight as float32 (the reference of the kernel and of the error)."""
+    count = q.codes.shape[0] - first if count is None else count
+    p = q.codes[first:first + count]
+    c = torch.stack((p & 15, p >> 4), -1).reshape(count, -1).long()
+    v = torch.tensor(_E2M1, device=p.device)[c & 7]
+    v = torch.where(c >= 8, -v, v)
+    b = _e4m3_values(p.device)[q.blocks[first:first + count].long()]
+    return v * b.repeat_interleave(16, 1) * q.scale[first:first + count, None]
+
+
+def quantize_f4(weight, rows=1024):
+    """Fp4 of a [N, K] weight (K a multiple of 16), a block of rows at a time: per row amax, a block's scale is its
+    largest value x 448 / amax as the nearest e4m3, codes the nearest e2m1 (the rule of the checkpoint's NVFP4 expert
+    weights). The weight itself is left as it is. Returns (Fp4, squared error, squared norm)."""
+    n, k = weight.shape
+    device = weight.device
+    codes = torch.empty((n, k // 2), dtype=torch.uint8, device=device)
+    blocks = torch.empty((n, k // 16), dtype=torch.uint8, device=device)
+    scale = torch.empty(n, dtype=torch.float32, device=device)
+    table = _e4m3_values(device)
+    mid8 = (table[1:] + table[:-1]) / 2
+    grid = torch.tensor(_E2M1, device=device)
+    mid4 = (grid[1:] + grid[:-1]) / 2
+    err = ref = 0.0
+    for at in range(0, n, rows):
+        w = weight[at:at + rows].float()
+        amax = w.abs().amax(1, keepdim=True).clamp_min_(1e-30)
+        blk = w.view(w.shape[0], k // 16, 16)
+        b = torch.bucketize(blk.abs().amax(-1) * (448.0 / amax), mid8).clamp_(max=0x7E)
+        bval = table[b]
+        t = blk * (2688.0 / amax)[..., None] / bval.clamp_min(1e-30)[..., None]
+        c = torch.bucketize(t.abs(), mid4).clamp_(max=7)
+        c = torch.where(bval[..., None] > 0, c, torch.zeros_like(c))
+        back = grid[c] * torch.sign(t) * bval[..., None] * (amax / 2688.0)[..., None]
+        err += (back - blk).pow(2).sum().item()
+        ref += w.pow(2).sum().item()
+        c = (c | ((t < 0) & (c > 0)).long() * 8).view(w.shape[0], k // 2, 2)
+        codes[at:at + rows] = (c[..., 0] | (c[..., 1] << 4)).to(torch.uint8)
+        blocks[at:at + rows] = b.to(torch.uint8)
+        scale[at:at + rows] = (amax / 2688.0).squeeze(1)
+    return Fp4(codes, blocks, scale), err, ref
+
+
+def linear_f4(x, q, *, out_dtype=None):
+    """x @ W.T from q's 4-bit codes (x [M <= MAX_M, K] BF16)."""
+    m = x.shape[0]
+    out = torch.empty((m, q.codes.shape[0]), dtype=out_dtype or x.dtype, device=x.device)
+    bm = 16 if m <= 16 else 32 if m <= 32 else 64
+    _lin_f4[(triton.cdiv(m, bm), q.table.shape[0] // 3)](
+        x, q.codes, q.blocks, q.scale, q.table, out, m, 2 * q.codes.shape[1], x.stride(0), q.codes.stride(0),
+        q.blocks.stride(0), out.stride(0), m * x.stride(0), bm, BN, BK, num_warps=4, num_stages=3, enable_fp_fusion=False)
+    return out
+
+
+def check_f4(q):
+    """The kernel against torch on this weight's first rows (at the load): the largest difference over the largest
+    output, which must be rounding only."""
+    n = min(4 * BN, q.codes.shape[0])
+    small = Fp4(q.codes[:n].contiguous(), q.blocks[:n].contiguous(), q.scale[:n].contiguous())
+    gen = torch.Generator(device="cpu").manual_seed(4)
+    x = torch.randn((24, 2 * q.codes.shape[1]), generator=gen).to(q.codes.device, torch.bfloat16)
+    got = linear_f4(x, small, out_dtype=torch.float32)
+    # as the kernel computes: code x block scale is exact in BF16, the row scale multiplies the FP32 sum
+    unit = Fp4(small.codes, small.blocks, torch.ones_like(small.scale))
+    want = (x.float() @ decode_f4(unit).T) * small.scale[None, :]
+    worst = float((got - want).abs().max() / want.abs().max().clamp_min(1e-30))
+    return worst
 
 
 class Int8:
@@ -170,6 +305,11 @@ def warm(device):
         for dtype in (torch.bfloat16, torch.float32):
             linear_i8(x, q, out_dtype=dtype)
             linear_i8(x, q, out_dtype=dtype, bias=bias)
+    if "dhead4" in PARTS:
+        f = Fp4(torch.zeros((BN, BK // 2), dtype=torch.uint8, device=device),
+                torch.zeros((BN, BK // 16), dtype=torch.uint8, device=device), torch.ones(BN, device=device))
+        for m in (16, 32, 64):
+            linear_f4(torch.zeros((m, BK), dtype=torch.bfloat16, device=device), f)
     torch.cuda.synchronize(device)
 
 
@@ -232,7 +372,17 @@ def _attach(model, group_of, what):
         for freed, _, _, name, module, group in sorted(chosen, key=lambda c: c[:3]):  # the freed last, smallest first
             weight = module.weight
             numel = weight.numel()
-            q, err, ref = quantize(weight.data, round_weight=group != "dhead" and not freed)
+            if group == "dhead" and "dhead4" in PARTS and weight.shape[1] % BK == 0:
+                q, err, ref = quantize_f4(weight.data)
+                worst = check_f4(q)
+                _log.warning("[dense_i8] dhead4: %s as 4-bit codes, %.1f MB (int8 would be %.1f MB); kernel against "
+                             "its reference: %.2g of the largest output%s", name,
+                             (q.codes.numel() + q.blocks.numel() + 4 * q.scale.numel()) / 1e6, numel / 1e6, worst,
+                             "" if worst < 1e-4 else ": TOO FAR, the head stays int8")
+                if not worst < 1e-4:  # the draft only: a wrong head costs acceptance, never the boot
+                    q, err, ref = quantize(weight.data, round_weight=False)
+            else:
+                q, err, ref = quantize(weight.data, round_weight=group != "dhead" and not freed)
             if freed:
                 q.freed = True
                 weight.data = weight.data.new_empty((0, weight.shape[1]))
@@ -280,7 +430,7 @@ def _group_target(name, module):
     if name.endswith(".mlp.gate"):
         return "router" if "router" in PARTS else None
     if name.endswith("lm_head"):
-        return "head" if "head" in PARTS else "dhead" if "dhead" in PARTS else None
+        return "head" if "head" in PARTS else "dhead" if "dhead" in PARTS or "dhead4" in PARTS else None
     return None
 
 
@@ -329,7 +479,7 @@ def install_draft(mod):
         if q is not None:
             x = hidden.to(torch.bfloat16)  # stock casts to the weight's dtype
             if _take("draft unembedding", x):
-                return linear_i8(x, q)
+                return linear_f4(x, q) if isinstance(q, Fp4) else linear_i8(x, q)
         return stock(hidden, lm_head)
 
     project_through_lm_head.__wrapped__ = stock

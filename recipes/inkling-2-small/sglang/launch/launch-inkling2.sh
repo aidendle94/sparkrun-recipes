@@ -25,6 +25,8 @@
 #      PREFILL_DECODE_INTERVAL (2, the default since 2026-11-17 | empty = off, the engine's own scheduling: --prefill-decode-interval, the decode rounds the scheduler runs after a prefill batch before it takes the next one, so that requests already decoding keep getting tokens through a long prefill; skipped while nothing is decoding; a new request still waits for the whole prefill; not measured against a boot without it)
 #      STABLE_KERNELS (tau,gate_sink, the default since 2026-11-17 | empty = off: two of the image's Triton kernels with the batch's row count and strides as arguments, patches/stable_kernels.py; exact; without it every prefill of a new size compiles and loads a CUDA module while serving, which is where both outages of 2026-11-17 began)
 #      KERNEL_LOAD_GUARD (5, the default since 2026-11-17 | empty = off: a Triton kernel load the driver refuses with "operation not permitted" is tried again up to this many times, patches/kernel_load_guard.py)
+#      SCALE_PACK (1, the default since 2026-11-19 | empty = off: the NVFP4 expert layers' block scales stay packed in memory, patches/scale_pack.py, and the forked grouped GEMM patches/spark_csf_gemm_sm120.so reads them in the kernel (kernels/csf_gemm/build_csf_gemm.py builds it from the image's sources; without the file the launcher turns the packing off). Exact: same bytes into the GEMM. 3.0-3.4 GB a node back, one stream's step about 1% longer (0.5 to 0.7 ms on three boots), NLL identical. Needs FI_MOE=1 and TP_SHARD. The .so belongs to the image it was built from: rebuild it when INKLING_IMAGE changes)
+#      GATE_HEAD (gate-head-mlp-reg.pt, the default since 2026-11-20 | empty = off, the gate's own rule: the gate's row count comes from a small trained confidence head, a file in patches/, computed in the draft graph's tail, patches/spark_gate_head.py. Exact for sampled requests like the gate (it reads the draft's hidden state and distributions, never the target); greedy text identical on 16 of 16 prompts. Measured in one boot against the gate's own rule, both arms carrying the head's cost: x1.02 greedy, x1.05 at temperature 1.0; its tail costs about 0.75 ms a step (most of it the statistics); net, measured across boots, x1.017 greedy at one stream. Every rank must hold the same file: the ranks vote at boot and no rank arms otherwise. Needs GATE; without the file the launcher leaves the gate on its own rule. bench/cc_export_head.py writes a head from a capture)
 #      SERVED_ALIASES (empty: extra ids listed by /v1/models, comma-separated) MTP (1|0: DSpark with the bundled draft, ~1.7x decode) EXTRA_ARGS
 # MIT License, Copyright (c) 2026 Aiden Le.
 set -o pipefail
@@ -43,6 +45,16 @@ if [ -z "${POOL+set}" ]; then case "$KV_DTYPE/$DRAFT_KV_FP8/$SWA_RATIO" in
   fp8_e4m3/1/0.05) POOL=793000;; fp8_e4m3//0.05) POOL=716000;; fp8_e4m3/*/|fp8_e4m3/*/0.1) POOL=600000;;
   *) POOL=; echo "note: no pool cap is known for KV_DTYPE=$KV_DTYPE SWA_RATIO=$SWA_RATIO: the engine sizes the pool at boot; the caps were measured with FP8 KV at MEMFRAC=0.94 (set POOL, or MEMFRAC=0.93 WMARK_BOOST= for the sizing before them)" >&2;;
 esac; fi
+SCALE_PACK=${SCALE_PACK-1}; CSF_SO=spark_csf_gemm_sm120.so; [ "$SCALE_PACK" = 1 ] || SCALE_PACK=
+if [ -n "$SCALE_PACK" ]; then
+  if [ "$FI_MOE" != 1 ] || [ -z "$TP_SHARD" ]; then echo "note: SCALE_PACK needs FI_MOE=1 and TP_SHARD: the packing is off for this launch" >&2; SCALE_PACK=
+  elif [ ! -f "$HERE/../patches/$CSF_SO" ]; then echo "note: patches/$CSF_SO is not built (kernels/csf_gemm/build_csf_gemm.py): the packing is off for this launch" >&2; SCALE_PACK=; fi
+fi
+GATE_HEAD=${GATE_HEAD-gate-head-mlp-reg.pt}
+if [ -n "$GATE_HEAD" ]; then
+  if [ -z "$GATE" ]; then echo "note: GATE_HEAD needs the gate (GATE): no confidence head for this launch" >&2; GATE_HEAD=
+  elif [ ! -f "$HERE/../patches/$GATE_HEAD" ]; then echo "note: patches/$GATE_HEAD is missing (bench/cc_export_head.py writes one): the gate runs its own rule for this launch" >&2; GATE_HEAD=; fi
+fi
 SHARD_ENV=""; if [ -n "$TP_SHARD" ]; then
   [ "$FI_MOE" = 1 ] || { echo "ABORT: TP_SHARD needs FI_MOE=1" >&2; exit 1; }
   SHARD_ENV="-e SPARK_TP_SHARD=1"; case ",$TP_SHARD," in *,half,*) SHARD_ENV="$SHARD_ENV -e SPARK_TP_SHARD_HALF=1";; esac; case ",$TP_SHARD," in *,fp8,*) SHARD_ENV="$SHARD_ENV -e SPARK_TP_SHARD_FP8=1";; esac
@@ -67,7 +79,7 @@ run_cmd() {
  -e NCCL_NET=IB -e NCCL_IB_DISABLE=0 -e NCCL_IB_HCA=$RDMA_HCAS -e NCCL_SOCKET_IFNAME=$FABRIC_IFACE -e GLOO_SOCKET_IFNAME=$FABRIC_IFACE \
  -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_IB_ADDR_RANGE=$FABRIC_SUBNET -e NCCL_IB_SUBNET_PREFIX_LEN=${FABRIC_SUBNET#*/} -e NCCL_IB_GID_INDEX=$gid \
  -e NCCL_CROSS_NIC=1 -e NCCL_IB_MERGE_NICS=0 -e NCCL_IB_SUBNET_AWARE_ROUTING=1 -e NCCL_CUMEM_ENABLE=0 -e NCCL_P2P_DISABLE=1 -e NCCL_SHM_DISABLE=1 -e NCCL_DEBUG=WARN \
- -e NCCL_BUFFSIZE=1048576 -e NCCL_LL128_BUFFSIZE=262144 -e NCCL_PROTO=^LL128 -e NCCL_MAX_NCHANNELS=8 ${GATE:+-e SPARK_GATE=$GATE} ${DENSE_I8:+-e SPARK_DENSE_I8=$DENSE_I8} ${DENSE_P12:+-e SPARK_DENSE_P12=$DENSE_P12} $SHARD_ENV ${WMARK_BOOST:+-e SPARK_WMARK_BOOST=1} ${DRAFT_KV_FP8:+-e SPARK_DRAFT_KV_FP8=1} ${PREFILL_GLUE:+-e SPARK_PREFILL_GLUE=$PREFILL_GLUE} ${BIAS_FAR:+-e SPARK_FA4_BIAS_FAR=$BIAS_FAR} ${FI_MXFP8:+-e SPARK_FI_MXFP8=1} ${STABLE_KERNELS:+-e SPARK_STABLE_KERNELS=$STABLE_KERNELS} ${KERNEL_LOAD_GUARD:+-e SPARK_KERNEL_LOAD_GUARD=$KERNEL_LOAD_GUARD} ${NCCL_EXTRA:-} ${REASONING_CACHE:+-e SPARK_REASONING_CACHE=$REASONING_CACHE} \
+ -e NCCL_BUFFSIZE=1048576 -e NCCL_LL128_BUFFSIZE=262144 -e NCCL_PROTO=^LL128 -e NCCL_MAX_NCHANNELS=8 ${GATE:+-e SPARK_GATE=$GATE} ${GATE_HEAD:+-e SPARK_GATE_HEAD=/patches/$GATE_HEAD} ${SCALE_PACK:+-e SPARK_SCALE_PACK=1 -e SPARK_CSF_GEMM=/patches/$CSF_SO} ${DENSE_I8:+-e SPARK_DENSE_I8=$DENSE_I8} ${DENSE_P12:+-e SPARK_DENSE_P12=$DENSE_P12} $SHARD_ENV ${WMARK_BOOST:+-e SPARK_WMARK_BOOST=1} ${DRAFT_KV_FP8:+-e SPARK_DRAFT_KV_FP8=1} ${PREFILL_GLUE:+-e SPARK_PREFILL_GLUE=$PREFILL_GLUE} ${BIAS_FAR:+-e SPARK_FA4_BIAS_FAR=$BIAS_FAR} ${FI_MXFP8:+-e SPARK_FI_MXFP8=1} ${STABLE_KERNELS:+-e SPARK_STABLE_KERNELS=$STABLE_KERNELS} ${KERNEL_LOAD_GUARD:+-e SPARK_KERNEL_LOAD_GUARD=$KERNEL_LOAD_GUARD} ${NCCL_EXTRA:-} ${REASONING_CACHE:+-e SPARK_REASONING_CACHE=$REASONING_CACHE} \
  --entrypoint python3 $IMAGE -m sglang.launch_server --model-path /models/repo/$SNAP --served-model-name $SERVED --trust-remote-code \
  --tp 4 --ep-size 4 --nnodes 4 --node-rank $r --dist-init-addr $HEAD:$DIST_PORT --host 0.0.0.0 --port $PORT \
  --attention-backend fa4 --mem-fraction-static $MEMFRAC --chunked-prefill-size $CHUNK --context-length $CTX \
@@ -78,8 +90,9 @@ if [ $DRY = 1 ]; then for r in 0 1 2 3; do echo "== rank $r"; run_cmd $r || exit
 echo "== preflight"; bad=""
 for r in 0 1 2 3; do
   # The GB10 hooks must be on every node (a rank without them runs stock code and fails at the first collective).
-  if [ $r = 0 ]; then mkdir -p ${HOMES[0]}/inkling2-patches && cp $HERE/../patches/*.py ${HOMES[0]}/inkling2-patches/
-  else on_rank $r "mkdir -p ${HOMES[$r]}/inkling2-patches" && scp -q -o BatchMode=yes $HERE/../patches/*.py ${USERS[$r]}@${NODES[$r]}:${HOMES[$r]}/inkling2-patches/; fi
+  # with them go the forked GEMM's module when the packing is on and the confidence head's file when it is on (patches/*.py only otherwise)
+  if [ $r = 0 ]; then mkdir -p ${HOMES[0]}/inkling2-patches && cp $HERE/../patches/*.py ${SCALE_PACK:+$HERE/../patches/$CSF_SO} ${GATE_HEAD:+$HERE/../patches/$GATE_HEAD} ${HOMES[0]}/inkling2-patches/
+  else on_rank $r "mkdir -p ${HOMES[$r]}/inkling2-patches" && scp -q -o BatchMode=yes $HERE/../patches/*.py ${SCALE_PACK:+$HERE/../patches/$CSF_SO} ${GATE_HEAD:+$HERE/../patches/$GATE_HEAD} ${USERS[$r]}@${NODES[$r]}:${HOMES[$r]}/inkling2-patches/; fi
   out=$(on_rank $r "mkdir -p ${HOMES[$r]}/inkling2-cache; docker image inspect $IMAGE >/dev/null 2>&1 && echo image-ok || echo image-MISSING; test -f ${HOMES[$r]}/$REPO_REL/$SNAP/model.safetensors.index.json && echo weights-ok || echo weights-MISSING; ${OTHER_CONTAINER:+docker ps -q -f name=^$OTHER_CONTAINER\$ | grep -q . && echo other-engine-RUNNING || echo other-engine-off}" 2>&1)
   case "$out" in *MISSING*|*RUNNING*) echo "  rank $r: $(echo $out)"; bad=1;; *) echo "  rank $r: image + weights OK";; esac
 done

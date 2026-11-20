@@ -5,4 +5,5 @@
 *.bak
 *.bak-*
 **/overlay/libengram_rows.so
+**/patches/*.so
 **/bench/out/

@@ -3,3 +3,4 @@
 launch/fleet.env
 logs
 bench/logs
+patches/*.so

@@ -3,7 +3,9 @@ NCCL_EXTRA="-e SPARK_GATE=0.4 -e SPARK_GATE_RID=1 -e SGLANG_DSPARK_DEBUG_DUMP=al
 request-id overrides let any client choose its K).
 
     python3 bench/gate_run.py <label> [--ref A] [--taus 0.25,0.4,0.6] [--ks 1,2,3,4,6] [--tokens 400] [--phases ...]
-                              [--limit N: the first N prompts of g1, g4 and g8]
+                              [--limit N: the first N prompts of g1, g4 and g8] [--head]
+--head (a boot with SPARK_GATE_HEAD, patches/spark_gate_head.py): every phase also runs the arm "h1", the learned
+confidence head's row count, and reports its paired ratio to the middle tau's arm (the gate's own rule, same boot).
 Prompts and reference outputs come from logs/trace-<ref>.json (bench/trace_run.py on a boot without the gate). Every
 request names its arm in its id: "gate-k8-..." verifies all 8 rows (the stock step), "gate-t<tau>-..." gates at tau,
 "gate-k<n>-..." always verifies n rows. The arms of a phase run back to back on the same prompts (their order rotates,
@@ -12,6 +14,7 @@ the prompt is in the prefix cache before the first), so a paired per-prompt rati
         how much of the target's own continuation one step commits): `same` counts outputs identical to k8's
   kc    six prompts alone, greedy, with a forced row count: step time against K
   s1    alone, temperature 0.7         g4, g8   four and eight at a time, greedy
+  s10   alone, temperature 1.0 (what a request without a temperature gets)      s4   four at a time, temperature 1.0
   copy  alone, greedy, an edit of a given file            long   alone, greedy, behind a 60K-token prompt
 Per phase and arm: per-stream tok/s, accepted length, paired speed-up over k8, `same`, the smallest distinct-4-gram
 ratio; then from the server's DSpark step records (/server_info) ms per step (draft, verify) and tokens per step.
@@ -34,10 +37,13 @@ ap.add_argument("--tokens", type=int, default=400)
 ap.add_argument("--port", type=int, default=8210)
 ap.add_argument("--phases", default="g1,kc,s1,g4,g8,copy,long")
 ap.add_argument("--limit", type=int)
+ap.add_argument("--head", action="store_true", help="also the arm h1: the confidence head's rows (SPARK_GATE_HEAD boots)")
 args = ap.parse_args()
 LOGS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
 ref = json.load(open(os.path.join(LOGS, f"trace-{args.ref}.json")))
 taus = [f"t{t}" for t in args.taus.split(",")]
+mid = taus[len(taus) // 2]
+head = ["h1"] if args.head else []
 rows = []
 
 
@@ -85,23 +91,28 @@ def run(phase, width, arms, tokens=None, source=None, limit=None, **sampling):
                        "accept": round(m.get("spec_accept_length") or 0, 2), "d4": round(d4(o), 2)}
                 print(time.strftime("%T"), row, repr(outs[name]["text"][:50]), flush=True)
                 rows.append(dict(row, ids=o, text=outs[name]["text"]))
+            json.dump(rows, open(os.path.join(LOGS, f"gate-{args.label}.json"), "w"))  # a run that is cut keeps its rows
 
 
 phases = args.phases.split(",")
 if "g1" in phases:
-    run("g1", 1, ["k8"] + taus, limit=args.limit)
+    run("g1", 1, ["k8"] + taus + head, limit=args.limit)
 if "kc" in phases:
     run("kc", 1, [f"k{k}" for k in args.ks.split(",")] + ["k8"], tokens=256, source="g1", limit=6)
 if "s1" in phases:
-    run("s1", 1, ["k8", taus[len(taus) // 2]], source="g1", limit=16, temperature=0.7)
+    run("s1", 1, ["k8", mid] + head, source="g1", limit=min(16, args.limit or 16), temperature=0.7)
+if "s10" in phases:
+    run("s10", 1, ["k8", mid] + head, source="g1", limit=args.limit, temperature=1.0)
 if "g4" in phases:
-    run("g4", 4, ["k8", taus[len(taus) // 2]], source="g1", limit=args.limit)
+    run("g4", 4, ["k8", mid] + head, source="g1", limit=args.limit)
+if "s4" in phases:
+    run("s4", 4, ["k8", mid] + head, source="g1", limit=args.limit, temperature=1.0)
 if "g8" in phases:
-    run("g8", 8, ["k8", taus[len(taus) // 2]], source="g1", limit=args.limit)
+    run("g8", 8, ["k8", mid] + head, source="g1", limit=args.limit)
 if "copy" in phases:
-    run("copy", 1, ["k8"] + taus, tokens=600)
+    run("copy", 1, ["k8"] + taus + head, tokens=600)
 if "long" in phases:
-    run("long", 1, ["k8"] + taus)
+    run("long", 1, ["k8"] + taus + head)
 json.dump(rows, open(os.path.join(LOGS, f"gate-{args.label}.json"), "w"))
 
 print("\n== requests: per-stream tok/s; x = mean per-prompt ratio to k8; same = outputs identical to k8's "
@@ -122,6 +133,16 @@ for phase in dict.fromkeys(r["phase"] for r in rows):
             cmp = [common(r["ids"], want[r["prompt"]]) for r in sel]
             line += (f" | vs trace-{args.ref}: same {sum(s for _, s in cmp)}/{len(cmp)} "
                      f"({sum(n for n, _ in cmp) / len(cmp):.0f})")
+        if arm == "h1":  # the head against the gate's own rule, by prompt (a width-4 group shares its steps: per group)
+            today = {r["prompt"]: r for r in rows if r["phase"] == phase and r["arm"] == mid}
+            rs = [r["tok_s"] / today[r["prompt"]]["tok_s"] for r in sel if r["prompt"] in today]
+            if rs:
+                mean = sum(rs) / len(rs)
+                se = (sum((x - mean) ** 2 for x in rs) / max(len(rs) - 1, 1) / len(rs)) ** 0.5
+                tot = sum(r["tokens"] for r in sel) / sum(r["decode_s"] for r in sel)
+                tot_t = sum(today[r["prompt"]]["tokens"] for r in sel if r["prompt"] in today) / \
+                    sum(today[r["prompt"]]["decode_s"] for r in sel if r["prompt"] in today)
+                line += f" | vs {mid}: x{mean:5.3f} +- {se:.3f} per prompt, x{tot / tot_t:5.3f} over all tokens"
         print(line, flush=True)
 
 info = json.load(urllib.request.urlopen(f"http://localhost:{args.port}/server_info", timeout=600))
