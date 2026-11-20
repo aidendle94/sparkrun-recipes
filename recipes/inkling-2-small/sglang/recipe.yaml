@@ -4,7 +4,7 @@ engine: sglang
 engine_base: lmsysorg/sglang@sha256:424c1da97f6d6eef1612006c77b2ca791657a8184c1fbdbc682ebf9485d3b32c   # the dev-inkling-2-small tag as of 2026-11-12
 image: lmsysorg/sglang:dev-inkling-2-small       # unmodified; the hooks in patches/ are mounted and put on PYTHONPATH
 image_with_hooks: aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.0   # the same pinned base + patches/ as of 2026-11-17 (Dockerfile): built before scale_pack, the stall recorder and the confidence head, so its own /patches are older than this tree (the launcher mounts the current patches/ over them); file and import check only, no fleet boot yet
-status: experimental          # production | validated | experimental | archived  (eight days old, dev image, open problems: see README)
+status: experimental          # production | validated | experimental | archived  (in service since 2026-11-12, dev image, open problems: see README)
 nodes: 4 x NVIDIA DGX Spark (GB10, 128 GB), switched RoCE fabric, TP4/EP4
 context_length: 524288        # launcher default since 2026-11-17 (262144 before)
 measured: 2026-11-20          # single boots on one fleet, 2026-11-13 to 2026-11-20; everything but scale_pack and confidence_head below by 2026-11-16, without those two

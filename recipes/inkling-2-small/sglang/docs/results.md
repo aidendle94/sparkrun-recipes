@@ -521,8 +521,8 @@ The script's one argument is an output directory: it writes the derived sources 
 files under `ws/` and `spark_csf_gemm_sm120.so` beside them (`--no-compile` stops after the sources). The launcher
 copies `patches/spark_csf_gemm_sm120.so` to every node with the hooks and names it in `SPARK_CSF_GEMM`. The module
 is not in the repository (`patches/*.so` is git-ignored): it belongs to the image it was built from, so build it
-again when the image changes. On 2026-11-19 a compile of it on a node that was serving left that node too little
-memory and took the fleet down: stop the fleet first.
+again when the image changes. The compile needs several GB of memory, which a serving node does not have: stop the
+fleet first.
 
 What a boot logs, on every rank: `[scale_pack] forked GEMM on w13_scale: packed scales give the stock bytes: the
 kernel reads them, nothing is expanded`, the same for `w2_scale`, and `[scale_pack] 40 expert layers: block scales
@@ -609,7 +609,7 @@ tokens, 336 questions on 14 shared contexts of 15-104K tokens; 1,377 without a t
 temperature 0.7. It gave 93,958 request-steps (657,706 drafted positions, 6.1 GB of hidden states). Every request
 ran with all 8 rows verified, so each position has its label: for a greedy request whether the draft was the
 target's argmax, for a sampled one the acceptance probability min(1, p/q) itself, without the coin. A first capture
-an hour earlier had been stopped by a temperature guard after 141 requests (6,068 request-steps); a small head
+an hour earlier had been stopped early for heat after 141 requests (6,068 request-steps); a small head
 trained on it alone already simulated at x1.035, so more data made the estimate firm and did not raise it.
 
 A chat or messages request without a `temperature` is sampled at 1.0 on this server: that is the engine's default
@@ -736,8 +736,8 @@ What this does not show:
   four prompts ran x0.88 to x1.03), x0.96 over all tokens. Not measured. The other phases of that check: x1.02
   greedy and x1.05 at temperature 1.0 alone (four prompts each, x0.94 to x1.19 and x0.81 to x1.24), and x0.91 for
   its one greedy batch of four.
-- Four at a time: 4 and 3 batches (the last phase was cut when the rank-0 node reached 95 C), too few for an
-  interval (see the note under the table). The thresholds come from one-stream step times and were used unchanged;
+- Four at a time: 4 and 3 batches (the last phase was stopped early for heat), too few for an interval (see the
+  note under the table). The thresholds come from one-stream step times and were used unchanged;
   79% of the captured steps ran four requests at a time, where an extra row costs less.
 - The head is the training harness's fold-1 model, fit on three fifths of the capture, not a head fit on all rows.
   The capture is one load of templated prompts with mostly truncated outputs (77% of the requests hit their token
