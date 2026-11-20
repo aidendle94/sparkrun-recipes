@@ -195,6 +195,24 @@ the engine. The bytes are what the rank-0 node has free at boot, so the cap that
 `POOL=<tokens>` sets another, `POOL=` none (the engine then sizes the pool at boot). For a combination no cap was
 measured for (`KV_DTYPE=auto`, another ratio) the launcher sets none and says so.
 
+For a short BF16 KV test with an 8,192-token cap, use `CTX=4096 MAXREQ=1 MTP=0 KV_DTYPE=auto POOL=8192 SWA_RATIO=0.25`.
+At SGLang's ratio of 0.1 that cap gives the sliding-window layers 819 tokens. Admitting one request needs 1,024.
+At 0.25 the allocator reserved 2,048 window tokens per rank. [Per-rank allocations](https://github.com/looskis/labski/blob/b4874b107855f9e56e41df923ccd9f3466aaa2e4/inference-recipes/results/inkling2-gb10-runtime-2026-11-19/native-load.jsonl)
+
+To use checkpoint revision `4d56448`, download it on each node and select its snapshot directory.
+
+```bash
+hf download thinkingmachines/Inkling-2-Small --revision 4d564489295e30e9341a9822a8046f0c9ded1a7b
+export INKLING_SNAP=snapshots/4d564489295e30e9341a9822a8046f0c9ded1a7b
+```
+
+This revision adds a ModelOpt shortcut to `config.json`. The pinned SGLang image picks that shortcut first and
+stops with `Inkling2 requires its checkpoint precision metadata`. For this snapshot the launcher clears the
+shortcut at runtime so the loader reads the native NVFP4/MXFP8 map in `hf_quant_config.json`. The checkpoint's
+chat template and scaling settings still come from the selected revision. An independent four-Spark run served
+this snapshot with the baked GB10 hooks, BF16 KV and plain decoding on a switchless RoCE ring.
+[Launch settings and six completions](https://github.com/looskis/labski/tree/b4874b107855f9e56e41df923ccd9f3466aaa2e4/inference-recipes/results/inkling2-gb10-runtime-2026-11-19/)
+
 Earlier configurations with today's launcher:
 
 ```bash

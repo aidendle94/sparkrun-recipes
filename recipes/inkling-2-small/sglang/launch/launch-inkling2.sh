@@ -33,6 +33,13 @@ FLEET_ENV="${FLEET_ENV:-$HERE/fleet.env}"
 [ -f "$FLEET_ENV" ] || { echo "ABORT: $FLEET_ENV not found — copy $HERE/fleet.env.example to fleet.env and fill in this site's nodes" >&2; exit 1; }
 . "$FLEET_ENV"
 REPO_REL=${INKLING_REPO_REL:-.cache/huggingface/hub/models--thinkingmachines--Inkling-2-Small}; SNAP=${INKLING_SNAP:-snapshots/b0e7afb8892a07897c78ce1c5b801a0d9cbd5e7b}
+# This snapshot has a generic ModelOpt shortcut as well as Inkling's mixed-precision map.
+# Pass the override as one JSON argument through the rank's shell.
+PRECISION_ARGS=""
+case "/${SNAP%/}" in
+  */4d564489295e30e9341a9822a8046f0c9ded1a7b)
+    PRECISION_ARGS="--json-model-override-args '{\"quantization_config\":null}'" ;;
+esac
 HEAD=${NODES[0]}; PORT=${PORT:-8210}; DIST_PORT=${DIST_PORT:-20200}; NAME=inkling2
 IMAGE=${INKLING_IMAGE:-lmsysorg/sglang:dev-inkling-2-small}; CTX=${CTX:-524288}; CHUNK=${CHUNK:-4096}; MAXREQ=${MAXREQ:-8}
 MEMFRAC=${MEMFRAC:-0.94}; SERVED=${SERVED:-inkling-2-small}; MTP=${MTP:-1}; KV_DTYPE=${KV_DTYPE:-fp8_e4m3}; GATE=${GATE-0.4}; DENSE_I8=${DENSE_I8-draft,dhead,dfree}; DENSE_P12=${DENSE_P12-attn,head,free}; REASONING_CACHE=${REASONING_CACHE-1}; TP_SHARD=${TP_SHARD-half,fp8}
@@ -72,7 +79,7 @@ run_cmd() {
  --tp 4 --ep-size 4 --nnodes 4 --node-rank $r --dist-init-addr $HEAD:$DIST_PORT --host 0.0.0.0 --port $PORT \
  --attention-backend fa4 --mem-fraction-static $MEMFRAC --chunked-prefill-size $CHUNK --context-length $CTX \
  --max-running-requests $MAXREQ --cuda-graph-max-bs-decode $MAXREQ --cuda-graph-backend-prefill disabled --cuda-graph-max-bs-prefill $MAXREQ \
- --watchdog-timeout 1800 --enable-metrics --kv-cache-dtype $KV_DTYPE $SPEC_ARGS ${POOL:+--max-total-tokens $POOL} ${SWA_RATIO:+--swa-full-tokens-ratio $SWA_RATIO} ${PREFILL_DECODE_INTERVAL:+--prefill-decode-interval $PREFILL_DECODE_INTERVAL} ${EXTRA_ARGS:-}"
+ --watchdog-timeout 1800 --enable-metrics --kv-cache-dtype $KV_DTYPE $PRECISION_ARGS $SPEC_ARGS ${POOL:+--max-total-tokens $POOL} ${SWA_RATIO:+--swa-full-tokens-ratio $SWA_RATIO} ${PREFILL_DECODE_INTERVAL:+--prefill-decode-interval $PREFILL_DECODE_INTERVAL} ${EXTRA_ARGS:-}"
 }
 if [ $DRY = 1 ]; then for r in 0 1 2 3; do echo "== rank $r"; run_cmd $r || exit 1; echo; done; exit 0; fi
 echo "== preflight"; bad=""
