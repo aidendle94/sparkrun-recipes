@@ -82,7 +82,7 @@ off switch:
 | launcher variable (default) | what it does | cost |
 |---|---|---|
 | `KV_DTYPE=fp8_e4m3` | FP8 KV cache with a reader for SM12x: 1.9x the pool at the same speed | prefill NLL within 0.02 of BF16 |
-| `GATE=0.4` | verifies only the draft rows the draft is confident of: +15 % decode | greedy text moves at near-ties only, by less than a second request in the batch moves it |
+| `GATE=0.4` | verifies only the draft rows the draft is confident of: +15 % decode | greedy text changes only at near-ties; sharing a batch with a second request changes it more |
 | `DENSE_I8=draft,dhead,dfree` | the draft reads int8 copies of its own weights: +5 % | none for the target (held-out NLL identical); about 5 % of the pool |
 | `DENSE_P12=attn,head,free` | the target's attention weights packed into 12 bits without rounding: −4.5 % step time for one stream | none: exact |
 | `TP_SHARD=half,fp8` | every node holds all 384 experts at a quarter of their width instead of 96 whole ones, so no node waits for the busiest: −18 % step time | not bit-identical to the stock placement (rounding only; mean NLL unchanged) |
