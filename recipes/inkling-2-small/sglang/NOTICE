@@ -41,7 +41,10 @@ Adapted third-party code (modified for this recipe; the original notices apply t
     factors); and a binding source (SOURCE) written after FlashInfer's csrc/group_gemm_nvfp4_groupwise_sm120.cu and
     its instantiation template. The decode routine (DECODE) and the packed format (patches/scale_pack.py) were
     written for this recipe. The module a user builds is a derived work of both projects and links the CUDA
-    runtime: their terms apply to whoever passes it on.
+    runtime: their terms apply to whoever passes it on. The hooks image published from this recipe
+    (aidendle94/sparkrun-sglang-inkling2-gb10, from experimental-1.1) carries one such module, built by this script
+    from its own base image, at /opt/inkling2-spark/prebuilt/; the image also carries this NOTICE and the licence
+    texts it names, under /opt/inkling2-spark.
     FlashInfer's distribution carries a NOTICE file. Its attribution notices, which apply to the excerpts above:
     "FlashInfer / Copyright 2025-2026 NVIDIA / Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)".
     The other entries of that file name components (the KDA kernels and others) of which this recipe carries nothing.

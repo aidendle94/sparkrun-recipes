@@ -176,7 +176,7 @@ the target's dense weights without the 12-bit packing, both as before 2026-11-15
   memlock limit.
 - On rank 0: `bash`, `ssh`, `scp`, `curl`, `flock`, `nvidia-smi`, and Python 3 (standard library only) for `bench/`.
   The one-time build of step 2 of [Run it](#run-it) runs in the image and needs the node idle: several GB of
-  memory, and eight cores for about 40 s on a Spark.
+  memory, and eight cores for about 40 s on a Spark. With the hooks image, step 2 is a copy instead of a build.
 - Nothing else on the GPUs. The weights take 92–93 GB of each node, and the pool takes what is left.
 
 ## Run it
@@ -190,13 +190,12 @@ hf download thinkingmachines/Inkling-2-Small --revision b0e7afb8892a07897c78ce1c
 #    If the tag has moved since then and a boot fails in a hook, pull that digest and set INKLING_IMAGE to it.
 docker pull lmsysorg/sglang:dev-inkling-2-small
 #    Or that pinned build with this recipe's hooks already inside (one small layer on top, see the Dockerfile):
-#      docker pull aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.0
-#      export INKLING_IMAGE=aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.0     # before launching
+#      docker pull aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.1
+#      export INKLING_IMAGE=aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.1     # before launching
 #    The launcher runs either image. It mounts its own patches/ over the image's, so the two cannot drift apart.
-#    That tag was built on 2026-11-17, before the packed block scales, the stall recorder and the confidence
-#    head: its own /patches are the hooks of that day, and it holds neither the head file nor kernels/. Under
-#    the launcher it runs the current hooks all the same, because of that mount. It has passed a file and
-#    import check and has not been booted on a fleet; the measurements here used the upstream tag.
+#    This tag holds the hooks of this README, the confidence head's file, kernels/ and the prebuilt module of
+#    step 2. It has passed a file and import check and has not been booted on a fleet; the measurements here
+#    used the upstream tag.
 
 # 2. Once per image, on rank 0, with nothing serving on that node: build the forked grouped GEMM that reads the
 #    packed block scales (SCALE_PACK, a default). The build takes about 40 s on a Spark and no GPU, but several
@@ -208,6 +207,9 @@ docker run --rm --network none --memory 16g --cpus 8 \
   -v "$PWD/kernels/csf_gemm":/k:ro -v "$HOME/inkling2-csf-build":/out \
   --entrypoint /opt/sglang/bin/python3 lmsysorg/sglang:dev-inkling-2-small /k/build_csf_gemm.py /out
 cp "$HOME/inkling2-csf-build/spark_csf_gemm_sm120.so" patches/
+#    With the hooks image of step 1 there is nothing to build: copy its prebuilt module instead (no GPU, seconds).
+#      docker run --rm --entrypoint cat aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.1 \
+#        /opt/inkling2-spark/prebuilt/spark_csf_gemm_sm120.so > patches/spark_csf_gemm_sm120.so
 #    Without that file the launcher prints "note: patches/spark_csf_gemm_sm120.so is not built
 #    (kernels/csf_gemm/build_csf_gemm.py): the packing is off for this launch" and starts the stack without the
 #    packing: the same text, 3.0-3.4 GB less available memory on every node, one stream's step about 1 % shorter.
@@ -364,7 +366,7 @@ The top of `launch/launch-inkling2.sh` documents every launcher variable: the on
 | `launch/launch-inkling2.sh` | one container per node (`inkling2`), RoCE/NCCL environment, the hooks on PYTHONPATH; `--dry-run`, `--stop` |
 | `launch/relaunch-inkling2.sh` | disarm the watchdog, launch, wait for /health, re-arm the watchdog (use this to restart) |
 | `launch/watchdog-inkling2.sh` | probes and relaunches (log `~/inkling2-watchdog.log`); before a relaunch it saves every rank's state, stacks and stall evidence |
-| `Dockerfile` | the hooks image: the pinned base plus `patches/` on `PYTHONPATH`, published as `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.0` (no hook is switched on in it: the launcher's variables do that). The published tag was built on 2026-11-17 and holds the hooks of that day |
+| `Dockerfile` | the hooks image: the pinned base plus `patches/` on `PYTHONPATH`, published as `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.1` (no hook is switched on in it: the launcher's variables do that). It holds the hooks of this README, `kernels/` and the prebuilt module of step 2 |
 | `launch/fleet.env.example` | the site file; copy to `launch/fleet.env` (git-ignored) |
 | `patches/sitecustomize.py` | installs the hooks at interpreter start in every rank; the other `.py` files in `patches/` are the hooks |
 | `patches/gate-head-mlp-reg.pt` | the confidence head the launcher's `GATE_HEAD` names: a 256-unit MLP, 4.7 MB, sha256 `0bc7b3d52da6c1bd...`, read by `patches/spark_gate_head.py`. Trained for this recipe on the draft's hidden states (see [docs/results.md](docs/results.md)); no weight of the model is in it |
