@@ -3,7 +3,7 @@
 The working notes behind this recipe (2026-11-12 to 2026-11-21). First what the launcher starts and what took the
 fleet down: the defaults, two outages, the silent stall and its recorder. Then by subject: what the GB10 hooks do,
 the bug that produced garbage under concurrency, every decode lever with its numbers, the packed block scales, the
-confidence head for the gate, picture input, long contexts and multi-turn history, the reasoning loop on long lists, the KV
+confidence head for the gate, picture input, pre-sharded weights, long contexts and multi-turn history, the reasoning loop on long lists, the KV
 cache, the prefill switches, reasoning effort, and the first day's measurements. "Production" and "the fleet" mean
 the author's four Sparks; times are UTC. Each number is one boot on that fleet unless the text says otherwise. The
 launch scripts are in `launch/`, the tools in `bench/`, the hooks in `patches/`, the build script of the forked
@@ -929,6 +929,47 @@ Not done: the flash_attn variable-length kernel on SM12x (the per-picture attent
 engine refuses it: "Inkling2 supports text and images only"); the tool-call suite and long contexts with pictures.
 The encoder runs on rank 0 inside the prefill, so running decodes wait for it: about 0.28 s for each 2,048 px
 picture.
+
+## Pre-sharded weights (2026-11-21; `PRESHARDED=1` loads them, off by default)
+
+With `TP_SHARD` every rank holds a quarter of every expert's width and its share of the rest: 98.14 GB of
+parameters a rank (93 GiB on disk), of the 394 GB checkpoint. `patches/preshard.py` writes those parameters once
+per rank and loads them back, so that a node needs only its own folder.
+
+The cut is the end of the engine's copy loop inside `load_weights`, where each checkpoint tensor has gone through
+its parameter's weight loader (which slices out the rank's part) and nothing has been post-processed yet. Later
+steps keep running at every boot: the engine's own post-steps (scale swizzles, query scaling), then the hooks'
+attachments (12-bit packing, int8 draft copies) and the quant methods' post-processing (packed block scales).
+Saving after those steps would not work: the hooks keep their packed copies outside the model's parameters and
+shrink the originals to empty tensors, and SGLang's own `sharded_state` and `presharded` loaders save after
+post-processing.
+
+- Export (`SPARK_PRESHARD_EXPORT=<dir>`): the weights iterator is wrapped; when the loop asks for the item after the
+  last one, the rank writes its parameters (1,530 for the target, 64 for the draft) as safetensors parts of at most
+  2 GiB, the checkpoint names and dtypes the loop saw, the shaping switches and a checksum of every parameter.
+- Reload (`SPARK_PRESHARDED=1`): the loop gets those names with empty tensors of their dtypes while every weight
+  loader is a no-op (the loop checks names and dtypes only), so the engine's completeness check and post-steps run
+  unchanged; then the rank fills its parameters from its folder and compares the checksum with the export's.
+
+On the test fleet, one export boot and two boots from the folders:
+
+| | rank 0 | rank 1 | rank 2 | rank 3 |
+|---|---|---|---|---|
+| checksum of all parameters after the full load, official checkpoint | `4706a469…` | `ed72c157…` | `173c9dcd…` | `173e9e95…` |
+| the same, from the rank folder (both boots) | `4706a469…` | `ed72c157…` | `173c9dcd…` | `173e9e95…` |
+| fill from the folder, first reader | 667 s | 625 s | 646 s | 622 s |
+| fill from the folder, pinned-buffer reader | 122 s | 124 s | 96 s | 100 s |
+
+The first reader copied every tensor from pageable host memory to the GPU, which runs at about 150 MB/s on GB10;
+the export's writer had the same problem (288–632 s a rank). Both now go through two 256 MiB pinned buffers and
+write and read the safetensors format directly; the files stay standard safetensors (`bench/preshard_test.py`
+reads them back with the library). The boot from the folders took 241 s with the checksums on, against 222 s from
+the official checkpoint. Greedy text: the same on 16 of 16 questions as the boot from the official checkpoint, on
+both boots from the folders. `bench/image_check.py` 21 of 21 and `bench/concurrency_check.py` ALL OK on the first.
+
+The folders are tied to four ranks and to `TP_SHARD`, `TP_SHARD_FP8`, `TP_SHARD_HALF`, `FI_MOE` and `FI_MXFP8` as
+they were written; a reload refuses any difference, and any difference in the parameters' names, shapes or dtypes.
+A change to a hook that acts before the cut (the expert sharding) needs a new export.
 
 ## Long contexts and multi-turn history (2026-11-14)
 

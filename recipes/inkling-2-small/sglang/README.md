@@ -188,8 +188,9 @@ the target's dense weights without the 12-bit packing, both as before 2026-11-15
 - Four DGX Spark nodes (GB10, 128 GB unified memory, arm64). One of them is rank 0, and every script runs there.
 - A RoCE fabric between the nodes, switched or direct. The RDMA devices must be visible in
   `/sys/class/infiniband` on every node.
-- The checkpoint on the local disk of **every** node, 394 GB each. The launcher mounts each node's own copy. The
-  default place is the HuggingFace cache of the launching user; `INKLING_REPO_REL` in `launch/fleet.env` moves it.
+- The weights on the local disk of **every** node: the node's pre-sharded folder, about 93 GB, or the official
+  checkpoint, 394 GB. The launcher mounts each node's own copy. The default place is the HuggingFace cache of the
+  launching user; `INKLING_REPO_REL` in `launch/fleet.env` moves it.
   On a node that is serving something else, run the download under a memory limit (for example
   `systemd-run --user -p MemoryMax=4G hf download ...`): on GB10 the page cache competes with the GPU for memory.
 - About 37 GB on every node for the image.
@@ -204,20 +205,22 @@ the target's dense weights without the 12-bit packing, both as before 2026-11-15
 ## Run it
 
 ```bash
-# 0. The checkpoint, on every node, at the revision this recipe was measured on.
+# 0. The weights, on every node. Either each node's own pre-sharded folder from this variant's weights repository
+#    (about 93 GB a node; see "Pre-sharded weights" below), on node R:
+#      hf download aidendle94/Inkling-2-Small-DGX-Spark --include "rank<R>/*" --local-dir ~/inkling2-weights
+#      export PRESHARDED=1 INKLING_REPO_REL=inkling2-weights      # on rank 0, before launching (or in launch/fleet.env)
+#    or the official checkpoint, 394 GB on every node, at the revision this recipe was measured on:
 hf download thinkingmachines/Inkling-2-Small --revision b0e7afb8892a07897c78ce1c5b801a0d9cbd5e7b
-#    Or the weights repository of this variant: the same files byte for byte, plus the confidence head
-#    (spark/gate-head-mlp-reg.pt, the file that patches/ also carries). Then tell the launcher where they are:
-#      hf download aidendle94/Inkling-2-Small-DGX-Spark --local-dir ~/inkling2-weights
-#      export INKLING_REPO_REL=inkling2-weights INKLING_SNAP=.      # or put both in launch/fleet.env
+#    (the weights repository's full/ folder holds the same files: --include "full/*", then INKLING_REPO_REL=inkling2-weights
+#    INKLING_SNAP=full).
 
 # 1. The image, on every node (arm64). The hooks are written against this build of the tag:
 #    lmsysorg/sglang@sha256:424c1da97f6d6eef1612006c77b2ca791657a8184c1fbdbc682ebf9485d3b32c  (2026-11-12)
 #    If the tag has moved since then and a boot fails in a hook, pull that digest and set INKLING_IMAGE to it.
 docker pull lmsysorg/sglang:dev-inkling-2-small
 #    Or that pinned build with this recipe's hooks already inside (one small layer on top, see the Dockerfile):
-#      docker pull aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.3
-#      export INKLING_IMAGE=aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.3     # before launching
+#      docker pull aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.4
+#      export INKLING_IMAGE=aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.4     # before launching
 #    The launcher runs either image. It mounts its own patches/ over the image's, so the two cannot drift apart.
 #    This tag holds the hooks of this README, the confidence head's file, kernels/ and the prebuilt module of
 #    step 2. It has passed a file and import check and has not been booted on a fleet; the measurements here
@@ -234,7 +237,7 @@ docker run --rm --network none --memory 16g --cpus 8 \
   --entrypoint /opt/sglang/bin/python3 lmsysorg/sglang:dev-inkling-2-small /k/build_csf_gemm.py /out
 cp "$HOME/inkling2-csf-build/spark_csf_gemm_sm120.so" patches/
 #    With the hooks image of step 1 there is nothing to build: copy its prebuilt module instead (no GPU, seconds).
-#      docker run --rm --entrypoint cat aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.3 \
+#      docker run --rm --entrypoint cat aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.4 \
 #        /opt/inkling2-spark/prebuilt/spark_csf_gemm_sm120.so > patches/spark_csf_gemm_sm120.so
 #    Without that file the launcher prints "note: patches/spark_csf_gemm_sm120.so is not built
 #    (kernels/csf_gemm/build_csf_gemm.py): the packing is off for this launch" and starts the stack without the
@@ -340,6 +343,29 @@ The top of `launch/launch-inkling2.sh` documents every launcher variable: the on
 `MAXREQ`, `CHUNK`, `SERVED`, `SERVED_ALIASES`, `MTP`, `ROCE_AR`, `FI_MOE`, `PAGED_DECODE`). Leave
 `PAGED_DECODE=1`.
 
+## Pre-sharded weights
+
+With the default layout every node uses about 93 GB of the 394 GB checkpoint: a quarter of every expert's width
+(`TP_SHARD`) and its share of the rest. The weights repository
+[aidendle94/Inkling-2-Small-DGX-Spark](https://huggingface.co/aidendle94/Inkling-2-Small-DGX-Spark) holds those
+93 GB once per rank, in `rank0/` to `rank3/`, so a node downloads and stores only its own folder. `PRESHARDED=1`
+makes every rank load `$INKLING_REPO_REL/rank<R>` (`patches/preshard.py`).
+
+The folders hold each rank's parameters as the engine's copy loop leaves them, before any post-processing: the
+rank's slices of the official checkpoint, byte for byte, written by an export boot
+(`SPARK_PRESHARD_EXPORT=<dir>` in `NCCL_EXTRA`). Every step after the copy loop still runs at boot: the engine's own
+post-steps, the 12-bit packing, the int8 draft copies and the packed block scales. On a reload each rank checks
+its folder's rank, the node count and the switches that shape the weights (`TP_SHARD`, `TP_SHARD_FP8`,
+`TP_SHARD_HALF`, `FI_MOE`, `FI_MXFP8`), then a checksum of every parameter against the export's, and refuses to
+boot on any difference. So the folders work only with four nodes and those switches at their defaults; for
+anything else, use the official checkpoint (or `full/` in the same repository).
+
+Measured on the test fleet (2026-11-21): on all four ranks the checksum of every parameter after the full load,
+post-processing included, was equal on a boot from the folders and on a boot from the official checkpoint
+(`SPARK_PRESHARD_CHECK=1` logs it); greedy text was the same on 16 of 16 questions; `bench/image_check.py` and
+`bench/concurrency_check.py` passed. A rank fills its weights from its folder in 96–124 s, and the boot took
+241 s with the checks on (222 s from the official checkpoint). `bench/preshard_test.py` checks the hook on the CPU.
+
 ## Using it as a client
 
 - **Temperature.** A chat or messages request without a `temperature` is sampled at 1.0 (the engine's default for
@@ -419,7 +445,7 @@ The top of `launch/launch-inkling2.sh` documents every launcher variable: the on
 | `launch/launch-inkling2.sh` | one container per node (`inkling2`), RoCE/NCCL environment, the hooks on PYTHONPATH; `--dry-run`, `--stop` |
 | `launch/relaunch-inkling2.sh` | disarm the watchdog, launch, wait for /health, re-arm the watchdog (use this to restart) |
 | `launch/watchdog-inkling2.sh` | probes and relaunches (log `~/inkling2-watchdog.log`); before a relaunch it saves every rank's state, stacks and stall evidence |
-| `Dockerfile` | the hooks image: the pinned base plus `patches/` on `PYTHONPATH`, published as `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.3` (no hook is switched on in it: the launcher's variables do that). It holds the hooks of this README, `kernels/` and the prebuilt module of step 2 |
+| `Dockerfile` | the hooks image: the pinned base plus `patches/` on `PYTHONPATH`, published as `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.4` (no hook is switched on in it: the launcher's variables do that). It holds the hooks of this README, `kernels/` and the prebuilt module of step 2 |
 | `launch/fleet.env.example` | the site file; copy to `launch/fleet.env` (git-ignored) |
 | `patches/sitecustomize.py` | installs the hooks at interpreter start in every rank; the other `.py` files in `patches/` are the hooks |
 | `patches/gate-head-mlp-reg.pt` | the confidence head the launcher's `GATE_HEAD` names: a 256-unit MLP, 4.7 MB, sha256 `0bc7b3d52da6c1bd...`, read by `patches/spark_gate_head.py`. Trained for this recipe on the draft's hidden states (see [docs/results.md](docs/results.md)); no weight of the model is in it |
@@ -429,6 +455,7 @@ The top of `launch/launch-inkling2.sh` documents every launcher variable: the on
 | `patches/conf_capture.py`, `bench/conf_capture_run.py`, `bench/conf_capture_check.py`, `bench/conf_capture_rank_check.py`, `bench/conf_capture_align_check.py`, `bench/conf_capture_test.py` | training data for a confidence head: the recorder (capture windows only), its load generator, the checks of a capture, the recorder's CPU test |
 | `bench/conf_head_train.py`, `bench/conf_head_selftest.py`, `bench/cc_build_features.py`, `bench/cc_lab.py`, `bench/cc-run.sh`, `bench/exp_base.py`, `bench/exp_combo.py`, `bench/cc_count_ops.py` | training a head, CPU only: the first trainer and its self-test; the harness (features, folds, gate rules, the simulation, one capped container a node), the baselines, the script every head of the results comes from, operation counts |
 | `bench/cc_export_head.py`, `bench/gate_head_test.py`, `bench/gate_head_capture_check.py`, `bench/gate_run.py`, `bench/gate_ab_report.py` | from a trained head to the engine: the export with its parity check, CPU checks of the engine code, a test boot's recorded rows against a recomputation, the A/B inside one boot (`gate_run.py --head`) and its summary |
+| `patches/preshard.py`, `bench/preshard_test.py` | pre-sharded weights (`PRESHARDED`, `SPARK_PRESHARD_EXPORT`, `SPARK_PRESHARD_CHECK`): a rank folder written at the end of the engine's copy loop and loaded from there, checksummed; the hook's CPU test |
 | `patches/vision_sm12x.py` | picture input on GB10 (`IMAGES`): the encoder's attention, the size cap, the lean path of a picture's data through the engine |
 | `bench/image_check.py`, `bench/make_test_images.py` | pictures with known content over every endpoint, answers checked (safe on a serving fleet); the pictures, drawn in the image |
 | `bench/image_stress.py`, `bench/make_stress_images.py` | very large, odd and broken pictures, many at once, the server's health after each (planned windows) |

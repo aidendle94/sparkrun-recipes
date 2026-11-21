@@ -1034,6 +1034,25 @@ if _KERNEL_LOAD_GUARD:
         import kernel_load_guard
         kernel_load_guard.install(mod, int(_KERNEL_LOAD_GUARD))
 
+# SPARK_PRESHARD_EXPORT=<dir> / SPARK_PRESHARDED=1 / SPARK_PRESHARD_CHECK=1 (unset = off): pre-sharded weights, one
+# folder per rank (patches/preshard.py): written at the end of the engine's copy loop, loaded from there, checksummed.
+if (os.environ.get("SPARK_PRESHARD_EXPORT") or os.environ.get("SPARK_PRESHARDED") == "1"
+        or os.environ.get("SPARK_PRESHARD_CHECK") == "1"):
+    @_on_import("sglang.srt.models.inkling2")
+    def preshard_target_bind(mod):
+        import preshard
+        preshard.install_target(mod)
+
+    @_on_import("sglang.srt.models.inkling2_mtp")
+    def preshard_draft_bind(mod):
+        import preshard
+        preshard.install_draft(mod)
+
+    @_on_import("sglang.srt.model_loader.loader")
+    def preshard_loader_bind(mod):
+        import preshard
+        preshard.install_loader(mod)
+
 # SPARK_VISION=1 (with --enable-multimodal; unset = off): image input on GB10. The engine's vision attention refuses
 # GPUs that are not compute capability 9 or 10; patches/vision_sm12x.py runs the engine's per-image SDPA there.
 if os.environ.get("SPARK_VISION") == "1":
