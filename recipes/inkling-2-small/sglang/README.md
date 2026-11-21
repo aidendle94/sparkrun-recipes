@@ -206,14 +206,18 @@ the target's dense weights without the 12-bit packing, both as before 2026-11-15
 ```bash
 # 0. The checkpoint, on every node, at the revision this recipe was measured on.
 hf download thinkingmachines/Inkling-2-Small --revision b0e7afb8892a07897c78ce1c5b801a0d9cbd5e7b
+#    Or the weights repository of this variant: the same files byte for byte, plus the confidence head
+#    (spark/gate-head-mlp-reg.pt, the file that patches/ also carries). Then tell the launcher where they are:
+#      hf download aidendle94/Inkling-2-Small-DGX-Spark --local-dir ~/inkling2-weights
+#      export INKLING_REPO_REL=inkling2-weights INKLING_SNAP=.      # or put both in launch/fleet.env
 
 # 1. The image, on every node (arm64). The hooks are written against this build of the tag:
 #    lmsysorg/sglang@sha256:424c1da97f6d6eef1612006c77b2ca791657a8184c1fbdbc682ebf9485d3b32c  (2026-11-12)
 #    If the tag has moved since then and a boot fails in a hook, pull that digest and set INKLING_IMAGE to it.
 docker pull lmsysorg/sglang:dev-inkling-2-small
 #    Or that pinned build with this recipe's hooks already inside (one small layer on top, see the Dockerfile):
-#      docker pull aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.2
-#      export INKLING_IMAGE=aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.2     # before launching
+#      docker pull aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.3
+#      export INKLING_IMAGE=aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.3     # before launching
 #    The launcher runs either image. It mounts its own patches/ over the image's, so the two cannot drift apart.
 #    This tag holds the hooks of this README, the confidence head's file, kernels/ and the prebuilt module of
 #    step 2. It has passed a file and import check and has not been booted on a fleet; the measurements here
@@ -230,7 +234,7 @@ docker run --rm --network none --memory 16g --cpus 8 \
   --entrypoint /opt/sglang/bin/python3 lmsysorg/sglang:dev-inkling-2-small /k/build_csf_gemm.py /out
 cp "$HOME/inkling2-csf-build/spark_csf_gemm_sm120.so" patches/
 #    With the hooks image of step 1 there is nothing to build: copy its prebuilt module instead (no GPU, seconds).
-#      docker run --rm --entrypoint cat aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.2 \
+#      docker run --rm --entrypoint cat aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.3 \
 #        /opt/inkling2-spark/prebuilt/spark_csf_gemm_sm120.so > patches/spark_csf_gemm_sm120.so
 #    Without that file the launcher prints "note: patches/spark_csf_gemm_sm120.so is not built
 #    (kernels/csf_gemm/build_csf_gemm.py): the packing is off for this launch" and starts the stack without the
@@ -415,7 +419,7 @@ The top of `launch/launch-inkling2.sh` documents every launcher variable: the on
 | `launch/launch-inkling2.sh` | one container per node (`inkling2`), RoCE/NCCL environment, the hooks on PYTHONPATH; `--dry-run`, `--stop` |
 | `launch/relaunch-inkling2.sh` | disarm the watchdog, launch, wait for /health, re-arm the watchdog (use this to restart) |
 | `launch/watchdog-inkling2.sh` | probes and relaunches (log `~/inkling2-watchdog.log`); before a relaunch it saves every rank's state, stacks and stall evidence |
-| `Dockerfile` | the hooks image: the pinned base plus `patches/` on `PYTHONPATH`, published as `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.2` (no hook is switched on in it: the launcher's variables do that). It holds the hooks of this README, `kernels/` and the prebuilt module of step 2 |
+| `Dockerfile` | the hooks image: the pinned base plus `patches/` on `PYTHONPATH`, published as `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.3` (no hook is switched on in it: the launcher's variables do that). It holds the hooks of this README, `kernels/` and the prebuilt module of step 2 |
 | `launch/fleet.env.example` | the site file; copy to `launch/fleet.env` (git-ignored) |
 | `patches/sitecustomize.py` | installs the hooks at interpreter start in every rank; the other `.py` files in `patches/` are the hooks |
 | `patches/gate-head-mlp-reg.pt` | the confidence head the launcher's `GATE_HEAD` names: a 256-unit MLP, 4.7 MB, sha256 `0bc7b3d52da6c1bd...`, read by `patches/spark_gate_head.py`. Trained for this recipe on the draft's hidden states (see [docs/results.md](docs/results.md)); no weight of the model is in it |
