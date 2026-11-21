@@ -6,8 +6,8 @@ one OpenAI-compatible endpoint. The engine is the SGLang team's own image for th
 `lmsysorg/sglang:dev-inkling-2-small`, unmodified. That image targets Hopper and datacenter Blackwell. On a Spark's
 GB10 (SM12x) it does not serve the model as it is. The MIT-licensed Python hooks in `patches/` are copied to every
 node and put on `PYTHONPATH`. They supply what GB10 needs (attention arguments, expert kernels, collectives across
-four nodes, a correct decode kernel at page size 1) and then the speed: about 61 tok/s for one stream, against 37
-with the image's own decode step on the same hardware.
+four nodes, a correct decode kernel at page size 1, the vision encoder's attention) and then the speed: 55–56 tok/s
+for one stream at temperature 1.0 with the defaults. The model takes text and pictures.
 
 **Status: experimental.**
 
@@ -17,7 +17,8 @@ with the image's own decode step on the same hardware.
   packed block scales is compiled from it once per image. Each stops if that source has changed.
 - Every number is a single boot on that fleet. The defaults are recent: the sharded experts since 2026-11-15, the
   500K configuration (524,288 tokens of context, the 793,000-token pool, the three prefill switches) since
-  2026-11-17, the packed block scales since 2026-11-19, the confidence head since 2026-11-20.
+  2026-11-17, the packed block scales since 2026-11-19, the confidence head since 2026-11-20, picture input since
+  2026-11-21.
 - Open problems are listed under [Known problems](#known-problems). One is a silent stall of the whole fleet whose
   cause is not known.
 
@@ -38,13 +39,17 @@ on the 600,000-token pool without the prefill switches; a row that was measured 
 the 793,000-token pool says so. Two of the four newest switches are the kernel switches of 2026-11-17 against
 kernels compiled and loaded while serving; they are exact and have no row. The other two are the packed block
 scales (2026-11-19) and the confidence head (2026-11-20); they have a row each, measured against the configuration
-without them. The conditions and the record of each number are in [docs/results.md](docs/results.md).
+without them. The first three rows and the picture rows were measured on 2026-11-21 with all defaults. Speed is
+quoted at temperature 1.0, the standard way to run the model; the greedy rows (temperature 0) are there to compare
+with older measurements. The conditions and the record of each number are in [docs/results.md](docs/results.md).
 
 | what | measured |
 |---|---|
-| decode, one stream, greedy, coding questions of 400 tokens | 60–61 tok/s (37 with the image's own decode step, on another set of such questions) |
+| decode, one stream, temperature 1.0, 16 coding questions of 400 tokens | 55–56 tok/s (54.94 and 56.31 on two boots, without and with picture input) |
+| decode, four / eight streams at a time, temperature 1.0 | 92–107 / 131–137 tok/s for the batch (about 25 / 17 a stream), on the same two boots |
+| decode, one stream, greedy, coding questions of 400 tokens (for comparison) | 60–61 tok/s; 37 with the image's own decode step, on another set of such questions |
 | decode, one stream, temperature 0.7 | 56.6 tok/s |
-| decode, four / eight streams at a time, greedy | 106 / 130 tok/s for the batch (about 26 / 16 a stream) |
+| decode, four / eight streams at a time, greedy (for comparison) | 106 / 130 tok/s for the batch (about 26 / 16 a stream) |
 | decode, one stream, greedy, with the confidence head (the default since 2026-11-20; a test boot and the serving boot after it, 16 coding questions of 400 tokens) | 61.64 tok/s on the test boot and 61.79 on the serving boot, against 60.41 and 60.81 on the boots without it before and after (60.61 on average): x1.017 and x1.019, net of the head's own cost. These are medians over the 16 questions; the step time at equal accept is 1.5 % and 1.2 % lower. Those comparison boots carry the packed block scales, which cost about 1 % of a step. The boots of 2026-11-19 with neither default ran 61.31 and 60.95 tok/s, so for one greedy stream the two newest defaults together are about level with the stack before them (the serving boot against them: x1.008 and x1.014). Inside the test boot, on a mixed set of 16 short prompts (8 of those coding questions, 8 general ones) run back to back under the head and under the gate's own rule: x1.023 greedy and x1.050 at temperature 1.0, not net (both arms carried the head's cost); net at temperature 1.0 was not measured (about x1.036 estimated) |
 | memory with the packed block scales (the default since 2026-11-19) | 3.0–3.4 GB more available on every node; the same text and the same NLL token for token. One stream's step is about 1 % longer (0.5 to 0.7 ms on three boots) |
 | prefill, ~15K-token prompts | 2,400–2,500 tok/s (before the prefill switches; not measured again with them) |
@@ -56,7 +61,10 @@ without them. The conditions and the record of each number are in [docs/results.
 | concurrent requests | 8 |
 | tool calls, 283 cases over five wire formats (chat, Anthropic messages, each also streamed, and responses), two trials | 250 right, 20 soft, 13 failed (10 are `tool_choice: none`, 3 slips on the sampled trial); 12 of 12 agent loops. With the prefill switches (the defaults): 252 / 20 / 11, and no case of the temperature-0 trial changed its verdict |
 | boot to healthy | about 5 min with a warm kernel cache, about 17 min the first time |
-| request features | tool calls, reasoning with effort levels; OpenAI chat completions and responses, Anthropic `/v1/messages`; extra model names on `/v1/models` and the Ollama-style `/api/tags` and `/api/show` |
+| pictures, one request | 1.2–1.6 s for a 1,400 px wide text picture (455 picture tokens), 3.2 s for a 4,096 x 4,096 one (downscaled to 2,048 x 2,048: 2,736 prompt tokens), each with 60–80 answer tokens at reasoning effort `low` |
+| pictures, many at once | 8 pictures of 4,096 x 4,096 at once: 5.0–6.7 s for all, 0.7–0.9 GB of the rank-0 node's memory; 16: 9.1–10.3 s, 0.85–1.0 GB |
+| decode with picture input on | the same as without it at temperature 1.0: one stream 56.31 against 54.94 tok/s (−0.53 ms a step at equal accept, se 0.38), the batch of 4 and 8 streams within the spread of the boot without it. Greedy: the same text on 16 of 16 questions |
+| request features | text and pictures (PNG, JPEG, WebP and other formats Pillow reads); tool calls, reasoning with effort levels; OpenAI chat completions and responses, Anthropic `/v1/messages`; extra model names on `/v1/models` and the Ollama-style `/api/tags` and `/api/show` |
 
 Decode tok/s is tokens divided by decode seconds, taken from the server's own timing. For comparison, the hosted
 model on OpenRouter answered the same long lookups at 190–320 tok/s, depending on the provider. This recipe runs on
@@ -75,6 +83,9 @@ make it work on GB10 at all:
 - **Experts**: the image's NVFP4 kernels are SM100-only. `patches/fi_moe.py` runs the 40 NVFP4 expert layers on
   FlashInfer's SM120 grouped GEMM with the checkpoint's weights (prefill goes from about 440 to about 2,000 tok/s).
 - **Collectives**: the model's all-reduces assume NVLink. Here they go over RoCE (`patches/roce_collectives.py`).
+- **Pictures**: the image's vision encoder refuses GPUs other than compute capability 9 and 10, so the first request
+  with a picture fails on GB10. `patches/vision_sm12x.py` runs the encoder's attention with the engine's own
+  per-picture fallback (see `IMAGES` below).
 
 The following make it faster or larger. All are launcher variables, all are on by default, and each has its own
 off switch:
@@ -145,6 +156,16 @@ the numbers of the packing are in
 How the head was trained, its test boot and what that boot did not measure are in
 [the section after it](docs/results.md#a-confidence-head-for-the-gate-2026-11-1920-the-launchers-default-since-2026-11-20-1147-utc-gate_head-turns-it-off).
 
+And picture input (the default since 2026-11-21). It adds the encoder's weights and keeps a burst of large pictures
+within the memory that the rank-0 node has to spare:
+
+| launcher variable (default) | what it does | cost |
+|---|---|---|
+| `IMAGES=1` (`--enable-multimodal`, `SPARK_VISION`) | pictures on every endpoint. The encoder's attention runs as one fused PyTorch attention call per picture instead of the image's flash-attention kernel, which needs SM90 or SM100: as close to float32 as the engine's own BF16 path (`bench/vision_check.py`). The picture data travels through the engine at half its size, at most two pictures are prepared at a time, and the encoder runs in groups: for 8 pictures of 4,096 x 4,096 at once the tokenizer process peaked at 2.2 GB instead of 4.5 GB. A broken picture is refused with HTTP 400 | about 0.66 GB of GPU memory a node for the encoder; the pool and text decode unchanged. The encoder runs on rank 0 inside the prefill, and running decodes wait for it: 0.28 s for a 2,048 px picture |
+| `IMAGE_MAX_EDGE` (empty = 2,048; `SPARK_VISION_MAX_EDGE`) | a picture whose long side is larger is downscaled to it before encoding (Lanczos). `4096` is the model card's limit; `0` is no limit | at 4,096 px a picture is about 10,600 prompt tokens and 2.7 s of encoder time, and 8 at once took 4.7 GB of the rank-0 node's memory instead of 0.9 GB. On the reading tests, print 15 px tall read as well at 2,048 as at 4,096 |
+
+The tests, the memory and what was not tested are in [docs/results.md](docs/results.md#picture-input-2026-11-2021-the-launchers-default-since-2026-11-21-images-turns-it-off).
+
 One more change is not a launcher switch: the stall recorder (since 2026-11-18). Every rank logs what it is
 waiting for when a forward does not return or the scheduler stops making forwards (`[stall]` lines;
 `SPARK_STALL_DUMP`, 60 s by default). Every rank also prints a running checksum of its forwards, which must be
@@ -157,7 +178,8 @@ Every switch of these tables is turned off by setting it empty on the relaunch (
 pool). The switches are independent of each other, with four exceptions: `FI_MXFP8` does nothing without `fp8` in
 `TP_SHARD`, `DRAFT_KV_FP8` does nothing without the FP8 KV cache, `SCALE_PACK` needs `TP_SHARD`, and `GATE_HEAD`
 needs `GATE`. In the last two cases the launcher turns the switch off and says so. Lever by lever, an empty
-setting leaves you with: the gate's own rule (`GATE_HEAD=`); the block scales as loaded (`SCALE_PACK=`); prefill
+setting leaves you with: text only (`IMAGES=`); the gate's own rule (`GATE_HEAD=`); the block scales as loaded
+(`SCALE_PACK=`); prefill
 without the three prefill switches (`PREFILL_GLUE= BIAS_FAR= FI_MXFP8=`); the experts in the stock placement and
 the target's dense weights without the 12-bit packing, both as before 2026-11-15 (`TP_SHARD= DENSE_P12=`).
 
@@ -190,8 +212,8 @@ hf download thinkingmachines/Inkling-2-Small --revision b0e7afb8892a07897c78ce1c
 #    If the tag has moved since then and a boot fails in a hook, pull that digest and set INKLING_IMAGE to it.
 docker pull lmsysorg/sglang:dev-inkling-2-small
 #    Or that pinned build with this recipe's hooks already inside (one small layer on top, see the Dockerfile):
-#      docker pull aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.1
-#      export INKLING_IMAGE=aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.1     # before launching
+#      docker pull aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.2
+#      export INKLING_IMAGE=aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.2     # before launching
 #    The launcher runs either image. It mounts its own patches/ over the image's, so the two cannot drift apart.
 #    This tag holds the hooks of this README, the confidence head's file, kernels/ and the prebuilt module of
 #    step 2. It has passed a file and import check and has not been booted on a fleet; the measurements here
@@ -208,7 +230,7 @@ docker run --rm --network none --memory 16g --cpus 8 \
   --entrypoint /opt/sglang/bin/python3 lmsysorg/sglang:dev-inkling-2-small /k/build_csf_gemm.py /out
 cp "$HOME/inkling2-csf-build/spark_csf_gemm_sm120.so" patches/
 #    With the hooks image of step 1 there is nothing to build: copy its prebuilt module instead (no GPU, seconds).
-#      docker run --rm --entrypoint cat aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.1 \
+#      docker run --rm --entrypoint cat aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.2 \
 #        /opt/inkling2-spark/prebuilt/spark_csf_gemm_sm120.so > patches/spark_csf_gemm_sm120.so
 #    Without that file the launcher prints "note: patches/spark_csf_gemm_sm120.so is not built
 #    (kernels/csf_gemm/build_csf_gemm.py): the packing is off for this launch" and starts the stack without the
@@ -241,9 +263,22 @@ docker logs inkling2 2>&1 | grep -E 'scale_pack\] forked GEMM|gate head\]|\[gate
 curl -s http://<rank-0>:8210/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model":"inkling-2-small","messages":[{"role":"user","content":"Is 91 prime?"}],"max_tokens":400}'
 
+#    And one with a picture (picture.png is any PNG of yours; for a JPEG, write image/jpeg). printf is a shell
+#    builtin, so a large picture does not hit the length limit of a command's argument.
+printf '{"model":"inkling-2-small","max_tokens":800,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,%s"}},{"type":"text","text":"What is in this picture?"}]}]}' \
+  "$(base64 -w0 picture.png)" > request.json
+curl -s http://<rank-0>:8210/v1/chat/completions -H 'content-type: application/json' -d @request.json
+
 # 8. Read the text of overlapping requests. Do this after every boot of a changed configuration, because a
 #    broken decode path looks fast and healthy in every counter.
 mkdir -p logs && python3 bench/concurrency_check.py && python3 bench/reasoning_cache_check.py --expect on
+
+# 9. Pictures with known content, drawn in the image (it has Pillow), then asked over every endpoint. The answers
+#    are checked; expect "21 of 21 passed". bench/make_stress_images.py and bench/image_stress.py do the same for
+#    very large, odd and broken pictures (planned windows: a 4,096 x 4,096 picture costs every node seconds).
+mkdir -p logs/test_images && docker run --rm --network none -v "$PWD/logs/test_images":/o -v "$PWD/bench":/b:ro \
+  --entrypoint /opt/sglang/bin/python3 lmsysorg/sglang:dev-inkling-2-small /b/make_test_images.py /o
+python3 bench/image_check.py
 ```
 
 With nothing set, the launcher starts the 500K configuration: 524,288 tokens of context, `MEMFRAC=0.94`, a pool
@@ -253,15 +288,16 @@ it takes the next one, so requests that are already decoding keep getting tokens
 request still waits for the whole prefill ahead of it. The setting was not measured against a boot without it.
 `PREFILL_DECODE_INTERVAL=` leaves the scheduling to the engine. On top of that configuration come the two kernel
 switches of 2026-11-17 (`STABLE_KERNELS`, `KERNEL_LOAD_GUARD`), the packed block scales (since 2026-11-19, if the
-module of step 2 is built) and the confidence head (since 2026-11-20).
+module of step 2 is built), the confidence head (since 2026-11-20) and picture input (since 2026-11-21).
 
-Each of the two newest defaults has a rollback line. `GATE_HEAD=` takes exactly the head's variable out of the
-four `docker run` commands, and `SCALE_PACK=` takes out exactly the packing's two. With both empty, the commands
-are those of the launcher before 2026-11-19, token for token (dry-runs compared):
+Each of the three newest defaults has a rollback line. `IMAGES=` takes exactly the picture input's three settings
+out of the four `docker run` commands, `GATE_HEAD=` the head's variable, and `SCALE_PACK=` the packing's two. With
+all three empty, the commands are those of the launcher before 2026-11-19, token for token (dry-runs compared):
 
 ```bash
-GATE_HEAD= launch/relaunch-inkling2.sh               # the gate's own rule: the stack before 2026-11-20
-SCALE_PACK= GATE_HEAD= launch/relaunch-inkling2.sh   # and the block scales as loaded: the stack before 2026-11-19
+IMAGES= launch/relaunch-inkling2.sh                          # text only: the stack before 2026-11-21
+IMAGES= GATE_HEAD= launch/relaunch-inkling2.sh               # and the gate's own rule: the stack before 2026-11-20
+IMAGES= SCALE_PACK= GATE_HEAD= launch/relaunch-inkling2.sh   # and the block scales as loaded: before 2026-11-19
 ```
 
 The cap goes with the pool settings. The same bytes hold 716,000 tokens with `DRAFT_KV_FP8=` and 600,000 with
@@ -274,16 +310,16 @@ Earlier configurations with the current launcher:
 
 ```bash
 # The 600,000-token pool without the prefill switches: what most rows of the table above were measured on.
-SCALE_PACK= GATE_HEAD= SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= \
+IMAGES= SCALE_PACK= GATE_HEAD= SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= BIAS_FAR= FI_MXFP8= \
   launch/relaunch-inkling2.sh
 
 # The defaults before 2026-11-17: 262,144 tokens of context, a pool sized at each boot, the engine's scheduling.
-SCALE_PACK= GATE_HEAD= CTX=262144 MEMFRAC=0.93 POOL= SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= PREFILL_GLUE= \
-  BIAS_FAR= FI_MXFP8= PREFILL_DECODE_INTERVAL= launch/relaunch-inkling2.sh
+IMAGES= SCALE_PACK= GATE_HEAD= CTX=262144 MEMFRAC=0.93 POOL= SWA_RATIO= WMARK_BOOST= DRAFT_KV_FP8= \
+  PREFILL_GLUE= BIAS_FAR= FI_MXFP8= PREFILL_DECODE_INTERVAL= launch/relaunch-inkling2.sh
 ```
 
-Both lines switch the two newest defaults off (`SCALE_PACK= GATE_HEAD=`). Without that, the two would run on top
-of the older configuration. The two kernel switches of 2026-11-17 (`STABLE_KERNELS`, `KERNEL_LOAD_GUARD`) stay on
+Both lines switch the three newest defaults off (`IMAGES= SCALE_PACK= GATE_HEAD=`). Without that, the three would
+run on top of the older configuration. The two kernel switches of 2026-11-17 (`STABLE_KERNELS`, `KERNEL_LOAD_GUARD`) stay on
 in both lines on purpose: they are exact and they keep the fleet up. With `STABLE_KERNELS= KERNEL_LOAD_GUARD=` in
 front as well, the lines give the commands of their day token for token (dry-runs compared).
 
@@ -317,6 +353,12 @@ The top of `launch/launch-inkling2.sh` documents every launcher variable: the on
   does.
 - **`tool_choice: none`** does not work: the model writes the call as text. Leave the tools out of the request
   instead.
+- **Pictures** go in a user (or tool) message as an `image_url` part with a base64 data URL or an http(s) URL, or
+  as an `image` block on `/v1/messages`. The server fetches an http(s) URL itself. Paths and `file://` URLs are
+  refused. A picture of w x h pixels costs ceil(w/40) x ceil(h/40) prompt tokens. The server downscales a
+  picture whose long side is over 2,048 px to 2,048 (`IMAGE_MAX_EDGE`), so one picture costs at most about 2,700
+  tokens. A picture that cannot be read returns HTTP 400. So does any picture while the rank-0 node has less than
+  3 GB of memory available; retry after a moment. Video is not supported.
 
 ## Known problems
 
@@ -340,6 +382,13 @@ The top of `launch/launch-inkling2.sh` documents every launcher variable: the on
   built and its gain is an estimate. That the head leaves sampled output exact rests, as for the gate itself, on
   how the engine's accept treats the capped row. A second reading of the engine's code confirmed that, and no test
   pins it. `GATE_HEAD=` goes back to the gate's own rule.
+- **Pictures stop the batch while they are encoded.** The encoder runs on rank 0 inside the prefill, so running
+  decodes wait for it: about 0.28 s for each 2,048 px picture, 2.7 s at 4,096 px. Short picture prompts (200 to
+  330 tokens) reuse little of the prefix cache when the question changes; large pictures reuse nearly all of
+  it. Not tested with pictures: the tool-call suite and long contexts.
+- **The server fetches picture URLs.** A request can make the rank-0 node fetch any http(s) URL that it can reach,
+  including addresses on the fleet's own network. Expose the endpoint only to clients you trust, or set
+  `IMAGES=` for text only.
 - **A short request waits behind a long prefill.** It waits for the whole prefill: 338 s behind a 500K one.
 - **The reasoning loop on long lists.** At 130K tokens of near-identical record lines, about 1 lookup in 10 runs
   out of tokens while copying the list in its reasoning (0 at 60K, 0 on source code). This is the model's own
@@ -366,7 +415,7 @@ The top of `launch/launch-inkling2.sh` documents every launcher variable: the on
 | `launch/launch-inkling2.sh` | one container per node (`inkling2`), RoCE/NCCL environment, the hooks on PYTHONPATH; `--dry-run`, `--stop` |
 | `launch/relaunch-inkling2.sh` | disarm the watchdog, launch, wait for /health, re-arm the watchdog (use this to restart) |
 | `launch/watchdog-inkling2.sh` | probes and relaunches (log `~/inkling2-watchdog.log`); before a relaunch it saves every rank's state, stacks and stall evidence |
-| `Dockerfile` | the hooks image: the pinned base plus `patches/` on `PYTHONPATH`, published as `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.1` (no hook is switched on in it: the launcher's variables do that). It holds the hooks of this README, `kernels/` and the prebuilt module of step 2 |
+| `Dockerfile` | the hooks image: the pinned base plus `patches/` on `PYTHONPATH`, published as `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.2` (no hook is switched on in it: the launcher's variables do that). It holds the hooks of this README, `kernels/` and the prebuilt module of step 2 |
 | `launch/fleet.env.example` | the site file; copy to `launch/fleet.env` (git-ignored) |
 | `patches/sitecustomize.py` | installs the hooks at interpreter start in every rank; the other `.py` files in `patches/` are the hooks |
 | `patches/gate-head-mlp-reg.pt` | the confidence head the launcher's `GATE_HEAD` names: a 256-unit MLP, 4.7 MB, sha256 `0bc7b3d52da6c1bd...`, read by `patches/spark_gate_head.py`. Trained for this recipe on the draft's hidden states (see [docs/results.md](docs/results.md)); no weight of the model is in it |
@@ -376,6 +425,10 @@ The top of `launch/launch-inkling2.sh` documents every launcher variable: the on
 | `patches/conf_capture.py`, `bench/conf_capture_run.py`, `bench/conf_capture_check.py`, `bench/conf_capture_rank_check.py`, `bench/conf_capture_align_check.py`, `bench/conf_capture_test.py` | training data for a confidence head: the recorder (capture windows only), its load generator, the checks of a capture, the recorder's CPU test |
 | `bench/conf_head_train.py`, `bench/conf_head_selftest.py`, `bench/cc_build_features.py`, `bench/cc_lab.py`, `bench/cc-run.sh`, `bench/exp_base.py`, `bench/exp_combo.py`, `bench/cc_count_ops.py` | training a head, CPU only: the first trainer and its self-test; the harness (features, folds, gate rules, the simulation, one capped container a node), the baselines, the script every head of the results comes from, operation counts |
 | `bench/cc_export_head.py`, `bench/gate_head_test.py`, `bench/gate_head_capture_check.py`, `bench/gate_run.py`, `bench/gate_ab_report.py` | from a trained head to the engine: the export with its parity check, CPU checks of the engine code, a test boot's recorded rows against a recomputation, the A/B inside one boot (`gate_run.py --head`) and its summary |
+| `patches/vision_sm12x.py` | picture input on GB10 (`IMAGES`): the encoder's attention, the size cap, the lean path of a picture's data through the engine |
+| `bench/image_check.py`, `bench/make_test_images.py` | pictures with known content over every endpoint, answers checked (safe on a serving fleet); the pictures, drawn in the image |
+| `bench/image_stress.py`, `bench/make_stress_images.py` | very large, odd and broken pictures, many at once, the server's health after each (planned windows) |
+| `bench/vision_check.py` | the encoder hook against the engine's CPU path and float32 (one GPU, the fleet stopped); with `--cpu-checks`, the lean path against the engine's bit for bit (CPU only) |
 | `bench/concurrency_check.py` | reads the text of overlapping requests against single-stream references. **Run it after any change to a decode path** |
 | `bench/reasoning_cache_check.py` | whether the server restores a history turn's reasoning, over six wire formats |
 | `bench/toolcall_check.py` | the tool-call suite (wire formats and agent loops) |

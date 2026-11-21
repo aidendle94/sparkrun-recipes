@@ -3,15 +3,17 @@ model: thinkingmachines/Inkling-2-Small          # the official NVFP4 checkpoint
 engine: sglang
 engine_base: lmsysorg/sglang@sha256:424c1da97f6d6eef1612006c77b2ca791657a8184c1fbdbc682ebf9485d3b32c   # the dev-inkling-2-small tag as of 2026-11-12
 image: lmsysorg/sglang:dev-inkling-2-small       # unmodified; the hooks in patches/ are mounted and put on PYTHONPATH
-image_with_hooks: aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.1   # the same pinned base + this tree's patches/ (the head file included), kernels/ and the prebuilt forked-GEMM module (Dockerfile); file and import check only, no fleet boot yet
+image_with_hooks: aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.2   # the same pinned base + this tree's patches/ (the head file included), kernels/ and the prebuilt forked-GEMM module (Dockerfile); file and import check only, no fleet boot yet
 status: experimental          # production | validated | experimental | archived  (in service since 2026-11-12, dev image, open problems: see README)
 nodes: 4 x NVIDIA DGX Spark (GB10, 128 GB), switched RoCE fabric, TP4/EP4
 context_length: 524288        # launcher default since 2026-11-17 (262144 before)
-measured: 2026-11-20          # single boots on one fleet, 2026-11-13 to 2026-11-20; everything but scale_pack and confidence_head below by 2026-11-16, without those two
+measured: 2026-11-21          # single boots on one fleet, 2026-11-13 to 2026-11-21; everything but scale_pack, confidence_head and images below by 2026-11-16, without those three
 max_running_requests: 8
-numbers:
-  decode_tok_s: {code_greedy: 61, code_t07: 56.6}            # one stream, 400-token coding answers
-  aggregate_tok_s: {c1: 61, c4: 106, c8: 130}                # greedy, tokens of the batch per decode second
+numbers:                      # speed at temperature 1.0 is the headline; greedy keys are kept to compare with older measurements
+  decode_tok_s_t10: {c1: [54.94, 56.31]}                    # temperature 1.0, one stream, 16 coding questions of 400 tokens, 2026-11-21, all defaults (two boots: without / with picture input)
+  aggregate_tok_s_t10: {c1: [54.94, 56.31], c4: [92, 107], c8: [131, 137]}   # temperature 1.0, tokens of the batch per decode second, same two boots
+  decode_tok_s: {code_greedy: 61, code_t07: 56.6}            # one stream, 400-token coding answers (older stack, by 2026-11-16)
+  aggregate_tok_s: {c1: 61, c4: 106, c8: 130}                # greedy, tokens of the batch per decode second (older stack)
   prefill_tok_s: {15k_unique: [2417, 2482], cold_30k: 2474, cold_120k: 2241}   # without the prefill switches (PREFILL_GLUE= BIAS_FAR= FI_MXFP8=)
   prefill_tok_s_prefill_switches: {cold_30k: 3110, cold_120k: 2786, cold_300k: 2223}   # the launcher's defaults since 2026-11-17: PREFILL_GLUE + BIAS_FAR=f2 + FI_MXFP8=1
   cold_prefill_s: {130k: 61, 260k: 142, 500k: 348}
@@ -21,6 +23,7 @@ numbers:
   boot_to_healthy_s: {warm: 300, cold: 1020}
   scale_pack: {mem_available_gain_gb_per_node: [3.0, 3.4], step_ms_c1: {packed: 56.55, plain: 56.06}, scale_bytes_kept: 0.56}   # SCALE_PACK, the launcher's default since 2026-11-19: exact (same text on 16 of 16 prompts, NLL identical token for token); one stream's step is about 1% longer (+1.0%, se 0.5%, on its test boot; 0.5 to 0.7 ms on three boots); needs the module built by kernels/csf_gemm/build_csf_gemm.py; the pool is not raised
   confidence_head: {net_greedy_c1: 1.017, decode_tok_s_greedy_c1: 61.64, serving_boot_tok_s_greedy_c1: 61.79, head_vs_gate_rule_same_boot_not_net: {greedy_c1: 1.023, t10_c1: 1.050}, tail_ms_per_step: 0.75}   # GATE_HEAD, the launcher's default since 2026-11-20. net = one greedy stream on the test boot against the two plain boots of that day (60.41 and 60.81 tok/s), 16 coding questions of 400 tokens; the serving boot after the deployment ran the same questions (x1.019); both ratios are medians over the questions against the mean of the two plain boots, which carry scale_pack (the boots of 2026-11-19 with neither ran 60.95 and 61.31). head_vs_gate_rule_same_boot_not_net = tok/s ratios over all tokens of a mixed set of 16 short prompts inside the test boot, both arms carrying the head's cost (its tail in the draft graph, about 0.75 ms a step, se 0.32); four streams ran 4 and 3 batches, too few to quote; agent turns, long contexts and temperature 0.7 not measured
-features: [tools, thinking, reasoning_effort, dspark, confidence_gate, confidence_head, fp8_kv, fp8_draft_kv, sharded_experts, packed_block_scales, prefill_glue, rdma_collectives, stall_recorder, reasoning_cache, served_aliases, prometheus_metrics]
+  images: {max_edge_px: 2048, prompt_tokens_max_edge_square: 2736, encode_ms_2048px: 281, encode_ms_4096px: 2720, rank0_mem_gb_8_at_once: [0.7, 0.9], rank0_mem_gb_16_at_once: [0.85, 1.0], gpu_mem_gb_per_node: 0.66, decode_tok_s_c1_t10: {images_on: 56.31, images_off: 54.94}}   # IMAGES, the launcher's default since 2026-11-21: the encoder's attention as per-picture fused SDPA on SM12x, long side capped at IMAGE_MAX_EDGE (2048), the lean data path; image_check 21/21 (incl. temperature-1.0 text after a picture), image_stress 14/14; text decode and pool unchanged; the encoder runs on rank 0 inside the prefill and draws no random numbers (a draw there desynchronised the ranks' sampling at temperature > 0 in the first version)
+features: [text, images, tools, thinking, reasoning_effort, dspark, confidence_gate, confidence_head, fp8_kv, fp8_draft_kv, sharded_experts, packed_block_scales, prefill_glue, rdma_collectives, stall_recorder, reasoning_cache, served_aliases, prometheus_metrics]
 blog: https://aidenle.com/recipes/inkling-2-small-sglang-4x-dgx-spark
 license: MIT

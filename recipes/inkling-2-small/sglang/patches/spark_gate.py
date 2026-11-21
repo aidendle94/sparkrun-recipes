@@ -235,9 +235,10 @@ def install_model(mod):
 
     def forward(self, input_ids, positions, forward_batch, *args, **kwargs):
         ep = _s["epilogue"]
-        rows = input_ids.shape[0]
-        if (ep is None or not forward_batch.forward_mode.is_target_verify() or forward_batch.batch_size > ep.max_bs
-                or rows != forward_batch.batch_size * ep.stride):
+        # input_ids is None when the engine passes embeddings instead (a prefill with an image): never a verify step.
+        rows = input_ids.shape[0] if input_ids is not None else -1
+        if (ep is None or rows < 0 or not forward_batch.forward_mode.is_target_verify()
+                or forward_batch.batch_size > ep.max_bs or rows != forward_batch.batch_size * ep.stride):
             return stock(self, input_ids, positions, forward_batch, *args, **kwargs)
         index = _s["index"].get(rows)
         if index is None:

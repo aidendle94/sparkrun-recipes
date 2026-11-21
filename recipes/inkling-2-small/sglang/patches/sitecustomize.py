@@ -1034,5 +1034,18 @@ if _KERNEL_LOAD_GUARD:
         import kernel_load_guard
         kernel_load_guard.install(mod, int(_KERNEL_LOAD_GUARD))
 
+# SPARK_VISION=1 (with --enable-multimodal; unset = off): image input on GB10. The engine's vision attention refuses
+# GPUs that are not compute capability 9 or 10; patches/vision_sm12x.py runs the engine's per-image SDPA there.
+if os.environ.get("SPARK_VISION") == "1":
+    @_on_import("sglang.srt.models.inkling2_vision")
+    def vision_sm12x_bind(mod):
+        import vision_sm12x
+        vision_sm12x.install(mod)
+
+    @_on_import("sglang.srt.multimodal.inkling2.image_processing")
+    def vision_size_bind(mod):
+        import vision_sm12x
+        vision_sm12x.install_processor(mod)
+
 
 sys.meta_path.insert(0, _Finder())

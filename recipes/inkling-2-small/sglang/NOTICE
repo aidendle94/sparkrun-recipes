@@ -21,7 +21,9 @@ Adapted third-party code (modified for this recipe; the original notices apply t
     short-convolution, residual-add, attn_res, RMSNorm and bias-shear kernels. The hooks in patches/sitecustomize.py,
     fi_moe.py, fi_mxfp8.py, prefill_glue.py, fp8_kv.py, dense_p12.py, dense_i8.py, tp_shard.py, scale_pack.py,
     spark_gate.py, spark_gate_head.py, conf_capture.py and sampled_lab.py wrap or replace functions of SGLang's
-    Inkling model and speculative-decoding code and call its and FlashInfer's kernels.
+    Inkling model and speculative-decoding code and call its and FlashInfer's kernels. patches/vision_sm12x.py wraps
+    SGLang's Inkling-2 vision encoder and image processor: its attention follows the encoder's own per-image CPU
+    branch, and its patch builder reproduces the arithmetic of Inkling2ImageProcessor._encode strip by strip.
     Copyright SGLang Team / FlashInfer contributors. Apache License 2.0.
   - patches/stable_kernels.py: modified copies of three short Triton functions of SGLang
     (sglang/kernels/ops/inkling2/attention.py: _tau_kernel, _gate_sink_kernel, _sigmoid), with the batch's row count

@@ -1,9 +1,9 @@
 # Inkling-2-Small on four DGX Sparks: lab notes
 
-The working notes behind this recipe (2026-11-12 to 2026-11-20). First what the launcher starts and what took the
+The working notes behind this recipe (2026-11-12 to 2026-11-21). First what the launcher starts and what took the
 fleet down: the defaults, two outages, the silent stall and its recorder. Then by subject: what the GB10 hooks do,
 the bug that produced garbage under concurrency, every decode lever with its numbers, the packed block scales, the
-confidence head for the gate, long contexts and multi-turn history, the reasoning loop on long lists, the KV
+confidence head for the gate, picture input, long contexts and multi-turn history, the reasoning loop on long lists, the KV
 cache, the prefill switches, reasoning effort, and the first day's measurements. "Production" and "the fleet" mean
 the author's four Sparks; times are UTC. Each number is one boot on that fleet unless the text says otherwise. The
 launch scripts are in `launch/`, the tools in `bench/`, the hooks in `patches/`, the build script of the forked
@@ -773,6 +773,162 @@ was before the head: in a clone of the GitHub repository,
 `git show 3d7e798:recipes/inkling-2-small/sglang/patches/spark_gate.py > spark_gate_before.py` makes it), and the
 author's lab record, which the docstring of `bench/cc_lab.py` cites as
 `research/2026-11-19-confidence-head/RESULTS.md`: this section is its public form.
+
+## Picture input (2026-11-20/21; the launcher's default since 2026-11-21, `IMAGES=` turns it off)
+
+The image serves pictures when the server runs with `--enable-multimodal`. Inkling-2's vision encoder is a
+1,024-wide, 23-layer vision transformer with a projector: 327.7M parameters, 0.66 GB in BF16. Every rank loads it.
+Rank 0 encodes the pictures of a prefill batch and broadcasts the result to the other ranks. A picture of w x h
+pixels becomes ceil(w/40) x ceil(h/40) prompt tokens, and four times as many plus one inside the encoder.
+`IMAGES=1` sets `--enable-multimodal`, `SPARK_VISION=1` and `TORCHINDUCTOR_COMPILE_THREADS=1`. The last one keeps
+the compile of the encoder's one compiled function (`_renormalize`, at the first picture) from leaving a 0.7 GB
+pool of compile workers on the rank-0 node. `patches/vision_sm12x.py` does three things.
+
+### Attention on GB10
+
+The engine runs the encoder's attention with flash_attn.cute's variable-length kernel. It refuses every GPU that is
+not compute capability 9 or 10, so on GB10 (12.1) the first picture fails with "Inkling2 vision attention requires
+Hopper or Blackwell". The hook runs the engine's own fallback instead: the per-picture
+`scaled_dot_product_attention` of its CPU branch, with the same projections, rotary embedding and scale. It allows
+only the fused kernels. On GB10 the flash, memory-efficient and cuDNN kernels all run; the plain math kernel would
+allocate tokens² per head.
+
+`bench/vision_check.py` (one GPU, the fleet stopped) encodes the same random pictures three times: on the GPU with
+the hook, on the CPU with the engine's BF16 path, and on the CPU in float32 as the reference. Five sets of
+pictures, from 6 to 676 output tokens, one to three pictures a call:
+
+| | GPU hook against float32 | engine's CPU BF16 path against float32 |
+|---|---|---|
+| mean relative difference, smallest set | 1.65e-2 | 1.58e-2 |
+| mean relative difference, largest set (26 x 26) | 2.58e-2 | 2.54e-2 |
+| cosine, all sets | above 0.9997 | above 0.9997 |
+
+BF16 rounding alone moves a 23-layer encoder by a few percent; the hook is as close to float32 as the engine's own
+path. The kernel probe and an encode leave the GPU generator's offset where it was (see
+[Random numbers on rank 0](#random-numbers-on-rank-0)). Encode time on the GPU: 46 ms for 26 x 26 tokens, 281 ms for 52 x 52 (a 2,048 x 2,048 picture, peak 0.92
+GiB allocated with the weights), 2.7 s for 103 x 103 (4,096 x 4,096, peak 1.75 GiB).
+
+### Memory on the rank-0 node
+
+A GB10 node shares one memory between the CPU and the GPU. The rank-0 node runs the HTTP server, the tokenizer
+process and the encoder beside its rank, and has a few GB to spare while serving. With the engine's own picture
+path (only the attention hooked, pictures capped at 4,096 px), pictures of 4,096 x 4,096 took:
+
+| at once | MemAvailable of the rank-0 node | largest process |
+|---|---|---|
+| 4 | from 4.64 to 1.68 GB | tokenizer 6.3 GB (1.2 GB after a boot), scheduler 6.6 GB |
+| 8 | from 5.00 to 0.93 GB | tokenizer 4.5 GB |
+
+On the test fleet the out-of-memory killer acts near 2.5 GB. The engine passes each patch as two identical frames
+(the encoder's temporal dimension, which it averages), and the patches travel in three or four copies: the
+tokenizer's tensor, a shared-memory segment, a GPU copy and a CPU copy kept until the prompt is read. The hook
+changes four things. None of them changes a value the model sees:
+
+- The tokenizer process builds a picture's patches strip by strip, straight into BF16, with the engine's float32
+  arithmetic. It handles at most two pictures at a time and returns the freed heap to the system afterwards.
+- The patches travel as one frame. The encoder hook widens them to two frames (a view, no copy).
+- The encoder runs the pictures of a batch in groups of at most 45,000 encoder tokens
+  (`SPARK_VISION_TOKEN_BUDGET`), the size of one 4,096 x 4,096 picture. Each picture is independent inside the
+  encoder.
+- After a large encode (more than 16,384 encoder tokens) the encoder's cached GPU blocks are released, if the node
+  has less than 6 GB available (`SPARK_VISION_EMPTY_BELOW_GB`).
+
+`bench/vision_check.py --cpu-checks` (CPU only) checks the first three:
+
+- the patches against the engine's `_encode`: bit-identical on 11 pictures (PNG, JPEG, WebP, transparent,
+  greyscale, from 1 x 1 to 6,000 x 4,000), with the cap and without it;
+- the encoder in groups against one pass, and on one frame against two: bit-identical.
+
+On the GPU, one frame is bit-identical to two. The encoder in groups differs from one pass by as much as any change
+of summation order does in BF16 (2.3e-2 mean relative), and stays within the float32 bound above.
+
+With the four changes and the cap still at 4,096 px, the tokenizer process peaked at 2.2 GB for 8 pictures of
+4,096 x 4,096 at once, against 4.5 GB on the engine's path. MemAvailable went from 9.02 to 4.32 GB (4.7 GB). That
+drop cannot be set against the 4.1 GB of the table above: that run started with 5.0 GB and ended with 0.9. Either
+way, at 4,096 px a burst of large pictures is not safe on the rank-0 node; the cap below is what makes it safe.
+
+### The size cap
+
+The engine encodes a picture at its native resolution, with no limit. The model card says that pictures work best
+with each side between 40 and 4,096 pixels, and its evaluations downsample larger ones to 4,096 on the long side.
+The hook caps the long side at `SPARK_VISION_MAX_EDGE` pixels before encoding (launcher `IMAGE_MAX_EDGE`, default
+2,048; 0 = no cap), with Pillow's Lanczos filter, and logs each resize. The engine's own Lanczos-3 resize
+(`resize.py`, used for its virtual sizes) gives the same pixels within 1 on 99.98 % of values (mean difference
+0.001) on the two oversized test pictures; Pillow is faster and needs no compile.
+
+2,048 and not 4,096, because the reading tests found no difference and the memory did:
+
+| test | 4,096 px | 2,048 px | 1,024 px |
+|---|---|---|---|
+| a page of 40 numbered lines, 4-digit code on each line, 6 lines asked | 6 of 6 (10,656 prompt tokens) | 6 of 6 (2,751) | 6 of 6 (723) |
+| the same page in small print, 8 lines asked | 8 of 8 (30 px type) | 8 of 8 (15 px type) | not run |
+| 8 pictures of 4,096 x 4,096 at once: MemAvailable lost on the rank-0 node | 4.7 GB | 0.7 to 0.9 GB | |
+| 16 at once (4,096 x 4,096, or 6,000 x 4,000 JPEG) | not run | 0.85 to 1.0 GB, tokenizer at most 2.1 GB | |
+
+When the node has less than 3 GB available (`SPARK_VISION_MIN_FREE_GB`), a new picture is refused with HTTP 400
+and a message that says why. A picture that cannot be decoded is refused the same way.
+
+### Picture sources
+
+The engine takes a picture as a base64 data URL or an http(s) URL, which the server fetches itself. It also reads a
+file on the server when the URL is `file://...` or a bare path: with only the attention hooked, `/etc/hostname`
+as a picture URL was read and failed to decode, and a missing path returned a different error. The hook refuses
+every source that is not a data URL, an http(s) URL or bytes, before anything is read, with one fixed message
+(HTTP 400). An http URL fetched from a local web server was read right.
+
+### Random numbers on rank 0
+
+The first version of the hook probed the attention kernels with `torch.randn` on the GPU, at the first picture.
+Only rank 0 runs the encoder, so only rank 0's generator moved, and every boot moved it: the engine encodes a
+warm-up picture before it reports ready. Each rank samples a request's tokens with its own generator. With rank
+0's generator ahead, rank 0 sampled other tokens than the other ranks at temperature 1.0, ended a request at
+another step, and started the next prefill alone while the others were still verifying the old request. Rank 0's
+GPU then waited in one collective and the other ranks in another, until the RoCE wait timed out (about 133 s)
+and every rank exited. It happened twice in a row, within the first four requests of a temperature-1.0 run of
+`bench/step_time.py`. The greedy tests had all passed, because greedy decoding draws no random numbers. The
+watchdog's probe stops on its token limit on every rank, so it did not show either.
+
+The probe now uses a constant tensor, and the encoder wrapper puts the generator's offset back after an encode
+if anything moved it, logging once. The engine's encoder draws no random numbers. After the fix the same
+temperature-1.0 run completed on an image boot (16 requests at each of 1, 4 and 8 streams, twice), and
+`bench/image_check.py` sends eight requests at temperature 1.0 right after a picture.
+
+### On the serving fleet (2026-11-21, launcher defaults)
+
+- `bench/image_check.py`: 21 of 21, among them eight requests at temperature 1.0 right after a picture. One picture on chat completions, Anthropic `/v1/messages` and the Responses
+  API; two pictures in one request; a streamed request (first token after 0.63 s); 3,000 x 2,000 (capped to
+  2,048 x 1,365, 1,852 prompt tokens); 40 x 40; the prefix cache; 4 picture requests at once beside 4 text ones.
+- `bench/image_stress.py`: 14 of 14. 4,096 x 4,096 PNG, 6,000 x 4,000 JPEG, transparent and greyscale PNG, WebP,
+  1 x 1, eight pictures in one request, four large pictures at once. A truncated PNG, a text file, invalid base64,
+  a path on the server and a `file://` URL each return HTTP 400 with a message, and the server stays up.
+- A picture in the first turn and questions about it in later turns, over chat completions and `/v1/messages`:
+  right. A picture with a tool: the model called the tool with the word and number it read.
+- Prefix cache: a later turn about a 2,048 px picture, and a new request with the same picture and another
+  question, each reused 2,688 of 2,735 prompt tokens. Short picture prompts (200 to 330 tokens) reused 0 to 128
+  tokens when the question changed, and all but 5 on an exact repeat; the cause was not looked into.
+- One request at reasoning effort `low`, 60 to 80 answer tokens: 1.2 to 1.6 s for a 1,400 px wide text picture (455
+  picture tokens), 3.2 s for a 4,096 x 4,096 picture (capped, 2,736 prompt tokens). 8 such large pictures at once:
+  5.0 to 6.7 s for all; 16: 9.1 to 10.3 s.
+- The text path, two boots of the same launcher with and without `IMAGES`, 16 coding questions of 400 tokens, two
+  rounds, temperature 1.0 (`bench/step_time.py --temperature 1.0`; the text differs from run to run, so the
+  boots are compared by the step time at equal accept):
+
+  | | without pictures | with pictures |
+  |---|---|---|
+  | 1 stream | 54.94 tok/s | 56.31 tok/s; −0.53 ms a step at equal accept (se 0.38) |
+  | 4 streams, tokens of the batch | 92.2 to 104.7 tok/s | 101.0 to 107.2 tok/s |
+  | 8 streams, tokens of the batch | 131.7, 136.0 tok/s | 130.9, 136.5 tok/s |
+
+  Greedy, on another pair of boots: the same text on 16 of 16 questions with and without pictures, +0.15 ms a
+  step at equal accept (se 0.43).
+
+  `bench/concurrency_check.py` and `bench/reasoning_cache_check.py` passed on the final boot. GPU memory available
+  to the server after loading fell from 10.48 to 9.82 GB a node (the encoder); the pool stayed at 793,000 tokens.
+
+Not done: the flash_attn variable-length kernel on SM12x (the per-picture attention is what runs); video (the
+engine refuses it: "Inkling2 supports text and images only"); the tool-call suite and long contexts with pictures.
+The encoder runs on rank 0 inside the prefill, so running decodes wait for it: about 0.28 s for each 2,048 px
+picture.
 
 ## Long contexts and multi-turn history (2026-11-14)
 
