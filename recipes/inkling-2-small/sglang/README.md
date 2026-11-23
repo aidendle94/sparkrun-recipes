@@ -9,6 +9,9 @@ node and put on `PYTHONPATH`. They supply what GB10 needs (attention arguments, 
 four nodes, a correct decode kernel at page size 1, the vision encoder's attention) and then the speed: 55–56 tok/s
 for one stream at temperature 1.0 with the defaults. The model takes text and pictures.
 
+For the same stack with an NVFP4 KV cache (1.8x the cache in the same memory, faster decode behind long contexts)
+and a one-command setup, use [`../sglang-nvfp4-kv`](../sglang-nvfp4-kv/).
+
 **Status: experimental.**
 
 - In service on one four-node fleet since 2026-11-12.
@@ -219,12 +222,12 @@ hf download thinkingmachines/Inkling-2-Small --revision b0e7afb8892a07897c78ce1c
 #    If the tag has moved since then and a boot fails in a hook, pull that digest and set INKLING_IMAGE to it.
 docker pull lmsysorg/sglang:dev-inkling-2-small
 #    Or that pinned build with this recipe's hooks already inside (one small layer on top, see the Dockerfile):
-#      docker pull aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.4
-#      export INKLING_IMAGE=aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.4     # before launching
+#      docker pull aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.5
+#      export INKLING_IMAGE=aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.5     # before launching
 #    The launcher runs either image. It mounts its own patches/ over the image's, so the two cannot drift apart.
 #    This tag holds the hooks of this README, the confidence head's file, kernels/ and the prebuilt module of
-#    step 2. It has passed a file and import check and has not been booted on a fleet; the measurements here
-#    used the upstream tag.
+#    step 2. The fleet has served from it (2026-11-23, with ../sglang-nvfp4-kv); most measurements here used
+#    the upstream tag with the same hooks mounted.
 
 # 2. Once per image, on rank 0, with nothing serving on that node: build the forked grouped GEMM that reads the
 #    packed block scales (SCALE_PACK, a default). The build takes about 40 s on a Spark and no GPU, but several
@@ -237,7 +240,7 @@ docker run --rm --network none --memory 16g --cpus 8 \
   --entrypoint /opt/sglang/bin/python3 lmsysorg/sglang:dev-inkling-2-small /k/build_csf_gemm.py /out
 cp "$HOME/inkling2-csf-build/spark_csf_gemm_sm120.so" patches/
 #    With the hooks image of step 1 there is nothing to build: copy its prebuilt module instead (no GPU, seconds).
-#      docker run --rm --entrypoint cat aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.4 \
+#      docker run --rm --entrypoint cat aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.5 \
 #        /opt/inkling2-spark/prebuilt/spark_csf_gemm_sm120.so > patches/spark_csf_gemm_sm120.so
 #    Without that file the launcher prints "note: patches/spark_csf_gemm_sm120.so is not built
 #    (kernels/csf_gemm/build_csf_gemm.py): the packing is off for this launch" and starts the stack without the
@@ -366,6 +369,76 @@ post-processing included, was equal on a boot from the folders and on a boot fro
 `bench/concurrency_check.py` passed. A rank fills its weights from its folder in 96–124 s, and the boot took
 241 s with the checks on (222 s from the official checkpoint). `bench/preshard_test.py` checks the hook on the CPU.
 
+## NVFP4 KV cache
+
+`KV_NVFP4=target,draft` (off in this launcher; the recipe [`../sglang-nvfp4-kv`](../sglang-nvfp4-kv/) turns it on and
+sets everything up with one script).
+
+`patches/nvfp4_kv.py` stores the KV cache in NVFP4: a head's row of 128 values in 72 bytes instead of 128 (64 bytes of
+E2M1 codes, eight E4M3 scales, one per 16 values; the scale of a block is amax / 6 or amax / 4, whichever leaves the
+smaller sum of absolute errors, the rule the checkpoint quantizes its NVFP4 activations with; no per-tensor scale).
+The engine still runs with `--kv-cache-dtype fp8_e4m3` and treats the pools as FP8 pools; the hook swaps the MHA pool
+class of both sub-pools (target and, with `draft`, the DSpark draft's) and scales the pool sizing by 72 / 128. The
+pool hands out a uint8 view 128 values wide with a head stride of 72 bytes, so the engine's reshapes keep working and
+a reader that is not patched fails instead of reading wrong values. The store quantizes straight from BF16 (K and V
+in separate programs; the draft's prefix-valid commit masks rows in the same kernel; the scale is rounded in integer
+arithmetic). SGLang's own `--kv-cache-dtype nvfp4` reads only through TensorRT-LLM's SM100 kernels and the plain MHA
+pool.
+
+The readers (decode / verify: patches/paged_decode.py's derivation; the draft's block: draft_decode.py's; prefill: the
+gather to BF16 of fp8_kv.py):
+
+- A row decodes through GB10's conversion instruction (`cvt.rn.f16x2.e2m1x2`, two codes to two FP16 values) and one
+  FP16 multiply by its block's scale, exact. The attention kernels run both products as FP16 MMAs (queries cast to
+  FP16 once; P rounded to FP16, finer than BF16): against an FP64 reference over the stored values the result is
+  1.0e-4 off where the BF16 kernel on the same values is 7.0e-4 to 7.9e-4.
+- Far tiles: a tile whose keys all lie beyond the relative bias's extent for every query (all but the newest 1,032
+  keys of a global layer) runs a loop without masks and without the bias lookup (1,040 instructions a tile against
+  about 2,400). The result moves by FP32 rounding (2e-6): the compiler fuses the multiply by the scale differently.
+- Rows 32 + 16: a program's 48 query rows (8 queries on 6 heads per key head) run as two sets instead of 64 padded
+  rows.
+- Tiles of 64 keys where a program reads at least 2,048 of them (8 to 12% less time on long spans; 5e-5 from the
+  tiles of 32: another grouping of the sums).
+- The draft block's reduction of its split partials takes one row a program (it took 32: three programs, 45 us more
+  a call; the same bits; this one serves the e4m3 draft pool too).
+
+Time per call in a CUDA graph, 8 queries a request (`bench/nvfp4_kv_sweep.py`, one idle GB10):
+
+| call | e4m3 kernel | NVFP4 kernel |
+|---|---|---|
+| verify, windowed layer | 12.6 us | 8.7 us |
+| verify, global layer, 3K / 30K keys | 19.2 / 108.5 us | 11.6 / 66.1 us |
+| verify, global layer, 130K / 500K keys | 437.9 / 1,630.5 us | 265.1 / 930.8 us (155 GB/s) |
+| verify, global layer, 4 requests of 130K | 1,777.3 us | 975.2 us |
+| draft block, 3K / 130K / 500K keys (both with the one-row reduction) | 22.6 / 327.7 / 1,159.4 us | 22.9 / 252.2 / 884.4 us |
+| store, 8 tokens (verify) / 4,096 (prefill) | 3.2 / 8.6 us | 1.9 / 27.1 us |
+| prefill gather, 130K rows | 463.5 us | 418.6 us |
+
+Measured on 4 nodes against the FP8 boot of the same day (2026-11-23, launcher defaults, pre-sharded weights, decode at
+temperature 1.0; `bench/step_time.py --context` puts a cached record context before every question):
+
+| | FP8 KV | NVFP4 KV |
+|---|---|---|
+| pool (same bytes) | 793,000 tokens, windowed 39,650 | 1,409,000 tokens, windowed 70,450 |
+| held-out NLL, 10,547 tokens | 1.4437 | 1.4437 (difference +0.0001 +- 0.0022; mean per-token change 0.113, 31% of tokens by more than 0.1) |
+| lookups at 130K, 40 questions | 36 right, 2 recitals, 2 out of tokens | 35 right, 1 recital, 4 out of tokens; no wrong answer in either |
+| decode, short context, 1 / 4 / 8 streams | 54.0 tok/s / 89-102 / 126 | 56.9 tok/s / 89-104 / 129 |
+| step time at equal accept, short context | | -0.73 ms (se 0.43), -1.3% |
+| decode behind 130K, 1 stream / 4 streams (per stream) | 54.1 / 23.6 tok/s, 62.5 ms a step | 55.7 / 25.4 tok/s, 60.2 ms a step; -1.94 ms at equal accept (se 0.44), -3.1% |
+| decode behind 500K, 1 stream | 47.6 tok/s, 77.5 ms a step | 52.2 tok/s, 67.0 ms a step; -10.3 ms at equal accept (se 0.93), -13.2% |
+| cold prefill, 60K / 130K | | 2,763 / 2,549 tok/s (FP8 on 2026-11-19: 2,738 at 60K) |
+| concurrency check / pictures / windowed pool run full | ALL OK / 21 of 21 | ALL OK / 21 of 21 / 208 lookups right |
+
+The per-token NLL change compares with the width-sharded experts' (mean per-token change 0.093, 26% by more than
+0.1) and the average does not move. A lookup over 130K ends without an answer about one time in ten on either pool
+(the model recites the records or runs out of tokens; see Known problems), so a long-context check counts 40
+lookups against the FP8 count instead of trusting one. The first reader decoded rows with integer arithmetic into
+BF16 tiles and was 8 to 15% slower per call than the e4m3 kernel (+0.8 ms a step).
+Tests: `bench/nvfp4_kv_cpu.py` (format, store and gather in the Triton interpreter, error at the attention level),
+`bench/compile_check_nvfp4.py` (GB10 compile, shared memory, registers), `bench/nvfp4_kv_test.py` (idle GPU: store
+bytes equal the torch reference, readers against FP64, the pool class end to end, timing), `bench/nvfp4_kv_sweep.py`
+(each reader step: how far it moves the result, and its time).
+
 ## Using it as a client
 
 - **Temperature.** A chat or messages request without a `temperature` is sampled at 1.0 (the engine's default for
@@ -445,7 +518,7 @@ post-processing included, was equal on a boot from the folders and on a boot fro
 | `launch/launch-inkling2.sh` | one container per node (`inkling2`), RoCE/NCCL environment, the hooks on PYTHONPATH; `--dry-run`, `--stop` |
 | `launch/relaunch-inkling2.sh` | disarm the watchdog, launch, wait for /health, re-arm the watchdog (use this to restart) |
 | `launch/watchdog-inkling2.sh` | probes and relaunches (log `~/inkling2-watchdog.log`); before a relaunch it saves every rank's state, stacks and stall evidence |
-| `Dockerfile` | the hooks image: the pinned base plus `patches/` on `PYTHONPATH`, published as `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.4` (no hook is switched on in it: the launcher's variables do that). It holds the hooks of this README, `kernels/` and the prebuilt module of step 2 |
+| `Dockerfile` | the hooks image: the pinned base plus `patches/` on `PYTHONPATH`, published as `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.5` (no hook is switched on in it: the launcher's variables do that). It holds the hooks of this README, `kernels/` and the prebuilt module of step 2 |
 | `launch/fleet.env.example` | the site file; copy to `launch/fleet.env` (git-ignored) |
 | `patches/sitecustomize.py` | installs the hooks at interpreter start in every rank; the other `.py` files in `patches/` are the hooks |
 | `patches/gate-head-mlp-reg.pt` | the confidence head the launcher's `GATE_HEAD` names: a 256-unit MLP, 4.7 MB, sha256 `0bc7b3d52da6c1bd...`, read by `patches/spark_gate_head.py`. Trained for this recipe on the draft's hidden states (see [docs/results.md](docs/results.md)); no weight of the model is in it |
@@ -457,6 +530,8 @@ post-processing included, was equal on a boot from the folders and on a boot fro
 | `bench/cc_export_head.py`, `bench/gate_head_test.py`, `bench/gate_head_capture_check.py`, `bench/gate_run.py`, `bench/gate_ab_report.py` | from a trained head to the engine: the export with its parity check, CPU checks of the engine code, a test boot's recorded rows against a recomputation, the A/B inside one boot (`gate_run.py --head`) and its summary |
 | `patches/preshard.py`, `bench/preshard_test.py` | pre-sharded weights (`PRESHARDED`, `SPARK_PRESHARD_EXPORT`, `SPARK_PRESHARD_CHECK`): a rank folder written at the end of the engine's copy loop and loaded from there, checksummed; the hook's CPU test |
 | `patches/vision_sm12x.py` | picture input on GB10 (`IMAGES`): the encoder's attention, the size cap, the lean path of a picture's data through the engine |
+| `patches/nvfp4_kv.py` | the NVFP4 KV cache (`KV_NVFP4`): the pool, the store, the decode / verify, draft and prefill readers, the pool sizing |
+| `bench/nvfp4_kv_cpu.py`, `bench/compile_check_nvfp4.py`, `bench/nvfp4_kv_test.py`, `bench/nvfp4_kv_sweep.py` | the NVFP4 format and kernels in Triton's CPU interpreter; compiled for GB10 without a GPU; on one idle GPU against FP64 and the torch reference, with timings; each reader step's time and how far it moves the result |
 | `bench/image_check.py`, `bench/make_test_images.py` | pictures with known content over every endpoint, answers checked (safe on a serving fleet); the pictures, drawn in the image |
 | `bench/image_stress.py`, `bench/make_stress_images.py` | very large, odd and broken pictures, many at once, the server's health after each (planned windows) |
 | `bench/vision_check.py` | the encoder hook against the engine's CPU path and float32 (one GPU, the fleet stopped); with `--cpu-checks`, the lean path against the engine's bit for bit (CPU only) |

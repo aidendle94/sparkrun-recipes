@@ -971,6 +971,51 @@ The folders are tied to four ranks and to `TP_SHARD`, `TP_SHARD_FP8`, `TP_SHARD_
 they were written; a reload refuses any difference, and any difference in the parameters' names, shapes or dtypes.
 A change to a hook that acts before the cut (the expert sharding) needs a new export.
 
+## NVFP4 KV cache (2026-11-23; `KV_NVFP4=target,draft`, the recipe `../sglang-nvfp4-kv`)
+
+Every fleet number below is one boot against an FP8 boot of the same launcher on the same day, both with the
+pre-sharded weights. Decode at temperature 1.0, 400 tokens a request, 16 coding questions (8 at 500K);
+`bench/step_time.py --context N` puts the same cached record context of N tokens before every question.
+
+| | FP8 KV | NVFP4 KV |
+|---|---|---|
+| pool cap, the same bytes | 793,000 (windowed 39,650) | 1,409,000 (windowed 70,450); the engine's budget 7,680 -> 4,320 bytes a token |
+| held-out NLL (`bench/nll_texts.py --windows 4`, 10,547 tokens) | 1.4437 | 1.4437; difference +0.0001 (se 0.0022); mean per-token change 0.113, median 0.031, 31.2% of tokens by more than 0.1, 0.79% by more than 1 |
+| lookups over 130K records (`bench/recital_rate.py --n 40`) | right 36, recital 2, out of tokens 2 | right 35, recital 1, out of tokens 4; no wrong answer. Misses on different questions (FP8: 9, 10, 22, 35; NVFP4: 27, 28, 29, 34, 35); the run of 2026-11-15 on FP8 missed 2, 9, 11, 22 |
+| one stream, short | 54.00 tok/s, 55.77 ms a step, 2.96 tokens a step | 56.86 tok/s, 55.40 ms, 3.15; at equal accept -0.73 ms (se 0.43) |
+| 4 / 8 streams, short, batch tok/s | 89.1-101.7 / 125.9-126.0 | 88.7-103.7 / 128.6-129.6 |
+| behind 130K, one stream | 54.14 tok/s, 62.50 ms a step | 55.74 tok/s, 60.23 ms; at equal accept -1.94 ms (se 0.44) |
+| behind 130K, 4 streams, per stream | 23.55 tok/s, 137.37 ms a step | 25.42 tok/s, 127.47 ms |
+| behind 500K, one stream | 47.58 tok/s, 77.51 ms a step | 52.22 tok/s, 67.02 ms; at equal accept -10.31 ms (se 0.93); every request faster (x0.81 to x0.89) |
+| cold prefill 60K / 130K | 2,738 at 60K (2026-11-19) | 2,763 / 2,549 tok/s |
+| concurrency check / pictures / windowed pool run full (`bench/swa_fill.py --convs 192`) | ALL OK / 21 of 21 | ALL OK / 21 of 21 / 192 + 8 + 8 lookups right, 141,000-253,000 tokens evicted |
+| boot to healthy | 201 s | 201-202 s |
+
+Kernel time per call in a CUDA graph on one idle GB10 (`bench/nvfp4_kv_sweep.py`, `bench/nvfp4_kv_test.py`), 8
+queries a request on 12 query heads over 2 key heads:
+
+| call | e4m3 | NVFP4: rows decoded in integer arithmetic, BF16 tiles (first version) | NVFP4 as served |
+|---|---|---|---|
+| verify, windowed layer (3K context) | 12.6 us | 9.6 | 8.7 |
+| verify, global layer, 3K / 30K | 19.2 / 108.5 us | 14.1 / 79.2 | 11.6 / 66.1 |
+| verify, global layer, 130K / 500K | 437.9 / 1,630.5 us | 357.5 / 1,331.9 | 265.1 / 930.8 (155 GB/s) |
+| verify, 4 requests of 130K / 8 of 30K | 1,777.3 / 814.4 us | 1,461.6 / 654.5 | 975.2 / 498.2 |
+| draft block, 3K / 30K / 130K / 500K (one-row reduction for all) | 22.6 / 71.1 / 327.7 / 1,159.4 us | 23.3 / 71.0 / 299.7 / 1,079.3 | 22.9 / 66.9 / 252.2 / 884.4 |
+| store, 1 token / 8 tokens / 4,096 tokens | 3.5 / 3.2 / 8.6 us | | 2.8 / 1.9 / 27.1 |
+| prefill gather to BF16, 130K rows | 463.5 us | | 418.6 |
+
+The steps from the first version to the served one, at 130K (one request): the general loop 357.5 us; the far-tile
+loop (no bias lookup, no masks beyond the bias's extent) 289.1; the 48 query rows as 32 + 16 instead of 64 padded
+285.6; tiles of 64 keys on long spans 262.7. The first version itself already used FP16 tiles through
+`cvt.rn.f16x2.e2m1x2`; before that, the rows were decoded with integer arithmetic into BF16 tiles, 8 to 15% slower
+per call than e4m3, which cost +0.80 ms a step (se 0.42) at equal accept on its serving boot. The draft block's
+reduction of the split partials took 32 rows a program (three programs on 48 SMs): 67.5 us a call at 3K against
+22.9 with one row a program, the same bits.
+
+Accuracy against FP64 over the stored values (4 requests, 3,000 keys; 4 requests, 25,000 keys for the long tiles):
+the NVFP4 kernel 0.69e-4 to 1.10e-4 relative L2, the BF16 kernel on the same values 6.05e-4 to 7.99e-4. The steps
+move the result by FP32 rounding against the general loop: far loop 0.8e-6 to 8.9e-6, tiles of 64 2.1e-5 to 5.9e-5.
+
 ## Long contexts and multi-turn history (2026-11-14)
 
 Serving 524,288 tokens of context since 2026-11-14 06:49 UTC through the environment of the relaunch (the launcher's

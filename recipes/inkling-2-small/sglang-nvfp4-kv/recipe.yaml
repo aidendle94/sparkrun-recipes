@@ -1,0 +1,23 @@
+# Machine-readable summary of this recipe (the blog's recipe cards and performance panels can be generated from it).
+model: thinkingmachines/Inkling-2-Small
+weights: aidendle94/Inkling-2-Small-DGX-Spark      # rank0/ .. rank3/, one folder of about 93 GB per node
+engine: sglang
+based_on: ../sglang                                  # the same launcher, hooks and checks, with KV_NVFP4=target,draft and PRESHARDED=1
+image: aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.5   # lmsysorg/sglang@sha256:424c1da9... (dev-inkling-2-small, 2026-11-12) + this repository's hooks
+status: experimental
+nodes: 4 x NVIDIA DGX Spark (GB10, 128 GB), RoCE fabric, TP4/EP4
+context_length: 524288
+kv_cache: nvfp4                                      # 72 bytes a head row of 128 values (E2M1 + E4M3 scale per 16); target and draft pools
+measured: 2026-11-23                                 # one fleet, against an FP8 boot of the same stack on the same day
+max_running_requests: 8
+numbers:                                             # temperature 1.0; FP8 counterpart in brackets
+  kv_pool_tokens: 1409000                            # [793000], the same bytes
+  decode_tok_s_t10: {c1: 56.86, c1_130k: 55.74, c4_130k_per_stream: 25.42, c1_500k: 52.22}   # [54.0, 54.14, 23.55, 47.58]
+  step_ms_at_equal_accept_vs_fp8: {short: -0.73, at_130k: -1.94, at_500k: -10.31}            # se 0.43 / 0.44 / 0.93
+  aggregate_tok_s_t10: {c4: [88.7, 103.7], c8: [128.6, 129.6]}                             # [89.1-101.7, 125.9-126.0]
+  heldout_nll: {nvfp4: 1.4437, fp8: 1.4437, difference: 0.0001, se: 0.0022, tokens: 10547, mean_abs_token_change: 0.113}
+  lookups_130k_40q: {nvfp4: 35, fp8: 36, wrong: 0}
+  cold_prefill_tok_s: {60k: 2763, 130k: 2549}
+  boot_to_healthy_s: {warm: 202}
+features: [text, images, tools, thinking, reasoning_effort, dspark, confidence_gate, confidence_head, nvfp4_kv, nvfp4_draft_kv, presharded_weights, sharded_experts, packed_block_scales, prefill_glue, rdma_collectives, reasoning_cache, prometheus_metrics, quickstart]
+license: MIT

@@ -95,6 +95,11 @@ draft_kv_fp8 (SPARK_DRAFT_KV_FP8=1, off by default; with --kv-cache-dtype fp8_e4
   reads to patches/draft_decode.py (the image's Triton decode kernel rebuilt for an e4m3 pool: every valid key, no
   bias). The draft's K/V are rounded when stored; the target's arithmetic is untouched.
   SPARK_DRAFT_KV_STATS=1 (diagnosis windows only): patches/draft_kv_stats.py logs what e4m3 does to those values.
+kv_nvfp4 (SPARK_KV_NVFP4=target,draft | target | draft, off by default; with --kv-cache-dtype fp8_e4m3, and for draft
+  SPARK_DRAFT_KV_FP8=1): patches/nvfp4_kv.py swaps the chosen workers' MHA pools for NVFP4 pools (a head row of 128
+  values in 72 bytes: E2M1 codes and an E4M3 scale per 16, the checkpoint's 4-over-6 scale rule) and scales the pool
+  sizing to match. The engine still sees FP8 pools; the pools hand out uint8 reader views (128 wide, head stride 72)
+  that triton_decode, the draft's block and fa4_sm12x_args send to the NVFP4 readers. Lossy: K/V are rounded to FP4.
 prefill_glue (SPARK_PREFILL_GLUE=<parts>, off by default; parts epilogue,stream,gate,qkvr,relbias):
   patches/prefill_glue.py takes passes over memory out of the per-layer glue of a plain prefill chunk: the layer's
   closing convolution + residual add in one kernel (fused_epilogue.py), attn_res + RMSNorm in one kernel
@@ -186,9 +191,14 @@ def fa4_sm12x_args(mod):
             q = kwargs.get("q", args[0] if args else None)
             scale_after_add = kwargs.pop("rel_bias_scale_after_add", False)
             presheared = kwargs.pop("rel_bias_presheared", False)
-            if _DRAFT_KV_FP8 and __name == "flash_attn_with_kvcache" and not args and _e4m3(kwargs.get("k_cache")):
+            fp4 = _KV_NVFP4 and _nvfp4(kwargs.get("k_cache"))
+            if (_DRAFT_KV_FP8 and __name == "flash_attn_with_kvcache" and not args
+                    and (fp4 or _e4m3(kwargs.get("k_cache")))):
                 import draft_decode
                 if draft_decode.handles(kwargs):  # draft_kv_fp8: the draft's block reads its e4m3 pool in place
+                    if fp4:  # kv_nvfp4: or its NVFP4 pool
+                        import nvfp4_kv
+                        return _timed("draft_kv", draft_decode.fa4_call)(kern=nvfp4_kv.draft_kernel, **kwargs)
                     return _timed("draft_kv", draft_decode.fa4_call)(**kwargs)
                 draft_decode.not_handled(kwargs)  # logged once; the call goes on as any e4m3 cache does
             out = kwargs.get("out")
@@ -197,11 +207,18 @@ def fa4_sm12x_args(mod):
                 kwargs["out"] = None
             check = (_ATTN_CHECK and __name == "flash_attn_with_kvcache" and not presheared
                      and not getattr(state, "nested", False) and kwargs.get("rel_bias") is not None)
+            check = check and not _nvfp4(kwargs.get("k_cache"))  # attn_check reads BF16/e4m3 pools only
             if check:  # the pool and page table as the model passed them, before the fp8 view replaces them
                 pool = (kwargs["k_cache"], kwargs["v_cache"], kwargs["page_table"])
             # the timers keep the global layers apart (no window): their time grows with the prefix
             glob = "" if (kwargs.get("window_size") or (-1, -1))[0] >= 0 else "_g"
-            if _e4m3(kwargs.get("k_cache")):  # fp8_kv: the SM12x FA4 forward reads BF16 K/V only
+            if fp4:  # kv_nvfp4: the rows this forward reads, decoded to BF16
+                import nvfp4_kv
+                kwargs["k_cache"], kwargs["v_cache"], kwargs["page_table"] = _timed("fp4_view" + glob, nvfp4_kv.bf16_view)(
+                    kwargs["k_cache"], kwargs["v_cache"], kwargs["page_table"], kwargs["cache_seqlens"],
+                    kwargs.get("cu_seqlens_q"), (kwargs.get("window_size") or (-1, -1))[0],
+                    q.shape[0] if q.dim() == 3 else q.shape[0] * q.shape[1])
+            elif _e4m3(kwargs.get("k_cache")):  # fp8_kv: the SM12x FA4 forward reads BF16 K/V only
                 import fp8_kv
                 kwargs["k_cache"], kwargs["v_cache"], kwargs["page_table"] = _timed("fp8_view" + glob, fp8_kv.bf16_view)(
                     kwargs["k_cache"], kwargs["v_cache"], kwargs["page_table"], kwargs["cache_seqlens"],
@@ -266,6 +283,29 @@ _ATTN_CHECK = os.environ.get("SPARK_ATTN_CHECK") == "1"
 
 def _e4m3(tensor):
     return tensor is not None and str(tensor.dtype) == "torch.float8_e4m3fn"
+
+
+# SPARK_KV_NVFP4=target,draft | target | draft (unset = off): NVFP4 KV pools, patches/nvfp4_kv.py.
+_KV_NVFP4 = os.environ.get("SPARK_KV_NVFP4", "").strip()
+
+
+def _nvfp4(tensor):
+    if not _KV_NVFP4 or tensor is None:
+        return False
+    import nvfp4_kv
+    return nvfp4_kv.is_packed(tensor)
+
+
+if _KV_NVFP4:
+    @_on_import("sglang.srt.mem_cache.kv_cache_configurator")
+    def kv_nvfp4_pool(mod):
+        import nvfp4_kv  # derive the kernels now: a changed image fails the boot, not the first request
+        nvfp4_kv.install_configurator(mod)
+
+    @_on_import("sglang.srt.model_executor.pool_configurator")
+    def kv_nvfp4_sizing(mod):
+        import nvfp4_kv
+        nvfp4_kv.install_sizing(mod)
 
 
 # SPARK_DRAFT_KV_FP8=1 (unset = off): the draft's KV pool in e4m3 like the target's, read by patches/draft_decode.py.
@@ -506,7 +546,10 @@ def triton_decode(mod):
 
     def rel_bias_partials(q, k_cache, v_cache, page_table, seqused_k, rel_bias, softmax_scale, out, *,
                           window_size_left, verify):
-        if _e4m3(k_cache):
+        if _nvfp4(k_cache):
+            import nvfp4_kv
+            decode_partials = nvfp4_kv.decode_partials
+        elif _e4m3(k_cache):
             import paged_decode as fp8_decode  # not `paged_decode`: that would shadow the module for the BF16 branch
             decode_partials = fp8_decode.decode_partials_fp8
         elif _PAGED_DECODE:
@@ -515,7 +558,7 @@ def triton_decode(mod):
             from sglang.kernels.ops.inkling2.decode_attention_sm90 import decode_partials
         partials = _timed("decode_attn", decode_partials)(q, k_cache, v_cache, page_table, seqused_k, rel_bias,
                                                           softmax_scale, window_size_left=window_size_left)
-        if _ATTN_CHECK:
+        if _ATTN_CHECK and not _nvfp4(k_cache):
             import attn_check
             attn_check.decode(q, k_cache, v_cache, page_table, seqused_k, rel_bias, softmax_scale, window_size_left,
                               partials)

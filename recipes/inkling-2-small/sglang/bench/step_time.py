@@ -2,7 +2,7 @@
 --temperature is given (safe on a serving fleet).
 
     python3 bench/step_time.py <label> [--ref <label>[,<label>...]] [--widths 1,4,8] [--tokens 400] [--rounds 1]
-                               [--prompts 8] [--temperature 0] [--rid <prefix>] [--port 8210] [--report]
+                               [--prompts 8] [--temperature 0] [--rid <prefix>] [--context 0] [--port 8210] [--report]
 Coding questions (the first --prompts of 32), each alone, then four and eight at a time. Per request, from the
 server's own numbers: decode seconds (e2e minus prefill) over DSpark verify steps = ms a step, tokens a step,
 tokens/s. Per width: the median over requests, the lowest distinct-4-gram ratio (below 0.7 the model loops: a number
@@ -35,6 +35,9 @@ ap.add_argument("--prompts", type=int, default=8)
 ap.add_argument("--temperature", type=float, default=0.0, help="sampled requests: read the text, compare by the fit")
 ap.add_argument("--rid", default="", help="request id prefix; windows with SPARK_GATE_RID: gate-k8- = 8 verify rows")
 ap.add_argument("--report", action="store_true", help="no requests: print logs/steps-<label>.json again")
+ap.add_argument("--context", type=int, default=0, help="tokens of record context (bench/chatload.py) before every "
+                "question: decode steps behind a long prefix. The warm-up request prefills it cold (minutes at 500K); "
+                "the questions then share its cached part")
 ap.add_argument("--port", type=int, default=8210)
 args = ap.parse_args()
 LOGS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
@@ -72,10 +75,19 @@ Q = ["Write a Python function that checks whether a string is a palindrome, igno
      "Implement quickselect in C++ with a median-of-three pivot and explain its expected running time."][:args.prompts]
 
 
+if args.context and not args.report:
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import chatload as cl
+    cl.PORT = args.port
+    _ctx = cl.Records(cl.lines_for(args.context), 7000021 + args.context).text()
+    Q = [_ctx + "\n\nIgnore the records. " + q for q in Q]
+
+
 def post(route, **body):
     req = urllib.request.Request(f"http://localhost:{args.port}/{route}", json.dumps(body).encode(),
                                  {"content-type": "application/json"})
-    return json.load(urllib.request.urlopen(req, timeout=3600))
+    return json.load(urllib.request.urlopen(req, timeout=7200))
 
 
 def d4(o):

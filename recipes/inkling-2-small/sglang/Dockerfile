@@ -4,6 +4,7 @@
 #   /patches                      the hooks (on PYTHONPATH, so the interpreter imports patches/sitecustomize.py at
 #                                 start), the confidence head's file included
 #   /opt/inkling2-spark           the launcher, the client-side checks, the docs, kernels/ and the licence files
+#   /opt/inkling2-spark/nvfp4-kv  the recipe ../sglang-nvfp4-kv (its quickstart.sh runs from a clone, not from here)
 #   /opt/inkling2-spark/prebuilt  spark_csf_gemm_sm120.so, the forked grouped GEMM of the packed block scales, built by
 #                                 kernels/csf_gemm/build_csf_gemm.py from this same base image (README, Run it, step 2)
 # Nothing is compiled or installed while the image is built, and no hook is switched on here: the launcher sets the
@@ -12,6 +13,7 @@
 # clone it is launched from.
 # Build on a Spark (arm64), from this directory, after building the module (step 2 of the README):
 #   docker build --build-context repo=../../.. --build-context prebuilt="$HOME/inkling2-csf-build" \
+#     (from a clean checkout or a `git archive` of one: the build copies what is on disk)
 #     --build-arg REVISION=$(git rev-parse --short HEAD) -t sglang-inkling2-spark:local .
 # Published as aidendle94/sparkrun-sglang-inkling2-gb10:<tag>; the README names the current tag. Every change to the
 # recipe gets a new tag.
@@ -25,6 +27,7 @@ LABEL org.opencontainers.image.title="Inkling-2-Small on 4x DGX Spark (SGLang + 
       org.opencontainers.image.base.name="lmsysorg/sglang:dev-inkling-2-small"
 COPY --from=repo LICENSE /opt/inkling2-spark/LICENSE
 COPY --from=repo licenses /opt/inkling2-spark/licenses
+COPY --from=repo recipes/inkling-2-small/sglang-nvfp4-kv /opt/inkling2-spark/nvfp4-kv
 COPY NOTICE README.md recipe.yaml /opt/inkling2-spark/
 COPY docs /opt/inkling2-spark/docs
 COPY bench /opt/inkling2-spark/bench

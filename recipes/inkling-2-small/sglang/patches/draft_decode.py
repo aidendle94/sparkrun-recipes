@@ -55,7 +55,9 @@ _TILE_N = "    block_n = 128 if qlen == 1 and span >= 128 * max_splits else 32\n
 _TILE_N_SET = "    block_n = BLOCK or (128 if qlen == 1 and span >= 128 * max_splits else 32)\n"
 _NONE = ("rel_bias", "rel_bias_prep_cache", "sinks", "score_mod", "mask_mod", "aux_tensors", "q_descale", "k_descale",
          "v_descale", "qv", "sfq", "sfk", "sfv", "k", "v", "cache_batch_idx", "cache_leftpad")
-ROWS = 32  # (token, head) rows a program of the reduction takes
+ROWS = 1  # (token, head) rows a program of the reduction takes: one, so the 96 rows of a block of 8 spread over the
+# SMs (32 rows a program until 2026-11-23: three programs, each reading every split's partials of 32 rows, 45 us
+# more a call; bench/nvfp4_kv_sweep.py: 67.5 -> 22.9 us for a call at 3,000 keys, the same bits)
 
 
 def _replace(src, old, new):
@@ -111,10 +113,11 @@ def _combine(O, M, L, Out, rows, splits, D: tl.constexpr, ROWS: tl.constexpr):
     tl.store(Out + r[:, None] * D + d[None, :], out.to(Out.dtype.element_ty), mask[:, None])
 
 
-def attend(q, k_cache, v_cache, page_table, seqused_k, softmax_scale=None, out=None):
+def attend(q, k_cache, v_cache, page_table, seqused_k, softmax_scale=None, out=None, kern=None):
     """q (batch * qlen, heads_q, d): a block of qlen queries per sequence, every one attending to the sequence's
     first seqused_k keys (the block's own included). k/v cache (pages, page_size, heads_k, d), e4m3; page_table
-    (batch, pages of a sequence). Returns out (batch * qlen, heads_q, d), q's dtype unless `out` is given."""
+    (batch, pages of a sequence). Returns out (batch * qlen, heads_q, d), q's dtype unless `out` is given. `kern`:
+    the derived kernel module (patches/nvfp4_kv.py passes its NVFP4 one), this module's e4m3 one by default."""
     tokens, heads, dim = q.shape
     if out is None:
         out = torch.empty_like(q)
@@ -123,7 +126,7 @@ def attend(q, k_cache, v_cache, page_table, seqused_k, softmax_scale=None, out=N
     assert q.is_contiguous() and k_cache.stride(3) == 1 and page_table.stride(1) == 1, "draft_decode: strided input"
     if softmax_scale is None:
         softmax_scale = dim ** -0.5
-    o, m, l = kernel.decode_partials(q, k_cache, v_cache, page_table, seqused_k, q, softmax_scale)  # q: the unread bias
+    o, m, l = (kern or kernel).decode_partials(q, k_cache, v_cache, page_table, seqused_k, q, softmax_scale)  # q: the unread bias
     rows = tokens * heads
     dest = out if out.is_contiguous() else torch.empty(out.shape, dtype=out.dtype, device=out.device)
     assert dest.numel() == rows * dim, f"draft_decode: out {tuple(out.shape)} for q {tuple(q.shape)}"
@@ -173,7 +176,7 @@ def not_handled(kwargs, _told=[]):
         tuple(lens.shape) if isinstance(lens, torch.Tensor) else None, kwargs.get("max_seqlen_q"))
 
 
-def fa4_call(**kwargs):
+def fa4_call(kern=None, **kwargs):
     """flash_attn_with_kvcache's keyword arguments, for a call that handles() accepts."""
     return attend(kwargs["q"], kwargs["k_cache"], kwargs["v_cache"], kwargs["page_table"], kwargs["cache_seqlens"],
-                  kwargs.get("softmax_scale"), kwargs.get("out"))
+                  kwargs.get("softmax_scale"), kwargs.get("out"), kern)

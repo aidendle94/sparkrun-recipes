@@ -41,7 +41,7 @@ def gather_bf16(cache, idx):
     return out
 
 
-def bf16_view(k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q, window_left, q_tokens):
+def bf16_view(k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q, window_left, q_tokens, gather=None):
     """The K/V a paged FA4 call reads, as BF16 caches, and the page table into them.
 
     The queries are the last qlen positions of each sequence; with a window they read keys from
@@ -62,4 +62,5 @@ def bf16_view(k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q, window_
     offset = torch.cumsum(rows, 0) - rows
     pos = torch.arange(width, device=page_table.device, dtype=torch.int64)
     table = ((pos[None, :] - lo[:, None]).clamp_(min=0) + offset[:, None]).clamp_(max=max(idx.numel() - 1, 0))
-    return gather_bf16(k_cache, idx), gather_bf16(v_cache, idx), table.to(page_table.dtype)
+    gather = gather or gather_bf16  # patches/nvfp4_kv.py passes its NVFP4 gather
+    return gather(k_cache, idx), gather(v_cache, idx), table.to(page_table.dtype)
