@@ -2,8 +2,8 @@
 model: thinkingmachines/Inkling-2-Small
 weights: aidendle94/Inkling-2-Small-DGX-Spark      # rank0/ .. rank3/, one folder of about 93 GB per node
 engine: sglang
-based_on: ../sglang                                  # the same launcher, hooks and checks, with KV_NVFP4=target,draft and PRESHARDED=1
-image: aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.5   # lmsysorg/sglang@sha256:424c1da9... (dev-inkling-2-small, 2026-11-12) + this repository's hooks
+based_on: ../sglang                                  # the same launcher, hooks and checks, with KV_NVFP4=target,draft, PRESHARDED=1 and CHUNK=8192
+image: aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.6   # lmsysorg/sglang@sha256:424c1da9... (dev-inkling-2-small, 2026-11-12) + this repository's hooks
 status: experimental
 nodes: 4 x NVIDIA DGX Spark (GB10, 128 GB), RoCE fabric, TP4/EP4
 context_length: 524288
@@ -17,7 +17,10 @@ numbers:                                             # temperature 1.0; FP8 coun
   aggregate_tok_s_t10: {c4: [88.7, 103.7], c8: [128.6, 129.6]}                             # [89.1-101.7, 125.9-126.0]
   heldout_nll: {nvfp4: 1.4437, fp8: 1.4437, difference: 0.0001, se: 0.0022, tokens: 10547, mean_abs_token_change: 0.113}
   lookups_130k_40q: {nvfp4: 35, fp8: 36, wrong: 0}
-  cold_prefill_tok_s: {60k: 2763, 130k: 2549}
+  cold_prefill_tok_s: {30k: [3248, 3249], 60k: [3113, 3119], 120k: [2840, 2865]}   # CHUNK=8192, idle fleet, 2026-11-23
+  cold_prefill_tok_s_chunk4096: {nvfp4: {30k: [2821, 2916], 60k: [2820, 2827], 120k: [2615, 2626]}, fp8: {30k: 2821, 60k: [2824, 2834], 120k: [2615, 2620]}}   # the same prompts: the cache format does not change prefill
+  stress_min_mem_available_gb: {rank0: 3.2, rank1: 6.0, rank2: 6.8, rank3: 6.1}   # bench/stress.py 8 workers (2 at 210K) + image_stress + swa_fill at once, CHUNK=8192
   boot_to_healthy_s: {warm: 202}
+chunked_prefill_size: 8192
 features: [text, images, tools, thinking, reasoning_effort, dspark, confidence_gate, confidence_head, nvfp4_kv, nvfp4_draft_kv, presharded_weights, sharded_experts, packed_block_scales, prefill_glue, rdma_collectives, reasoning_cache, prometheus_metrics, quickstart]
 license: MIT

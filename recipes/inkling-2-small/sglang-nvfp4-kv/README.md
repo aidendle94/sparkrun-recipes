@@ -14,10 +14,13 @@ Against the same stack with the FP8 KV cache, measured on one fleet on 2026-11-2
 | decode, one stream, behind 130K tokens of context | 54.1 tok/s | 55.7 tok/s |
 | decode, four streams behind 130K, per stream | 23.6 tok/s | 25.4 tok/s |
 | decode, one stream, behind 500K tokens of context | 47.6 tok/s | **52.2 tok/s** |
+| cold prefill, 30K / 120K tokens, the same prefill chunk (4,096 tokens) | 2,821 / 2,615–2,620 tok/s | 2,821–2,916 / 2,615–2,626 tok/s |
+| cold prefill, 30K / 120K tokens, with this recipe's chunk of 8,192 tokens | | **3,248 / 2,840–2,865 tok/s** |
 | held-out NLL, 10,547 tokens | 1.4437 | 1.4437 (difference +0.0001 ± 0.0022) |
 | lookups in a 130K-token context, 40 questions | 36 right | 35 right, no wrong answer in either |
 
-Decode is at temperature 1.0, one boot each. The lookup misses on both caches are the model reciting the context
+Decode is at temperature 1.0, one boot each. Prefill is two prompts per length on an idle fleet: the cache format
+does not change it (reading the cache is 0.3% of a prefill); the larger chunk does. The lookup misses on both caches are the model reciting the context
 or running out of its 1,500 tokens before answering, about one lookup in ten; see Known problems in `../sglang`.
 
 **Status: experimental.** The engine is the SGLang team's development image for this model, and the GB10 hooks
@@ -86,7 +89,7 @@ same settings after three failures; `--stop` stops it first. Logs: `~/inkling2-l
 on the first node, `docker logs inkling2` on every node.
 
 Every setting of the launcher in `../sglang` works here too, in front of `launch/relaunch.sh`. The top of
-[`../sglang/launch/launch-inkling2.sh`](../sglang/launch/launch-inkling2.sh) lists them. This recipe sets four of
+[`../sglang/launch/launch-inkling2.sh`](../sglang/launch/launch-inkling2.sh) lists them. This recipe sets five of
 them in [`launch/settings.sh`](launch/settings.sh), and a value set on the command line wins:
 
 | setting | here | |
@@ -94,10 +97,14 @@ them in [`launch/settings.sh`](launch/settings.sh), and a value set on the comma
 | `KV_NVFP4` | `target,draft` | the NVFP4 KV cache, for the model and its draft |
 | `PRESHARDED` | `1` | every node loads its own 93 GB folder instead of the 394 GB checkpoint |
 | `INKLING_REPO_REL` | `inkling2-weights` | where that folder is, under each node's home |
-| `INKLING_IMAGE` | `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.5` | the engine image with this repository's hooks |
+| `CHUNK` | `8192` | tokens one prefill batch takes (`../sglang`: 4096): 9–14% faster prefill, about 1.5 GB less free memory on each node during a long prefill. 16384 does not fit beside this pool |
+| `INKLING_IMAGE` | `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.6` | the engine image with this repository's hooks |
 
 The pool cap follows the cache: 1,409,000 tokens hold the bytes that 793,000 FP8 tokens did, so the memory left on
-every node is the same as with `../sglang`'s defaults.
+every node is the same as with `../sglang`'s defaults. Under the heaviest mixed load measured (two conversations of
+210,000 tokens, six more agent workers, a burst of large pictures and the windowed pool run full, all at once) the
+first node kept at least 3.2 GB free and the others at least 6.0 GB; every answer was right and the server stayed up.
+`CHUNK=4096 launch/relaunch.sh` gives back about 1.5 GB at the cost of the prefill gain.
 
 ## What the NVFP4 KV cache is
 

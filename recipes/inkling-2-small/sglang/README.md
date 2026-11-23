@@ -222,8 +222,8 @@ hf download thinkingmachines/Inkling-2-Small --revision b0e7afb8892a07897c78ce1c
 #    If the tag has moved since then and a boot fails in a hook, pull that digest and set INKLING_IMAGE to it.
 docker pull lmsysorg/sglang:dev-inkling-2-small
 #    Or that pinned build with this recipe's hooks already inside (one small layer on top, see the Dockerfile):
-#      docker pull aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.5
-#      export INKLING_IMAGE=aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.5     # before launching
+#      docker pull aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.6
+#      export INKLING_IMAGE=aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.6     # before launching
 #    The launcher runs either image. It mounts its own patches/ over the image's, so the two cannot drift apart.
 #    This tag holds the hooks of this README, the confidence head's file, kernels/ and the prebuilt module of
 #    step 2. The fleet has served from it (2026-11-23, with ../sglang-nvfp4-kv); most measurements here used
@@ -240,7 +240,7 @@ docker run --rm --network none --memory 16g --cpus 8 \
   --entrypoint /opt/sglang/bin/python3 lmsysorg/sglang:dev-inkling-2-small /k/build_csf_gemm.py /out
 cp "$HOME/inkling2-csf-build/spark_csf_gemm_sm120.so" patches/
 #    With the hooks image of step 1 there is nothing to build: copy its prebuilt module instead (no GPU, seconds).
-#      docker run --rm --entrypoint cat aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.5 \
+#      docker run --rm --entrypoint cat aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.6 \
 #        /opt/inkling2-spark/prebuilt/spark_csf_gemm_sm120.so > patches/spark_csf_gemm_sm120.so
 #    Without that file the launcher prints "note: patches/spark_csf_gemm_sm120.so is not built
 #    (kernels/csf_gemm/build_csf_gemm.py): the packing is off for this launch" and starts the stack without the
@@ -426,7 +426,8 @@ temperature 1.0; `bench/step_time.py --context` puts a cached record context bef
 | step time at equal accept, short context | | -0.73 ms (se 0.43), -1.3% |
 | decode behind 130K, 1 stream / 4 streams (per stream) | 54.1 / 23.6 tok/s, 62.5 ms a step | 55.7 / 25.4 tok/s, 60.2 ms a step; -1.94 ms at equal accept (se 0.44), -3.1% |
 | decode behind 500K, 1 stream | 47.6 tok/s, 77.5 ms a step | 52.2 tok/s, 67.0 ms a step; -10.3 ms at equal accept (se 0.93), -13.2% |
-| cold prefill, 60K / 130K | | 2,763 / 2,549 tok/s (FP8 on 2026-11-19: 2,738 at 60K) |
+| cold prefill 30K / 60K / 120K, prefill chunk 4,096 (`bench/prefill_ab.py`, two prompts a length, idle fleet) | 2,821 / 2,824-2,834 / 2,615-2,620 tok/s | 2,821-2,916 / 2,820-2,827 / 2,615-2,626 tok/s |
+| cold prefill 30K / 60K / 120K, prefill chunk 8,192 (`CHUNK=8192`, the default of `../sglang-nvfp4-kv`) | | 3,248-3,249 / 3,113-3,119 / 2,840-2,865 tok/s |
 | concurrency check / pictures / windowed pool run full | ALL OK / 21 of 21 | ALL OK / 21 of 21 / 208 lookups right |
 
 The per-token NLL change compares with the width-sharded experts' (mean per-token change 0.093, 26% by more than
@@ -438,6 +439,17 @@ Tests: `bench/nvfp4_kv_cpu.py` (format, store and gather in the Triton interpret
 `bench/compile_check_nvfp4.py` (GB10 compile, shared memory, registers), `bench/nvfp4_kv_test.py` (idle GPU: store
 bytes equal the torch reference, readers against FP64, the pool class end to end, timing), `bench/nvfp4_kv_sweep.py`
 (each reader step: how far it moves the result, and its time).
+
+Where a cold prefill's time goes (`SPARK_TIMERS=1`, 120K tokens, prefill chunk 4,096, rank 0; a chunk takes 1,586 ms,
+median): the routed experts 46% (the NVFP4 layers 460 ms, the MXFP8 ones 129 ms; both already on GB10's FP4 and FP8
+tensor cores), the attention blocks 41%, of which the global layers' attention 15% on average (12 ms a chunk at the
+start, 475 ms at 115K of prefix), the all-reduces 17%, and reading the NVFP4 cache (`fp4_view_g`) 0.3%. The cache
+format therefore does not change prefill. A chunk of 8,192 tokens gives the expert GEMMs twice the rows: 9-14% faster,
+with the lowest free memory during a long prefill at 5.0 GB on rank 0 (6.5 with 4,096) and 7.4-8.0 GB on ranks 2-3
+(9.0). Under the heaviest mixed load measured (`bench/stress.py`, 8 workers, 2 on 210,000-token contexts, with
+`bench/image_stress.py` and `bench/swa_fill.py` on top) rank 0 kept 3.2 GB and the others 6.0-6.8 GB; every check
+passed. A chunk of 16,384 does not fit beside the 1,409,000-token pool: the first chunk took ranks 2-3 to 2.7 GB and
+earlyoom stopped their servers.
 
 ## Using it as a client
 
@@ -518,7 +530,7 @@ bytes equal the torch reference, readers against FP64, the pool class end to end
 | `launch/launch-inkling2.sh` | one container per node (`inkling2`), RoCE/NCCL environment, the hooks on PYTHONPATH; `--dry-run`, `--stop` |
 | `launch/relaunch-inkling2.sh` | disarm the watchdog, launch, wait for /health, re-arm the watchdog (use this to restart) |
 | `launch/watchdog-inkling2.sh` | probes and relaunches (log `~/inkling2-watchdog.log`); before a relaunch it saves every rank's state, stacks and stall evidence |
-| `Dockerfile` | the hooks image: the pinned base plus `patches/` on `PYTHONPATH`, published as `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.5` (no hook is switched on in it: the launcher's variables do that). It holds the hooks of this README, `kernels/` and the prebuilt module of step 2 |
+| `Dockerfile` | the hooks image: the pinned base plus `patches/` on `PYTHONPATH`, published as `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.6` (no hook is switched on in it: the launcher's variables do that). It holds the hooks of this README, `kernels/` and the prebuilt module of step 2 |
 | `launch/fleet.env.example` | the site file; copy to `launch/fleet.env` (git-ignored) |
 | `patches/sitecustomize.py` | installs the hooks at interpreter start in every rank; the other `.py` files in `patches/` are the hooks |
 | `patches/gate-head-mlp-reg.pt` | the confidence head the launcher's `GATE_HEAD` names: a 256-unit MLP, 4.7 MB, sha256 `0bc7b3d52da6c1bd...`, read by `patches/spark_gate_head.py`. Trained for this recipe on the draft's hidden states (see [docs/results.md](docs/results.md)); no weight of the model is in it |
@@ -531,6 +543,7 @@ bytes equal the torch reference, readers against FP64, the pool class end to end
 | `patches/preshard.py`, `bench/preshard_test.py` | pre-sharded weights (`PRESHARDED`, `SPARK_PRESHARD_EXPORT`, `SPARK_PRESHARD_CHECK`): a rank folder written at the end of the engine's copy loop and loaded from there, checksummed; the hook's CPU test |
 | `patches/vision_sm12x.py` | picture input on GB10 (`IMAGES`): the encoder's attention, the size cap, the lean path of a picture's data through the engine |
 | `patches/nvfp4_kv.py` | the NVFP4 KV cache (`KV_NVFP4`): the pool, the store, the decode / verify, draft and prefill readers, the pool sizing |
+| `bench/prefill_ab.py` | cold prefill at a few lengths with the same prompts on every boot, waiting for an idle server and dropping requests that shared it |
 | `bench/nvfp4_kv_cpu.py`, `bench/compile_check_nvfp4.py`, `bench/nvfp4_kv_test.py`, `bench/nvfp4_kv_sweep.py` | the NVFP4 format and kernels in Triton's CPU interpreter; compiled for GB10 without a GPU; on one idle GPU against FP64 and the torch reference, with timings; each reader step's time and how far it moves the result |
 | `bench/image_check.py`, `bench/make_test_images.py` | pictures with known content over every endpoint, answers checked (safe on a serving fleet); the pictures, drawn in the image |
 | `bench/image_stress.py`, `bench/make_stress_images.py` | very large, odd and broken pictures, many at once, the server's health after each (planned windows) |

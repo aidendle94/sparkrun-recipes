@@ -987,9 +987,25 @@ pre-sharded weights. Decode at temperature 1.0, 400 tokens a request, 16 coding 
 | behind 130K, one stream | 54.14 tok/s, 62.50 ms a step | 55.74 tok/s, 60.23 ms; at equal accept -1.94 ms (se 0.44) |
 | behind 130K, 4 streams, per stream | 23.55 tok/s, 137.37 ms a step | 25.42 tok/s, 127.47 ms |
 | behind 500K, one stream | 47.58 tok/s, 77.51 ms a step | 52.22 tok/s, 67.02 ms; at equal accept -10.31 ms (se 0.93); every request faster (x0.81 to x0.89) |
-| cold prefill 60K / 130K | 2,738 at 60K (2026-11-19) | 2,763 / 2,549 tok/s |
+| cold prefill 30K / 60K / 120K, prefill chunk 4,096 (`bench/prefill_ab.py`: the same prompts on both boots, two a length, idle fleet, requests that shared the server dropped) | 2,821 / 2,824-2,834 / 2,615-2,620 tok/s | 2,821-2,916 / 2,820-2,827 / 2,615-2,626 tok/s |
+| cold prefill 30K / 60K / 120K, prefill chunk 8,192 (`CHUNK=8192`, the default of `../sglang-nvfp4-kv`) | | 3,248-3,249 / 3,113-3,119 / 2,840-2,865 tok/s |
 | concurrency check / pictures / windowed pool run full (`bench/swa_fill.py --convs 192`) | ALL OK / 21 of 21 | ALL OK / 21 of 21 / 192 + 8 + 8 lookups right, 141,000-253,000 tokens evicted |
 | boot to healthy | 201 s | 201-202 s |
+
+Where a cold prefill's time goes (`SPARK_TIMERS=1`, 120K tokens, prefill chunk 4,096, rank 0; a chunk takes 1,586 ms,
+median): the routed experts 46% (the NVFP4 layers 460 ms, the MXFP8 ones 129 ms; both already on GB10's FP4 and FP8
+tensor cores), the attention blocks 41%, of which the global layers' attention 15% on average (12 ms a chunk at the
+start, 475 ms at 115K of prefix), the all-reduces 17%, and reading the NVFP4 cache (`fp4_view_g`) 0.3%. The cache
+format therefore does not change prefill. A chunk of 8,192 tokens gives the expert GEMMs twice the rows: 9-14% faster,
+with the lowest free memory during a long prefill at 5.0 GB on rank 0 (6.5 with 4,096) and 7.4-8.0 GB on ranks 2-3
+(9.0). Under the heaviest mixed load measured (`bench/stress.py`, 8 workers, 2 on 210,000-token contexts, with
+`bench/image_stress.py` and `bench/swa_fill.py` on top) rank 0 kept 3.2 GB and the others 6.0-6.8 GB; every check
+passed. A chunk of 16,384 does not fit beside the 1,409,000-token pool: the first chunk took ranks 2-3 to 2.7 GB and
+earlyoom stopped their servers.
+
+An earlier comparison on this page (NVFP4 at 60K / 130K on 2026-11-23 against FP8 at 30K / 120K on 2026-11-17) mixed
+lengths and stacks; the FP8 figures of 2026-11-17 (3,110 / 2,786) were not idle-gated and neither cache reaches them
+on the current stack.
 
 Kernel time per call in a CUDA graph on one idle GB10 (`bench/nvfp4_kv_sweep.py`, `bench/nvfp4_kv_test.py`), 8
 queries a request on 12 query heads over 2 key heads:
