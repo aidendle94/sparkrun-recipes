@@ -131,18 +131,26 @@ def rows(logit, thr):
     return (surv >= thr).long().cumprod(1).sum(1) + 1
 
 
-def step_logits_k(head, z, d, temps, greedy, hidden, A, B, consts):
+FUSED = os.environ.get("SPARK_GATE_FUSED") == "1"
+
+
+def step_logits_k(head, z, d, temps, greedy, hidden, A, B, consts, fused_out=None):
     """(logits [bs, 7], K [bs]) of a step: z [>= bs, 7, V] step logits, d [bs, 7] drafted tokens, temps [bs], greedy
-    [bs], hidden [bs * 7, H]. A request at a time through the vocabulary-wide scratch (A, B)."""
+    [bs], hidden [bs * 7, H]. A request at a time through the vocabulary-wide scratch (A, B), or with fused_out (a
+    [>= bs, 7, 5] float32 buffer) all requests in one pass of patches/gate_stats.py (SPARK_GATE_FUSED=1)."""
     bs = d.shape[0]
-    per = [stats_torch(z[b], d[b], temps[b], greedy[b], A, B) for b in range(bs)]
-    lq, top1, top2, ent, q = (torch.stack([r[i] for r in per]) for i in range(5))
+    if fused_out is not None:
+        import gate_stats
+        lq, top1, top2, ent, q = gate_stats.stats(z, d, temps[:bs], greedy[:bs], A.shape[1], out=fused_out[:bs])
+    else:
+        per = [stats_torch(z[b], d[b], temps[b], greedy[b], A, B) for b in range(bs)]
+        lq, top1, top2, ent, q = (torch.stack([r[i] for r in per]) for i in range(5))
     logit = predict(head, hidden, features(lq, top1, top2, ent, q, temps, greedy, consts))
     return logit, rows(logit, head["thr"])
 
 
-def step_rows(head, z, d, temps, greedy, hidden, A, B, consts):
-    return step_logits_k(head, z, d, temps, greedy, hidden, A, B, consts)[1]
+def step_rows(head, z, d, temps, greedy, hidden, A, B, consts, fused_out=None):
+    return step_logits_k(head, z, d, temps, greedy, hidden, A, B, consts, fused_out)[1]
 
 
 def exchange(group, k, differ):
@@ -202,7 +210,8 @@ def selftest(head, width, live, device):
                              torch.tensor([True, False], device=device), h.to(device),
                              torch.zeros((G, live), dtype=torch.float32, device=device),
                              torch.zeros((G, live), dtype=torch.float32, device=device),
-                             (has_next, torch.eye(G, dtype=torch.float32, device=device)))
+                             (has_next, torch.eye(G, dtype=torch.float32, device=device)),
+                             torch.zeros((bs, G, 5), dtype=torch.float32, device=device) if FUSED else None)
     assert bool(torch.isfinite(logit).all()) and int(k.min()) >= 1 and int(k.max()) <= G + 1, "the self-test's values"
     return hashlib.sha256(logit.cpu().numpy().tobytes() + k.cpu().numpy().tobytes()).hexdigest()[:16]
 
@@ -281,15 +290,17 @@ def _arm(sampler, width_of):
     _s["A"] = torch.zeros((G, live), dtype=torch.float32, device=device)
     _s["B"] = torch.zeros((G, live), dtype=torch.float32, device=device)
     _s["kbuf"] = torch.full((int(sampler.max_bs),), G + 1, dtype=torch.int64, device=device)
+    _s["fused"] = torch.zeros((int(sampler.max_bs), G, 5), dtype=torch.float32, device=device) if FUSED else None
     _s["differ"] = torch.zeros((), dtype=torch.int64, device=device)
     has_next = torch.ones(G, dtype=torch.float32, device=device)
     has_next[-1] = 0
     _s["consts"] = (has_next, torch.eye(G, dtype=torch.float32, device=device))
     _s["sampler"], _s["head"], _s["group"], _s["why"] = sampler, head, group, ""
     _log.warning("[gate head] armed on %d rank(s): %s (sha %s, %s), hidden %d, vocabulary %d (%d read), thresholds %s, "
-                 "self-test %s, K exchanged every step: %s", len(votes), PATH, head["sha"], head["meta"].get("name"),
+                 "self-test %s, K exchanged every step: %s, statistics %s", len(votes), PATH, head["sha"], head["meta"].get("name"),
                  head["wh"].shape[0], int(head["meta"]["vocab"]), live,
-                 [round(float(t), 4) for t in head["thr"].tolist()], digest, group is not None)
+                 [round(float(t), 4) for t in head["thr"].tolist()], digest, group is not None,
+                 "fused (one pass, SPARK_GATE_FUSED)" if FUSED else "per request (torch)")
 
 
 def _tail(sampler, model_hidden, bs):
@@ -298,7 +309,7 @@ def _tail(sampler, model_hidden, bs):
     if head is None or sampler is not _s["sampler"] or sampler.step_logits is None or bs > _s["kbuf"].shape[0]:
         return
     k = step_rows(head, sampler.step_logits, sampler.out[: bs * G].view(bs, G), sampler.params.temperatures[:bs],
-                  sampler.params.greedy_mask[:bs], model_hidden, _s["A"], _s["B"], _s["consts"])
+                  sampler.params.greedy_mask[:bs], model_hidden, _s["A"], _s["B"], _s["consts"], _s.get("fused"))
     if _s["group"] is not None:
         k = exchange(_s["group"], k, _s["differ"])
     _s["kbuf"][:bs].copy_(k)

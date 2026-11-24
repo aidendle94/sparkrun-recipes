@@ -62,6 +62,7 @@ Both are on when nothing is set, so the serving line is unchanged.
 |---|---|---|
 | `SCALE_PACK` (1, serving since 2026-11-19 18:33 UTC) | `SPARK_SCALE_PACK=1` and `SPARK_CSF_GEMM=/patches/spark_csf_gemm_sm120.so` | the block scales as loaded and FlashInfer's own grouped GEMM: the stack before 2026-11-19 |
 | `GATE_HEAD` (gate-head-mlp-reg.pt, serving since 2026-11-20 11:47 UTC) | `SPARK_GATE_HEAD=/patches/gate-head-mlp-reg.pt` | the gate's own rule, the draft's token probability against `GATE`: the stack before 2026-11-20 |
+| `GATE_FUSED` (1, since 2026-11-24; only with `GATE_HEAD`) | `SPARK_GATE_FUSED=1` | the head's statistics a request at a time in torch, as before 2026-11-24 |
 
 The launcher copies the module and the head file to every node with the hooks. It turns either switch off by
 itself, with a note on stderr, when what the switch needs is missing: the packing without `FI_MOE=1` and `TP_SHARD`
@@ -1031,6 +1032,29 @@ reduction of the split partials took 32 rows a program (three programs on 48 SMs
 Accuracy against FP64 over the stored values (4 requests, 3,000 keys; 4 requests, 25,000 keys for the long tiles):
 the NVFP4 kernel 0.69e-4 to 1.10e-4 relative L2, the BF16 kernel on the same values 6.05e-4 to 7.99e-4. The steps
 move the result by FP32 rounding against the general loop: far loop 0.8e-6 to 8.9e-6, tiles of 64 2.1e-5 to 5.9e-5.
+
+## The confidence head's statistics in one pass (2026-11-24; the launcher's default, `GATE_FUSED=` turns it off)
+
+The head reads five numbers per drafted position from the draft's step logits: log p of the drafted token, the two
+largest log p, the entropy, and the drafted token's probability at the request's temperature (for a greedy request: 1
+if it is the one best token, 0 on a tie at the top). `patches/spark_gate_head.stats_torch` computes them a request at
+a time in eight passes over a 201,024-wide float32 copy. `patches/gate_stats.py` computes them for the whole step in
+one Triton launch, program (request, position) reading its row once in blocks of 2,048 and keeping the two largest
+values with multiplicity, the running maximum and three rescaled sums.
+
+| measure (one GB10, the real vocabulary, `bench/gate_stats_test.py`) | per request (torch) | one pass |
+|---|---:|---:|
+| one request a step | 338 us | 106 us |
+| four requests | 1,234 us | 106 us |
+| eight requests | 2,495 us | 136 us |
+| largest difference of the five numbers (entropy / the others) | | 2.6e-5 / 1.9e-6 |
+| row count through the serving head, 400 random request-steps | | 400 equal |
+
+Serving test boots of 2026-11-24, one boot each, bench/step_time.py at temperature 1.0, 16 coding prompts: one stream
+58.14 tok/s as before and 59.88 tok/s with the one pass; paired by prompt at equal accept -0.34 ms a step (se 0.38).
+The four ranks agreed on the row count on all 6,574 request-steps (`[gate] ... ranks differ=0`) and the concurrency
+check passed. At four streams the step time and the tokens a step both moved between the boots (sampling), so that
+run does not separate the change; the saving there is 1.1 ms a step by the kernel timings.
 
 ## Long contexts and multi-turn history (2026-11-14)
 

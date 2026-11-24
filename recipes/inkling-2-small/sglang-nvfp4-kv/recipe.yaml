@@ -3,7 +3,7 @@ model: thinkingmachines/Inkling-2-Small
 weights: aidendle94/Inkling-2-Small-DGX-Spark      # rank0/ .. rank3/, one folder of about 93 GB per node
 engine: sglang
 based_on: ../sglang                                  # the same launcher, hooks and checks, with KV_NVFP4=target,draft, PRESHARDED=1 and CHUNK=8192
-image: aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.6   # lmsysorg/sglang@sha256:424c1da9... (dev-inkling-2-small, 2026-11-12) + this repository's hooks
+image: aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.7   # lmsysorg/sglang@sha256:424c1da9... (dev-inkling-2-small, 2026-11-12) + this repository's hooks
 status: experimental
 nodes: 4 x NVIDIA DGX Spark (GB10, 128 GB), RoCE fabric, TP4/EP4
 context_length: 524288

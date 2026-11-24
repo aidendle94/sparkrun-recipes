@@ -10,5 +10,5 @@ export PRESHARDED="${PRESHARDED-1}"                             # every node loa
 export INKLING_REPO_REL="${INKLING_REPO_REL-inkling2-weights}"  # ... from this directory under each node's home
 export CHUNK="${CHUNK:-8192}"                                  # tokens a prefill batch takes (../sglang: 4096): +9-14% prefill
 # The image: the engine build the hooks were written against (pinned by digest inside), with this tree's files.
-export INKLING_IMAGE="${INKLING_IMAGE:-aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.6}"
+export INKLING_IMAGE="${INKLING_IMAGE:-aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.7}"
 WEIGHTS_REPO=aidendle94/Inkling-2-Small-DGX-Spark               # rank0/ .. rank3/ on the Hugging Face Hub

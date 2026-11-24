@@ -98,7 +98,7 @@ them in [`launch/settings.sh`](launch/settings.sh), and a value set on the comma
 | `PRESHARDED` | `1` | every node loads its own 93 GB folder instead of the 394 GB checkpoint |
 | `INKLING_REPO_REL` | `inkling2-weights` | where that folder is, under each node's home |
 | `CHUNK` | `8192` | tokens one prefill batch takes (`../sglang`: 4096): 9–14% faster prefill, about 1.5 GB less free memory on each node during a long prefill. 16384 does not fit beside this pool |
-| `INKLING_IMAGE` | `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.6` | the engine image with this repository's hooks |
+| `INKLING_IMAGE` | `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.7` | the engine image with this repository's hooks |
 
 The pool cap follows the cache: 1,409,000 tokens hold the bytes that 793,000 FP8 tokens did, so the memory left on
 every node is the same as with `../sglang`'s defaults. Under the heaviest mixed load measured (two conversations of
