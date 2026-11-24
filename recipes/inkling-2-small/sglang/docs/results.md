@@ -63,6 +63,7 @@ Both are on when nothing is set, so the serving line is unchanged.
 | `SCALE_PACK` (1, serving since 2026-11-19 18:33 UTC) | `SPARK_SCALE_PACK=1` and `SPARK_CSF_GEMM=/patches/spark_csf_gemm_sm120.so` | the block scales as loaded and FlashInfer's own grouped GEMM: the stack before 2026-11-19 |
 | `GATE_HEAD` (gate-head-mlp-reg.pt, serving since 2026-11-20 11:47 UTC) | `SPARK_GATE_HEAD=/patches/gate-head-mlp-reg.pt` | the gate's own rule, the draft's token probability against `GATE`: the stack before 2026-11-20 |
 | `GATE_FUSED` (1, since 2026-11-24; only with `GATE_HEAD`) | `SPARK_GATE_FUSED=1` | the head's statistics a request at a time in torch, as before 2026-11-24 |
+| `ROCE_LIVE` (1, since 2026-11-24; only with `ROCE_AR` and `GATE`) | `SPARK_ROCE_LIVE=1`, and `SPARK_ROCE_AR_MAX=1200KB` | every per-row all-reduce sends all 8 rows a request, `SPARK_ROCE_AR_MAX=1MB` |
 
 The launcher copies the module and the head file to every node with the hooks. It turns either switch off by
 itself, with a note on stderr, when what the switch needs is missing: the packing without `FI_MOE=1` and `TP_SHARD`
@@ -1032,6 +1033,69 @@ reduction of the split partials took 32 rows a program (three programs on 48 SMs
 Accuracy against FP64 over the stored values (4 requests, 3,000 keys; 4 requests, 25,000 keys for the long tiles):
 the NVFP4 kernel 0.69e-4 to 1.10e-4 relative L2, the BF16 kernel on the same values 6.05e-4 to 7.99e-4. The steps
 move the result by FP32 rounding against the general loop: far loop 0.8e-6 to 8.9e-6, tiles of 64 2.1e-5 to 5.9e-5.
+
+## Live rows in the verify step's all-reduces (2026-11-24; the launcher's default, `ROCE_LIVE=` turns it off), and thresholds by batch size (`GATE_THR`, measured, off)
+
+The gate verifies K of a request's 8 rows (about 4.4 on average) but the verify graph keeps all 8, so each of its 96
+per-row all-reduces shipped 8 rows a request. `patches/roce_live.py` forks the b12x one-shot kernel: a device table
+written by the gate at the start of the verify forward, inside the graph, names the live rows; the kernel stages only
+those, rings the doorbell with their byte count (the proxy thread already posts a per-operation count), reduces them in
+fixed rank order from the compact payloads and copies its own input to the other rows. Every rank compiles the fork at
+boot and the ranks vote; no rank runs the stock kernel beside a rank that stages compact payloads.
+
+One all-reduce inside a captured chain of 96, slowest rank, us (`bench/ar_bench.sh` with `ROCE=1 LIVE=1`; live rows
+bit-equal to the stock sum and the other rows equal to the rank's input in every case, on four ranks):
+
+| tensor | all rows (stock kernel) | K=1 | K=3 | K=5 | K=8 |
+|---|---:|---:|---:|---:|---:|
+| attention output, 1 request (74 KB) | 28.8 | 18.4 | 21.4 | 24.6 | 29.7 |
+| expert combine, 1 request (147 KB) | 41.2 | 24.2 | 30.8 | 34.1 | 39.5 |
+| attention output, 4 requests (295 KB) | 60.2 | 26.5 | 37.7 | 47.2 | 62.7 |
+| expert combine, 4 requests (590 KB) | 106.4 | 37.5 | 56.2 | 76.9 | 105.0 |
+| attention output, 8 requests (590 KB) | 102.4 | 35.4 | 55.9 | 76.1 | 111.5 |
+
+Serving test boots, one each, greedy with a forced row count (`SPARK_GATE_RID=1`, `bench/step_time.py --rid gate-k<K>-`),
+ms a step:
+
+| requests | rows K | as before | live rows |
+|---:|---:|---:|---:|
+| 1 | 1 / 2 / 4 / 8 | 38.28 / 44.95 / 55.44 / 71.79 | 37.02 / 43.99 / 54.86 / 72.09 |
+| 4 | 1 / 2 / 4 / 8 | 72.83 / 89.73 / 114.03 / 150.57 | 66.36 / 85.99 / 112.05 / 147.57 |
+| 8 | 1 / 2 / 4 / 8 | 107.62 / 134.03 / 170.26 / 210.96 | 101.09 / 129.82 / 167.15 / 213.42 |
+
+At temperature 1.0 with the head's own rows, one stream: 57.53 and 58.95 tok/s, -0.78 ms a step (se 0.43) at equal
+accept. Greedy text identical on 32 of 32 prompts at one stream; at four and eight streams greedy text depends on
+which steps the requests share and differs between any two runs. Concurrency check passed; the ranks agreed on every
+row count (18,113 request-steps). With eight requests and every row live the expert all-reduce (1.18 MB) is slower on
+the RoCE runtime than on NCCL, the K=8 row of the last line.
+
+**Thresholds by batch size (`GATE_THR`, off).** The head adds row j + 1 while the chance that every draft through j
+is accepted beats (ms one more row costs) x (tokens a ms the batch makes). `bench/cc_batch_sim.py` priced a row from
+the table above (one more row of one request: 6.97 / 5.43 / 4.31 ms alone for rows 2, 3-4, 5-8; 4.91 / 3.26 / 2.22 ms
+among four; 3.59 / 2.33 / 1.45 ms among eight), tuned the rule's rate on the capture's held-out predictions
+(2026-11-20, 92,278 request-steps) and simulated x1.0015 at one request, x1.0071 at four and x1.0047 at eight with
+
+| requests | thresholds (rows 2 .. 8) | against the head file's |
+|---:|---|---|
+| 1 | 0.449, 0.35, 0.35, 0.277 x4 | x1.04-1.28 |
+| 4 | 0.61, 0.405, 0.405, 0.276 x4 | x1.18-1.42 |
+| 8 | 0.593, 0.385, 0.385, 0.239 x4 | x1.02-1.38 |
+
+On the fleet, with live rows on, 64 requests a width at temperature 1.0 (`bench/step_time.py --widths 4,8 --prompts 32
+--rounds 2`, one boot each):
+
+| requests | this table | the head file's thresholds | ratio (bootstrap over batches) |
+|---:|---|---|---|
+| 4 | 94.3 tok/s, 2.86 tokens and 104.8 ms a step | 98.2 tok/s, 3.24 tokens and 113.8 ms | x0.960 (0.918-1.006) |
+| 8 | 120.9 tok/s, 2.90 tokens and 159.5 ms a step | 125.9 tok/s, 3.19 tokens and 170.6 ms | x0.960 (0.917-0.996) |
+
+So the table is not a default. The step-time table has every request at the same row count: it prices a request's
+second row at what a second row of every request costs together (4.9 ms a row among four), while a row added to a
+mixed step of about 14 rows costs about 3 ms; the higher thresholds dropped rows that paid. The head file's
+thresholds stay; the one-request row of the table was not measured alone.
+
+The same simulation compared the head with a cheap cross-position context input against the serving head by prompt
+family: x1.002-1.005 on agent turns, x0.996-0.9997 on long contexts, x0.9997-1.0005 over all rows. It was not deployed.
 
 ## The confidence head's statistics in one pass (2026-11-24; the launcher's default, `GATE_FUSED=` turns it off)
 

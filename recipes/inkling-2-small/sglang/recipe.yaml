@@ -4,7 +4,7 @@ weights: aidendle94/Inkling-2-Small-DGX-Spark     # the variant's weights reposi
 engine: sglang
 engine_base: lmsysorg/sglang@sha256:424c1da97f6d6eef1612006c77b2ca791657a8184c1fbdbc682ebf9485d3b32c   # the dev-inkling-2-small tag as of 2026-11-12
 image: lmsysorg/sglang:dev-inkling-2-small       # unmodified; the hooks in patches/ are mounted and put on PYTHONPATH
-image_with_hooks: aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.7   # the same pinned base + this tree's patches/ (the head file, nvfp4_kv.py and gate_stats.py included), kernels/, the prebuilt forked-GEMM module and ../sglang-nvfp4-kv (Dockerfile); served by the fleet since 2026-11-24
+image_with_hooks: aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.9   # the same pinned base + this tree's patches/ (the head file, nvfp4_kv.py, gate_stats.py and roce_live.py included), kernels/, the prebuilt forked-GEMM module and ../sglang-nvfp4-kv (Dockerfile); served by the fleet since 2026-11-24
 status: experimental          # production | validated | experimental | archived  (in service since 2026-11-12, dev image, open problems: see README)
 nodes: 4 x NVIDIA DGX Spark (GB10, 128 GB), switched RoCE fabric, TP4/EP4
 context_length: 524288        # launcher default since 2026-11-17 (262144 before)

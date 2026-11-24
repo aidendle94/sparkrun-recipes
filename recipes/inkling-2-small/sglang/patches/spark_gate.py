@@ -43,6 +43,9 @@ RID = os.environ.get("SPARK_GATE_RID") == "1"
 PARTS = set((os.environ.get("SPARK_GATE_PARTS") or "mask,cap").split(","))
 LOG_EVERY = max(1, int(os.environ.get("SPARK_GATE_LOG_EVERY") or 1024))  # steps between two [gate] lines of a rank
 _RID = re.compile(r"gate-([kth])([0-9.]+)-")
+_LIVE = None
+if os.environ.get("SPARK_ROCE_LIVE") == "1" and "mask" in PARTS:
+    import roce_live as _LIVE
 _log = logging.getLogger("spark_gate")
 _s = {"epilogue": None, "sampler": None, "reqs": None, "src": None, "index": {}, "over": {}, "steps": 0,
       "requests": 0, "hash": None, "ksum": None, "head": None, "differ": None}
@@ -247,11 +250,16 @@ def install_model(mod):
         row, pos, req, anchor = index
         # Rows are request-major. K = 0: no step has set this request (graph capture, padding), its rows stay.
         k = ep.verify_lens_buf.index_select(0, req)
-        _s["src"] = torch.where((pos < k) | (k == 0), row, anchor)
+        live = (pos < k) | (k == 0)
+        _s["src"] = torch.where(live, row, anchor)
+        if _LIVE is not None:  # the per-row all-reduces of this forward send the live rows only (patches/roce_live.py)
+            _LIVE.begin(live)
         try:
             return stock(self, input_ids, positions, forward_batch, *args, **kwargs)
         finally:
             _s["src"] = None
+            if _LIVE is not None:
+                _LIVE.end()
 
     forward.__wrapped__ = stock
     cls.forward = forward

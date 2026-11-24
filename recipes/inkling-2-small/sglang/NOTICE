@@ -11,6 +11,10 @@ Adapted third-party code (modified for this recipe; the original notices apply t
   - patches/roce_collectives.py: a port to SGLang's GroupCoordinator of the vLLM adapter b12x_roce_all_reduce.py by
     Jason (@original-el8), github.com/local-inference-lab/vllm pull request 597. Copyright contributors to the vLLM
     project. Apache License 2.0. It drives the b12x RoCE runtime bundled in the image's FlashInfer (Apache-2.0).
+  - patches/roce_live.py: a fork of the b12x RoCE one-shot all-reduce kernel (FlashInfer
+    flashinfer/experimental/b12x/comm/roce/_oneshot_cute.py, from github.com/local-inference-lab/b12x; Copyright the
+    b12x and FlashInfer contributors, Apache License 2.0) with a row table: the staging, doorbell, wait, reduce and
+    epoch steps are that kernel's; the row selection is new. It subclasses the installed launch class at run time.
   - patches/sitecustomize.py: the served-alias route handlers mirror SGLang's http_server.py originals (ported from
     this repository's DeepSeek-V4.1 recipe, overlay/served_aliases.py). Copyright SGLang Team. Apache License 2.0.
   - patches/paged_decode.py and patches/draft_decode.py: rebuild SGLang's Triton decode kernel from the source inside

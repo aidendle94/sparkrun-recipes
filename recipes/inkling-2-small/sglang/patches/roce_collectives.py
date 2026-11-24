@@ -28,6 +28,8 @@ Environment:
   SPARK_ROCE_AR_MAX    largest all-reduce routed (default 1MB)
   SPARK_ROCE_AG_MAX    largest per-rank all-gather shard routed (default 16MB)
   SPARK_ROCE_AG        1 routes all-gathers too (default 1)
+  SPARK_ROCE_LIVE      1: the verify forward's per-row all-reduces send only the rows the gate verifies
+                       (patches/roce_live.py; needs SPARK_GATE; default 0)
   SPARK_STALL_DUMP     seconds without progress before this rank logs its collective state, again at twice and at
                        three times that (default 60; 0 = off). No progress = a model forward that does not return,
                        or no new forward while the scheduler still holds running or waiting requests (a decode
@@ -80,6 +82,7 @@ class _Runtime:
 
     def __init__(self, cpu_group, device: torch.device, rank: int, world: int):
         self.rt = None
+        self.live_rows = None
         self.rank = rank
         # launches seen by Python on this rank (eager calls and graph captures; replays are not counted) and the last one
         self.seen = {"ar": 0, "ag": 0, "nccl_ar": 0, "nccl_ag": 0, "last": None, "last_nccl": None}
@@ -133,6 +136,20 @@ class _Runtime:
                 return
             self._kw = {"plan": self.plan}
         self._live = {"ar": False, "ag": False}
+        # Live-row all-reduces (patches/roce_live.py, SPARK_ROCE_LIVE=1): on every rank or on none, since a rank on the
+        # stock kernel would read a compact payload as a full one.
+        import roce_live
+        self.live_rows, why = roce_live.Live.build(self.rt)
+        if roce_live.ON:
+            votes = [None] * world
+            dist.all_gather_object(votes, why, group=cpu_group)
+            bad = [f"rank {i}: {w}" for i, w in enumerate(votes) if w]
+            if bad:
+                self.live_rows = None
+                logger.warning("RoCE live rows NOT armed on any rank: %s", "; ".join(bad))
+            elif rank == 0:
+                logger.warning("RoCE live rows armed on %d ranks: the verify forward's per-row all-reduces send the "
+                               "gate's live rows only", world)
         if rank == 0:
             logger.info("RoCE collectives on: world=%d hcas=%s all-reduce<=%d B all-gather shard<=%d B gather=%s",
                         world, ",".join(self.rt.hca_names), max_size, max_gather, self.gather)
@@ -145,6 +162,11 @@ class _Runtime:
             logger.info("RoCE all-reduce live: first routed tensor %d B %s", x.numel() * x.element_size(), x.dtype)
         self.seen["ar"] += 1
         self.seen["last"] = ("ar", x.numel() * x.element_size())
+        if self.live_rows is not None:
+            import roce_live
+            table = roce_live.current(x)
+            if table is not None:
+                return self.live_rows.all_reduce(x, table)
         return self.rt.all_reduce(x, **self._kw)
 
     def all_gather(self, x: torch.Tensor, dim: int):

@@ -153,6 +153,7 @@ the gate choose its rows better:
 | `SCALE_PACK=1` (`SPARK_SCALE_PACK`, `SPARK_CSF_GEMM`) | the block scales of the 40 NVFP4 expert layers stay packed in memory, 56 % of their bytes (`patches/scale_pack.py`), and a fork of FlashInfer's grouped GEMM, compiled from the image's own sources, reads them inside the kernel: 3.0–3.4 GB more available memory on every node | none in the results: the same bytes into the GEMM, the same text on 16 of 16 prompts, NLL equal token by token. About 1 % of step time for one stream: 0.5 to 0.7 ms a step longer on three boots than on the boots without it; none seen at four and eight streams (one boot; runs differ by up to 7 % there). The module has to be built once per image ([Run it](#run-it), step 2); without it the launcher leaves the packing off and says so |
 | `GATE_HEAD=gate-head-mlp-reg.pt` (`SPARK_GATE_HEAD`) | the gate's row count comes from a small trained head that reads the draft's hidden state, computed inside the draft's CUDA graph (`patches/spark_gate_head.py`; the head file is in `patches/`). Net of its own cost, for one greedy stream: x1.017 on the test boot and x1.019 on the serving boot, against the boots without it. Inside the test boot, against the gate's own rule with both arms carrying the head's cost: x1.023 greedy and x1.050 at temperature 1.0 for one stream (net at temperature 1.0 not measured, about x1.036 estimated) | exact for sampled requests like the gate, and greedy text identical on 16 of 16 prompts one at a time; its tail in the draft graph costs about 0.75 ms a step (se 0.32), most of it the statistics; measured on short prompts only (see [Known problems](#known-problems)) |
 | `GATE_FUSED=1` (`SPARK_GATE_FUSED`) | with `GATE_HEAD`, the head's draft statistics come from one Triton pass over the vocabulary for the whole step (`patches/gate_stats.py`) instead of eight passes a request: 0.11 ms a step instead of 0.34 ms at one stream and 1.2 ms at four (one GPU, eager). Measured across boots at temperature 1.0, one stream: -0.34 ms a step (se 0.38) at equal accept | the same five statistics to about 1e-5 and the same row counts on every test step; on the serving test boot the four ranks agreed on every row count (6,574 request-steps) and the concurrency check passed. The gain at several streams was not separated from sampling noise |
+| `ROCE_LIVE=1` (`SPARK_ROCE_LIVE`) | with `ROCE_AR` and `GATE`, the 96 per-row all-reduces of a verify step (48 attention outputs, 48 expert combines) send only the rows the gate verifies instead of all 8 a request (`patches/roce_live.py`, a fork of the b12x one-shot kernel that reads a row table the gate writes inside the graph). One all-reduce in a captured chain: 28.8 us with 8 rows and 21.4 us with 3 for the attention output of one request, 106 us and 66 us for the expert combine of four requests with 17 of 32 rows live. Serving test boots at temperature 1.0: -0.78 ms a step (se 0.43) for one stream at equal accept; with a forced row count the step is 1.0-1.3 ms shorter at 1-2 rows for one stream and 2.0-6.5 ms shorter at 1-4 rows for four and eight | the live rows get the same bits as before; rows that are not verified keep each rank's own partial sum (they were already unused). Greedy text identical on 32 of 32 prompts at one stream, concurrency check passed, the ranks agreed on every row count (18,113 request-steps). It sets `ROCE_AR_MAX` to 1200KB so that the expert all-reduce of eight requests stays on the RoCE runtime; with all 8 rows of 8 requests live that one is about 2.5 ms a step slower than NCCL |
 
 The pool is not raised for the memory that the packing frees: that memory is margin. The format, the kernel and
 the numbers of the packing are in
@@ -223,8 +224,8 @@ hf download thinkingmachines/Inkling-2-Small --revision b0e7afb8892a07897c78ce1c
 #    If the tag has moved since then and a boot fails in a hook, pull that digest and set INKLING_IMAGE to it.
 docker pull lmsysorg/sglang:dev-inkling-2-small
 #    Or that pinned build with this recipe's hooks already inside (one small layer on top, see the Dockerfile):
-#      docker pull aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.7
-#      export INKLING_IMAGE=aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.7     # before launching
+#      docker pull aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.9
+#      export INKLING_IMAGE=aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.9     # before launching
 #    The launcher runs either image. It mounts its own patches/ over the image's, so the two cannot drift apart.
 #    This tag holds the hooks of this README, the confidence head's file, kernels/ and the prebuilt module of
 #    step 2. The fleet has served from it (2026-11-23, with ../sglang-nvfp4-kv); most measurements here used
@@ -241,7 +242,7 @@ docker run --rm --network none --memory 16g --cpus 8 \
   --entrypoint /opt/sglang/bin/python3 lmsysorg/sglang:dev-inkling-2-small /k/build_csf_gemm.py /out
 cp "$HOME/inkling2-csf-build/spark_csf_gemm_sm120.so" patches/
 #    With the hooks image of step 1 there is nothing to build: copy its prebuilt module instead (no GPU, seconds).
-#      docker run --rm --entrypoint cat aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.7 \
+#      docker run --rm --entrypoint cat aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.9 \
 #        /opt/inkling2-spark/prebuilt/spark_csf_gemm_sm120.so > patches/spark_csf_gemm_sm120.so
 #    Without that file the launcher prints "note: patches/spark_csf_gemm_sm120.so is not built
 #    (kernels/csf_gemm/build_csf_gemm.py): the packing is off for this launch" and starts the stack without the
@@ -531,7 +532,7 @@ earlyoom stopped their servers.
 | `launch/launch-inkling2.sh` | one container per node (`inkling2`), RoCE/NCCL environment, the hooks on PYTHONPATH; `--dry-run`, `--stop` |
 | `launch/relaunch-inkling2.sh` | disarm the watchdog, launch, wait for /health, re-arm the watchdog (use this to restart) |
 | `launch/watchdog-inkling2.sh` | probes and relaunches (log `~/inkling2-watchdog.log`); before a relaunch it saves every rank's state, stacks and stall evidence |
-| `Dockerfile` | the hooks image: the pinned base plus `patches/` on `PYTHONPATH`, published as `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.7` (no hook is switched on in it: the launcher's variables do that). It holds the hooks of this README, `kernels/` and the prebuilt module of step 2 |
+| `Dockerfile` | the hooks image: the pinned base plus `patches/` on `PYTHONPATH`, published as `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.9` (no hook is switched on in it: the launcher's variables do that). It holds the hooks of this README, `kernels/` and the prebuilt module of step 2 |
 | `launch/fleet.env.example` | the site file; copy to `launch/fleet.env` (git-ignored) |
 | `patches/sitecustomize.py` | installs the hooks at interpreter start in every rank; the other `.py` files in `patches/` are the hooks |
 | `patches/gate-head-mlp-reg.pt` | the confidence head the launcher's `GATE_HEAD` names: a 256-unit MLP, 4.7 MB, sha256 `0bc7b3d52da6c1bd...`, read by `patches/spark_gate_head.py`. Trained for this recipe on the draft's hidden states (see [docs/results.md](docs/results.md)); no weight of the model is in it |

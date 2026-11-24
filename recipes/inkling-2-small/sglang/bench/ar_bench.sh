@@ -1,6 +1,6 @@
 #!/bin/bash
 # ar_bench.sh — run bench/ar_bench.py on the four Sparks (the fleet must be stopped: it needs every GPU).
-#   [ROCE=1] [LABEL=x] ./ar_bench.sh [extra docker -e flags, e.g. -e NCCL_BUFFSIZE=4194304]
+#   [ROCE=1] [LIVE=1] [LABEL=x] [CHAIN=96] [PIN_PROXY=N] [PIN_MAIN=N] ./ar_bench.sh [extra docker -e flags, e.g. -e NCCL_BUFFSIZE=4194304]
 # Uses the launcher's NCCL/RoCE environment; extra -e flags override it (later -e wins in docker).
 # MIT License, Copyright (c) 2026 Aiden Le.
 HERE=$(cd "$(dirname "$0")" && pwd); W=$(dirname "$HERE")
@@ -14,8 +14,8 @@ for r in 0 1 2 3; do
 done
 for r in 3 2 1 0; do
   gid=$(gid_of $r)
-  cmd="docker rm -f $NAME >/dev/null 2>&1; docker run --rm --name $NAME --network host --ipc host --gpus all --cap-add IPC_LOCK --ulimit memlock=-1:-1 --device /dev/infiniband:/dev/infiniband --shm-size 8g \
- -v ${HOMES[$r]}/inkling2-patches:/patches:ro -e RANK=$r -e WORLD_SIZE=4 -e MASTER_ADDR=${NODES[0]} -e MASTER_PORT=$PORT -e ROCE=${ROCE:-0} -e LABEL=${LABEL:-nccl} \
+  cmd="docker rm -f $NAME >/dev/null 2>&1; docker run --rm --name $NAME --network host --ipc host --gpus all --cap-add IPC_LOCK --cap-add SYS_NICE --ulimit memlock=-1:-1 --device /dev/infiniband:/dev/infiniband --shm-size 8g \
+ -v ${HOMES[$r]}/inkling2-patches:/patches:ro -e RANK=$r -e WORLD_SIZE=4 -e MASTER_ADDR=${NODES[0]} -e MASTER_PORT=$PORT -e ROCE=${ROCE:-0} -e LABEL=${LABEL:-nccl} -e LIVE=${LIVE:-} -e CHAIN=${CHAIN:-96} -e PIN_PROXY=${PIN_PROXY:-} -e PIN_MAIN=${PIN_MAIN:-} \
  -e B12X_ROCE_HCA=$RDMA_HCAS -e B12X_ROCE_GID_INDEX=$gid -e B12X_ROCE_SPIN_LIMIT=300000000 \
  -e NCCL_NET=IB -e NCCL_IB_DISABLE=0 -e NCCL_IB_HCA=$RDMA_HCAS -e NCCL_SOCKET_IFNAME=$FABRIC_IFACE -e GLOO_SOCKET_IFNAME=$FABRIC_IFACE \
  -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_IB_ADDR_RANGE=$FABRIC_SUBNET -e NCCL_IB_SUBNET_PREFIX_LEN=${FABRIC_SUBNET#*/} -e NCCL_IB_GID_INDEX=$gid \

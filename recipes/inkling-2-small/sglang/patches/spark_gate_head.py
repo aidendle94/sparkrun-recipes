@@ -132,9 +132,37 @@ def rows(logit, thr):
 
 
 FUSED = os.environ.get("SPARK_GATE_FUSED") == "1"
+THR = os.environ.get("SPARK_GATE_THR", "")                 # "1:a/b/c/d/e/f/g,4:...,8:...": thresholds by batch size
 
 
-def step_logits_k(head, z, d, temps, greedy, hidden, A, B, consts, fused_out=None):
+def thr_table(text, max_bs):
+    """SPARK_GATE_THR -> [max_bs][7] survival thresholds for batches of 1..max_bs requests: the listed batch sizes,
+    linear in between, the nearest listed row outside. A row is worth verifying while the chance that every draft up
+    to it is accepted beats (the step time one more row costs) x (the tokens a millisecond the whole batch makes); both
+    change with the number of requests in the step, and the head's file holds one-request thresholds of 2026-11-20.
+    bench/cc_batch_sim.py makes the table from measured step times."""
+    pts = {}
+    for item in text.split(","):
+        if not item.strip():
+            continue
+        n, vals = item.split(":")
+        row = [float(v) for v in vals.split("/")]
+        if int(n) < 1 or len(row) != G or any(not 0.0 < v <= 1.0 for v in row):
+            raise ValueError(f"SPARK_GATE_THR={text!r}: '<batch>:<7 thresholds in (0, 1] joined by />,...'")
+        pts[int(n)] = row
+    if not pts:
+        raise ValueError(f"SPARK_GATE_THR={text!r}: no batch size")
+    keys = sorted(pts)
+    out = []
+    for bs in range(1, max_bs + 1):
+        lo = max([k for k in keys if k <= bs], default=keys[0])
+        hi = min([k for k in keys if k >= bs], default=keys[-1])
+        t = 0.0 if hi == lo else (bs - lo) / (hi - lo)
+        out.append([a + (b - a) * t for a, b in zip(pts[lo], pts[hi])])
+    return out
+
+
+def step_logits_k(head, z, d, temps, greedy, hidden, A, B, consts, fused_out=None, thr=None):
     """(logits [bs, 7], K [bs]) of a step: z [>= bs, 7, V] step logits, d [bs, 7] drafted tokens, temps [bs], greedy
     [bs], hidden [bs * 7, H]. A request at a time through the vocabulary-wide scratch (A, B), or with fused_out (a
     [>= bs, 7, 5] float32 buffer) all requests in one pass of patches/gate_stats.py (SPARK_GATE_FUSED=1)."""
@@ -146,11 +174,11 @@ def step_logits_k(head, z, d, temps, greedy, hidden, A, B, consts, fused_out=Non
         per = [stats_torch(z[b], d[b], temps[b], greedy[b], A, B) for b in range(bs)]
         lq, top1, top2, ent, q = (torch.stack([r[i] for r in per]) for i in range(5))
     logit = predict(head, hidden, features(lq, top1, top2, ent, q, temps, greedy, consts))
-    return logit, rows(logit, head["thr"])
+    return logit, rows(logit, head["thr"] if thr is None else thr)
 
 
-def step_rows(head, z, d, temps, greedy, hidden, A, B, consts, fused_out=None):
-    return step_logits_k(head, z, d, temps, greedy, hidden, A, B, consts, fused_out)[1]
+def step_rows(head, z, d, temps, greedy, hidden, A, B, consts, fused_out=None, thr=None):
+    return step_logits_k(head, z, d, temps, greedy, hidden, A, B, consts, fused_out, thr)[1]
 
 
 def exchange(group, k, differ):
@@ -274,7 +302,7 @@ def _arm(sampler, width_of):
         why, head, live, digest = _local(sampler, width_of)
     except Exception as e:  # every rank must reach the vote
         why, head, live, digest = f"an error while arming ({e!r})", None, 0, ""
-    mine = (why, None if head is None else head["sha"], live, digest)
+    mine = (why, None if head is None else head["sha"], live, digest, THR)
     votes = _tp_vote(mine)
     bad = [f"rank {r}: {v[0]}" for r, v in enumerate(votes) if v[0]]
     if bad:
@@ -291,6 +319,13 @@ def _arm(sampler, width_of):
     _s["B"] = torch.zeros((G, live), dtype=torch.float32, device=device)
     _s["kbuf"] = torch.full((int(sampler.max_bs),), G + 1, dtype=torch.int64, device=device)
     _s["fused"] = torch.zeros((int(sampler.max_bs), G, 5), dtype=torch.float32, device=device) if FUSED else None
+    _s["thr_bs"] = None
+    if THR:                                                   # the vote above made the text equal on every rank
+        try:
+            table = thr_table(THR, int(sampler.max_bs))
+        except ValueError as e:
+            return _refuse(str(e))
+        _s["thr_bs"] = [torch.tensor(row, dtype=torch.float64, device=device) for row in table]
     _s["differ"] = torch.zeros((), dtype=torch.int64, device=device)
     has_next = torch.ones(G, dtype=torch.float32, device=device)
     has_next[-1] = 0
@@ -300,7 +335,9 @@ def _arm(sampler, width_of):
                  "self-test %s, K exchanged every step: %s, statistics %s", len(votes), PATH, head["sha"], head["meta"].get("name"),
                  head["wh"].shape[0], int(head["meta"]["vocab"]), live,
                  [round(float(t), 4) for t in head["thr"].tolist()], digest, group is not None,
-                 "fused (one pass, SPARK_GATE_FUSED)" if FUSED else "per request (torch)")
+                 ("fused (one pass, SPARK_GATE_FUSED)" if FUSED else "per request (torch)")
+                 + (f", thresholds by batch size (SPARK_GATE_THR): 1 request {[round(v, 3) for v in thr_table(THR, int(sampler.max_bs))[0]]}, "
+                    f"{int(sampler.max_bs)} requests {[round(v, 3) for v in thr_table(THR, int(sampler.max_bs))[-1]]}" if THR else ""))
 
 
 def _tail(sampler, model_hidden, bs):
@@ -309,7 +346,8 @@ def _tail(sampler, model_hidden, bs):
     if head is None or sampler is not _s["sampler"] or sampler.step_logits is None or bs > _s["kbuf"].shape[0]:
         return
     k = step_rows(head, sampler.step_logits, sampler.out[: bs * G].view(bs, G), sampler.params.temperatures[:bs],
-                  sampler.params.greedy_mask[:bs], model_hidden, _s["A"], _s["B"], _s["consts"], _s.get("fused"))
+                  sampler.params.greedy_mask[:bs], model_hidden, _s["A"], _s["B"], _s["consts"], _s.get("fused"),
+                  None if _s.get("thr_bs") is None else _s["thr_bs"][bs - 1])
     if _s["group"] is not None:
         k = exchange(_s["group"], k, _s["differ"])
     _s["kbuf"][:bs].copy_(k)
