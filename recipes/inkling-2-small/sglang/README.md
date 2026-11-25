@@ -62,7 +62,7 @@ with older measurements. The conditions and the record of each number are in [do
 | context length | 524,288 (the default since 2026-11-17; 262,144 before) |
 | KV pool | 793,000 tokens with the defaults (a cap; see [Run it](#run-it)). Before these defaults: 545K–600K with the 600K cap that most rows here were measured on, and 493K–805K when the pool was sized at each boot without a cap |
 | concurrent requests | 8 |
-| tool calls, 283 cases over five wire formats (chat, Anthropic messages, each also streamed, and responses), two trials | 250 right, 20 soft, 13 failed (10 are `tool_choice: none`, 3 slips on the sampled trial); 12 of 12 agent loops. With the prefill switches (the defaults): 252 / 20 / 11, and no case of the temperature-0 trial changed its verdict |
+| tool calls, 283 cases over five wire formats (chat, Anthropic messages, each also streamed, and responses), two trials | 250 right, 20 soft, 13 failed (10 are `tool_choice: none`, 3 slips on the sampled trial); 12 of 12 agent loops. With the prefill switches (the defaults): 252 / 20 / 11, and no case of the temperature-0 trial changed its verdict. With the tool switches (the defaults since 2026-11-25), one trial without the effort cases: 116 right, 10 soft, none failed of 126; the `tool_choice: none` cases pass |
 | boot to healthy | about 5 min with a warm kernel cache, about 17 min the first time |
 | pictures, one request | 1.2–1.6 s for a 1,400 px wide text picture (455 picture tokens), 3.2 s for a 4,096 x 4,096 one (downscaled to 2,048 x 2,048: 2,736 prompt tokens), each with 60–80 answer tokens at reasoning effort `low` |
 | pictures, many at once | 8 pictures of 4,096 x 4,096 at once: 5.0–6.7 s for all, 0.7–0.9 GB of the rank-0 node's memory; 16: 9.1–10.3 s, 0.85–1.0 GB |
@@ -101,6 +101,8 @@ off switch:
 | `DENSE_P12=attn,head,free` | the target's attention weights packed into 12 bits without rounding: −4.5 % step time for one stream | none: exact |
 | `TP_SHARD=half,fp8` | every node holds all 384 experts at a quarter of their width instead of 96 whole ones, so no node waits for the busiest: −18 % step time | not bit-identical to the stock placement (rounding only; mean NLL unchanged) |
 | `REASONING_CACHE=1` | the server puts an answer's reasoning back into history turns that arrive without it | prompts grow by that reasoning |
+| `TOOL_PARSE_ERROR=1` (`SPARK_TOOL_PARSE_ERROR`) | a tool call whose payload does not parse fails the request: HTTP 500 (`InternalServerError`), or an error event at the end of a stream, and the payload goes to the server log (`patches/tool_parse_error.py`). The stock server returns such a call as assistant text with a normal finish, which an agent reads as its final answer. Chat completions, `/v1/messages` and the Responses API. A call cut off by `max_tokens` still ends with `finish_reason: length` | the client has to retry the request |
+| `TOOL_CHOICE_FIX=parallel,none` (`SPARK_TOOL_CHOICE_FIX`) | `parallel`: `parallel_tool_calls: false` (`disable_parallel_tool_use` on `/v1/messages`) keeps the answer's first tool call; the stock server returns every call. `none`: an explicit `tool_choice: "none"` gives the two tool-invocation tokens a logit bias of -100, so the model answers in text (`patches/tool_choice_fix.py`). A request without tools that does not set `tool_choice` is not affected | a `tool_choice: "none"` request skips the speculative verify's graph paths (not measured). When the prompt itself tells the model to call a tool, the text can be the command it wanted to run |
 
 Three more grow the pool within the same bytes (defaults since 2026-11-17). None of them touches the target's
 arithmetic:
@@ -183,7 +185,8 @@ Every switch of these tables is turned off by setting it empty on the relaunch (
 pool). The switches are independent of each other, with four exceptions: `FI_MXFP8` does nothing without `fp8` in
 `TP_SHARD`, `DRAFT_KV_FP8` does nothing without the FP8 KV cache, `SCALE_PACK` needs `TP_SHARD`, and `GATE_HEAD`
 needs `GATE`. In the last two cases the launcher turns the switch off and says so. Lever by lever, an empty
-setting leaves you with: text only (`IMAGES=`); the gate's own rule (`GATE_HEAD=`); the block scales as loaded
+setting leaves you with: text only (`IMAGES=`); the stock server's tool-call handling (`TOOL_PARSE_ERROR=
+TOOL_CHOICE_FIX=`); the gate's own rule (`GATE_HEAD=`); the block scales as loaded
 (`SCALE_PACK=`); prefill
 without the three prefill switches (`PREFILL_GLUE= BIAS_FAR= FI_MXFP8=`); the experts in the stock placement and
 the target's dense weights without the 12-bit packing, both as before 2026-11-15 (`TP_SHARD= DENSE_P12=`).
@@ -224,8 +227,8 @@ hf download thinkingmachines/Inkling-2-Small --revision b0e7afb8892a07897c78ce1c
 #    If the tag has moved since then and a boot fails in a hook, pull that digest and set INKLING_IMAGE to it.
 docker pull lmsysorg/sglang:dev-inkling-2-small
 #    Or that pinned build with this recipe's hooks already inside (one small layer on top, see the Dockerfile):
-#      docker pull aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.9
-#      export INKLING_IMAGE=aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.9     # before launching
+#      docker pull aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.10
+#      export INKLING_IMAGE=aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.10     # before launching
 #    The launcher runs either image. It mounts its own patches/ over the image's, so the two cannot drift apart.
 #    This tag holds the hooks of this README, the confidence head's file, kernels/ and the prebuilt module of
 #    step 2. The fleet has served from it (2026-11-23, with ../sglang-nvfp4-kv); most measurements here used
@@ -242,7 +245,7 @@ docker run --rm --network none --memory 16g --cpus 8 \
   --entrypoint /opt/sglang/bin/python3 lmsysorg/sglang:dev-inkling-2-small /k/build_csf_gemm.py /out
 cp "$HOME/inkling2-csf-build/spark_csf_gemm_sm120.so" patches/
 #    With the hooks image of step 1 there is nothing to build: copy its prebuilt module instead (no GPU, seconds).
-#      docker run --rm --entrypoint cat aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.9 \
+#      docker run --rm --entrypoint cat aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.10 \
 #        /opt/inkling2-spark/prebuilt/spark_csf_gemm_sm120.so > patches/spark_csf_gemm_sm120.so
 #    Without that file the launcher prints "note: patches/spark_csf_gemm_sm120.so is not built
 #    (kernels/csf_gemm/build_csf_gemm.py): the packing is off for this launch" and starts the stack without the
@@ -468,8 +471,16 @@ earlyoom stopped their servers.
   `high` (the default), `xhigh` and `max`; chat completions also take a float. `thinking.budget_tokens` is accepted
   and not enforced, so `max_tokens` is the only hard cap. The task sets the amount of thinking more than the level
   does.
-- **`tool_choice: none`** does not work: the model writes the call as text. Leave the tools out of the request
-  instead.
+- **Tool calls that do not parse.** Now and then the model writes a tool call whose JSON does not parse or whose
+  two name fields differ: 18 of about 16,000 requests in the fleet's logs, more often deep into long agent
+  sessions. With `TOOL_PARSE_ERROR` (the default) the request fails with HTTP 500, or with an error event at the
+  end of a stream. Retry it. The OpenAI and Anthropic SDKs retry a 500 by themselves; an error event in a stream
+  they raise to the caller.
+- **`tool_choice: none`** keeps the model from calling a tool (`TOOL_CHOICE_FIX`, the default), and the answer
+  is text. If the system prompt tells the model to use tools, that text can be the command it would have run.
+  Without the switch, the call comes back as text that starts like JSON.
+- **`parallel_tool_calls: false`** keeps the first call of an answer (`TOOL_CHOICE_FIX`). The model may still
+  have written more; they are dropped.
 - **Pictures** go in a user (or tool) message as an `image_url` part with a base64 data URL or an http(s) URL, or
   as an `image` block on `/v1/messages`. The server fetches an http(s) URL itself. Paths and `file://` URLs are
   refused. A picture of w x h pixels costs ceil(w/40) x ceil(h/40) prompt tokens. The server downscales a
@@ -532,7 +543,7 @@ earlyoom stopped their servers.
 | `launch/launch-inkling2.sh` | one container per node (`inkling2`), RoCE/NCCL environment, the hooks on PYTHONPATH; `--dry-run`, `--stop` |
 | `launch/relaunch-inkling2.sh` | disarm the watchdog, launch, wait for /health, re-arm the watchdog (use this to restart) |
 | `launch/watchdog-inkling2.sh` | probes and relaunches (log `~/inkling2-watchdog.log`); before a relaunch it saves every rank's state, stacks and stall evidence |
-| `Dockerfile` | the hooks image: the pinned base plus `patches/` on `PYTHONPATH`, published as `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.9` (no hook is switched on in it: the launcher's variables do that). It holds the hooks of this README, `kernels/` and the prebuilt module of step 2 |
+| `Dockerfile` | the hooks image: the pinned base plus `patches/` on `PYTHONPATH`, published as `aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.10` (no hook is switched on in it: the launcher's variables do that). It holds the hooks of this README, `kernels/` and the prebuilt module of step 2 |
 | `launch/fleet.env.example` | the site file; copy to `launch/fleet.env` (git-ignored) |
 | `patches/sitecustomize.py` | installs the hooks at interpreter start in every rank; the other `.py` files in `patches/` are the hooks |
 | `patches/gate-head-mlp-reg.pt` | the confidence head the launcher's `GATE_HEAD` names: a 256-unit MLP, 4.7 MB, sha256 `0bc7b3d52da6c1bd...`, read by `patches/spark_gate_head.py`. Trained for this recipe on the draft's hidden states (see [docs/results.md](docs/results.md)); no weight of the model is in it |
@@ -553,6 +564,7 @@ earlyoom stopped their servers.
 | `bench/concurrency_check.py` | reads the text of overlapping requests against single-stream references. **Run it after any change to a decode path** |
 | `bench/reasoning_cache_check.py` | whether the server restores a history turn's reasoning, over six wire formats |
 | `bench/toolcall_check.py` | the tool-call suite (wire formats and agent loops) |
+| `patches/tool_parse_error.py`, `patches/tool_choice_fix.py`, `bench/tool_parse_error_test.py`, `bench/tool_choice_fix_test.py`, `bench/data/toolcall-*.json` | the tool switches (`TOOL_PARSE_ERROR`, `TOOL_CHOICE_FIX`); the tests run without a GPU on the image's own parser with the two token files |
 | `bench/streams.py`, `bench/step_time.py` | decode tok/s against the number of streams; step time of a boot, comparable between boots whose text differs |
 | `bench/longctx.py`, `bench/longctx_edges.py`, `bench/stress.py` | long contexts end to end, their edges, mixed load |
 | `bench/swa_fill.py`, `bench/prefix_fork.py` | the windowed pool run full, then old and recent conversations asked again; what a continued or a forked prompt reuses of the cache |

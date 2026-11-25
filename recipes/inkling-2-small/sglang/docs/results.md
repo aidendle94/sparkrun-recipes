@@ -1,9 +1,9 @@
 # Inkling-2-Small on four DGX Sparks: lab notes
 
-The working notes behind this recipe (2026-11-12 to 2026-11-21). First what the launcher starts and what took the
+The working notes behind this recipe (2026-11-12 to 2026-11-25). First what the launcher starts and what took the
 fleet down: the defaults, two outages, the silent stall and its recorder. Then by subject: what the GB10 hooks do,
 the bug that produced garbage under concurrency, every decode lever with its numbers, the packed block scales, the
-confidence head for the gate, picture input, pre-sharded weights, long contexts and multi-turn history, the reasoning loop on long lists, the KV
+confidence head for the gate, picture input, pre-sharded weights, tool calls, long contexts and multi-turn history, the reasoning loop on long lists, the KV
 cache, the prefill switches, reasoning effort, and the first day's measurements. "Production" and "the fleet" mean
 the author's four Sparks; times are UTC. Each number is one boot on that fleet unless the text says otherwise. The
 launch scripts are in `launch/`, the tools in `bench/`, the hooks in `patches/`, the build script of the forked
@@ -1119,6 +1119,67 @@ Serving test boots of 2026-11-24, one boot each, bench/step_time.py at temperatu
 The four ranks agreed on the row count on all 6,574 request-steps (`[gate] ... ranks differ=0`) and the concurrency
 check passed. At four streams the step time and the tokens a step both moved between the boots (sampling), so that
 run does not separate the change; the saving there is 1.1 ms a step by the kernel timings.
+
+## Tool calls: a malformed call fails, `parallel_tool_calls` and `tool_choice: none` (2026-11-25; the launcher's defaults, `TOOL_PARSE_ERROR=` and `TOOL_CHOICE_FIX=` turn them off)
+
+Inkling writes a tool call as `<|message_model|>NAME<|content_invoke_tool_json|>{"name":"NAME","args":{...}}`
+and closes it with `<|end_message|>`. SGLang's output parser (`sglang/srt/parser/inkling_output.py`) hands that
+to the `tml-renderers` library, and when the library rejects the payload it logs `Inkling output failed TMLv0
+parsing; surfacing as text` and returns the payload as assistant text with a normal finish.
+
+**How often.** The saved server logs of 2026-11-19 to 25 (16,229 API requests: agent sessions and the test suites
+together) hold 92 such failures:
+
+| library error | count | what it is |
+|---|---|---|
+| `json_incomplete` | 74 | mostly in runs a second or two apart: calls cut off by `max_tokens` |
+| `json_syntax` | 14 | the JSON of the arguments breaks, e.g. `expected , or }` at column 299 |
+| author name incompatible with the tool name | 4 | the header and the JSON name differ: `read` and `read_code` once; `job_output` and `job_id` three times in 25 s, the same turn retried |
+
+`read_code` is three tokens (`read`, `_`, `code`); the model closed the header after the first. In two hours of agent
+sessions on 2026-11-25, 2 of 174 chat requests failed this way, both late in long sessions (27K and 80K tokens of context), and
+neither session sent another turn: the client took the text as the answer.
+
+**`TOOL_PARSE_ERROR=1`** (`patches/tool_parse_error.py`). When the block that fails is a tool invocation that the
+model closed itself, the request fails instead: HTTP 500 with `type: InternalServerError`, or, in a stream, one
+error event after what was already sent (`data: {"error": ...}` and `[DONE]` on chat completions, an `error`
+event on the Responses API), and the engine request is aborted. `/v1/messages` runs through the chat handlers and
+forwards the failure in its own error format. The payload goes to the log with the library's message (at most
+2,000 characters). A call cut off by `max_tokens` is closed by the parser itself and keeps the stock behaviour
+(`finish_reason: length`); so do thinking and text blocks with stray bytes.
+
+**`TOOL_CHOICE_FIX=parallel`** (`patches/tool_choice_fix.py`). The engine applies no constraint for
+`parallel_tool_calls: false` on this model's output path, so every call of an answer reached the client. The parser
+now drops the calls after the first, below the reasoning cache, which therefore remembers the answer as the client
+received it. A request for two files at once, `parallel_tool_calls` false and true: 1 and 2 calls on chat
+completions, chat streamed, the Responses API and `/v1/messages` (`disable_parallel_tool_use`).
+
+**`TOOL_CHOICE_FIX=none`.** With `tool_choice: "none"` the engine renders no tools and turns the tool parser off,
+but the model still writes calls. On the tool-call suite's case (system prompt: use the tools; user: read
+README.md) the raw output at temperature 0 repeats `<|content_invoke_tool_json|>` until `max_tokens`, and a client
+received text that starts like JSON (10 of 10 failed on 2026-11-24). The switch adds a logit bias of -100 on
+`<|content_invoke_tool_json|>` and `<|content_invoke_tool_text|>` (200049 and 200057) to an explicit
+`tool_choice: "none"` on chat completions, `/v1/messages` (`{"type": "none"}`, which the endpoint sets after
+building the request, so the switch marks it) and the Responses API, merged with any bias of the client's. A
+request without tools that does not set `tool_choice` defaults to `"none"` and is left as it was. The DSpark verify
+applies the bias (`verify_logits_adjustments_are_noop` is false for such a batch, so it takes the general accept
+path instead of the folded and sampling graphs; the cost was not measured).
+
+- A summary turn after a tool round trip, `tool_choice: "none"` and `"auto"`, temperature 0.7, two samples each:
+  four plain text answers.
+- The suite's case: no call and no JSON, finish `stop`; the text is the command the prompt asked for
+  (`bash\ncat /workspace/README.md`), because the model writes the call's name and arguments as plain text.
+
+**Checks.** `bench/tool_parse_error_test.py` (8 checks) and `bench/tool_choice_fix_test.py` (15) run the image's
+own parser and protocol classes without a GPU on the two answers in `bench/data/`: a well-formed call parses as
+before; the same answer with a token of the payload removed raises, whole and token by token; a cut-off does not; a
+parser of another endpoint keeps the stock text; the handlers answer 500 and end a stream with the error event and
+an abort; the first of two calls stays; the bias appears for an explicit `"none"` only. On the fleet, the tool-call
+suite, one trial without the effort cases: 116 right, 10 soft, none failed of 126 (the soft ones: a missing final
+newline on the 5,675-character write, and the shortened task of the `truncated` case, as before). The same command
+on 2026-11-24's stack, two trials: 221 / 19 / 12, 10 of the failures `tool_choice: none`.
+
+Serving since 2026-11-25 12:36 UTC (`TOOL_PARSE_ERROR` since 12:04).
 
 ## Long contexts and multi-turn history (2026-11-14)
 

@@ -86,6 +86,11 @@ route_balance (SPARK_ROUTE_BALANCE=1, diagnosis windows only, garbage text): pat
 reasoning_cache (SPARK_REASONING_CACHE=1 or a flag file's path, off by default): patches/reasoning_cache.py keeps the
   reasoning of every answer in the API server and puts it back into history turns a client sends without it (the
   template renders an earlier turn's thinking only when it is sent; without it later questions get earlier answers).
+tool_parse_error (SPARK_TOOL_PARSE_ERROR=1, off by default): patches/tool_parse_error.py fails a chat-completions
+  request whose tool call does not parse (HTTP 500, or an error event in a stream) instead of handing the client
+  the broken payload as assistant text; the payload is logged. Chat completions, Anthropic messages, Responses API.
+tool_choice_fix (SPARK_TOOL_CHOICE_FIX=parallel,none, off by default): patches/tool_choice_fix.py honours
+  parallel_tool_calls false (first call kept) and an explicit tool_choice "none" (tool-invocation tokens biased -100).
 wmark_boost (SPARK_WMARK_BOOST=1, off by default): patches/wmark_boost.py gives the KV pool sizing the host's
   MemAvailable without the kernel's watermark boost (a reclaim target of a few minutes that hides up to 2.24 GB of
   page cache here at the second the pool is sized, on some boots and not on others).
@@ -1108,6 +1113,54 @@ if os.environ.get("SPARK_VISION") == "1":
     def vision_size_bind(mod):
         import vision_sm12x
         vision_sm12x.install_processor(mod)
+
+
+# SPARK_TOOL_PARSE_ERROR=1 (unset = off): a malformed tool call fails the request, patches/tool_parse_error.py.
+if os.environ.get("SPARK_TOOL_PARSE_ERROR"):
+    @_on_import("sglang.srt.parser.inkling_output")
+    def tool_parse_error_parser(mod):
+        import tool_parse_error
+        tool_parse_error.install_parser(mod)
+
+    @_on_import("sglang.srt.entrypoints.openai.serving_inkling")
+    def tool_parse_error_adapter(mod):
+        import tool_parse_error
+        tool_parse_error.install_adapter(mod)
+
+    @_on_import("sglang.srt.entrypoints.openai.serving_chat")
+    def tool_parse_error_chat(mod):
+        import tool_parse_error
+        tool_parse_error.install_chat(mod)
+
+    @_on_import("sglang.srt.entrypoints.openai.serving_responses")
+    def tool_parse_error_responses(mod):
+        import tool_parse_error
+        tool_parse_error.install_responses(mod)
+
+
+# SPARK_TOOL_CHOICE_FIX=parallel,none (unset = off): parallel_tool_calls false and an explicit tool_choice "none" honoured,
+# patches/tool_choice_fix.py.
+if os.environ.get("SPARK_TOOL_CHOICE_FIX"):
+    @_on_import("sglang.srt.parser.inkling_output")
+    def tool_choice_fix_parser(mod):
+        import tool_choice_fix
+        tool_choice_fix.install_parser(mod)
+
+    @_on_import("sglang.srt.entrypoints.openai.serving_inkling")
+    def tool_choice_fix_adapter(mod):
+        import tool_choice_fix
+        tool_choice_fix.install_adapter(mod)
+
+    @_on_import("sglang.srt.entrypoints.openai.protocol")
+    def tool_choice_fix_protocol(mod):
+        import tool_choice_fix
+        tool_choice_fix.install_protocol(mod)
+        tool_choice_fix.announce()
+
+    @_on_import("sglang.srt.entrypoints.anthropic.serving")
+    def tool_choice_fix_anthropic(mod):
+        import tool_choice_fix
+        tool_choice_fix.install_anthropic(mod)
 
 
 sys.meta_path.insert(0, _Finder())
