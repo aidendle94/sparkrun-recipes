@@ -8,8 +8,11 @@ This hook is 100% general (no task-specific rules) and preserves model weights a
   - Single-turn short prompts (assistant_turns == 0 and total prompt chars < MIN_CHARS, default 3600 ~= 1K tokens)
     are completely untouched (bit-for-bit identical to stock).
   - Requests without a system/developer message or ending in an assistant prefill are untouched.
+  - Before extracting directives, reference/catalog sections that agent harnesses inject for on-demand lookup
+    (<available_skills>, <skills>, <tools>, <docs>, <mcp_servers>, <cwd>, etc.) are stripped so optional skill
+    or tool catalogs are never misclassified as mandatory per-turn rules.
   - Once context exceeds the SWA window (or on any multi-turn request with assistant_turns >= 1), a concise
-    transient copy of the active system prompt's imperative directives is appended right before tokenization.
+    transient copy of the active system prompt's behavioral rules is appended right before tokenization.
   - Because the reminder is transient (never saved in client conversation history and applied after
     patches/reasoning_cache.py hashes/fills history), prior turns keep full SGLang radix prefix-cache hits.
   - Any unexpected error logs once and falls back cleanly to stock rendering without failing a request.
@@ -32,6 +35,60 @@ MIN_CHARS = int(os.environ.get("SPARK_SYSTEM_REINFORCE_MIN_CHARS") or "3600")
 
 IMPERATIVE_RE = re.compile(
     r"\b(must|never|always|mandatory|policy|rules?|do not|don't|prefer|avoid|forbid|strictly|required|prohibit|guideline|important)\b",
+    re.I,
+)
+
+# XML-tagged reference/catalog blocks used by coding harnesses (Pi, Claude Code, Codex, MCP, etc.)
+# that describe optional tools, skills, docs, or environment metadata rather than unconditional turn rules.
+_CATALOG_TAGS = (
+    "available_skills",
+    "skills",
+    "skill",
+    "available_tools",
+    "tools",
+    "tool_definitions",
+    "tool_list",
+    "functions",
+    "mcp_servers",
+    "mcp_tools",
+    "available_mcp_tools",
+    "docs",
+    "documentation",
+    "cwd",
+    "environment",
+    "env",
+    "system_info",
+    "user_information",
+    "workspace_information",
+    "slash_commands",
+    "file_tree",
+    "directory_structure",
+)
+_CATALOG_XML_RE = re.compile(
+    r"<(?P<tag>" + "|".join(_CATALOG_TAGS) + r")(?:\s[^>]*)?>[\s\S]*?</(?P=tag)>",
+    re.I,
+)
+
+# Markdown catalog headings (optional skill/tool listings)
+_CATALOG_MD_HEAD_RE = re.compile(
+    r"^\s*#{1,3}\s*(?:available\s+(?:skills|tools|commands)|skills\s+catalog|tool\s+(?:definitions|list)|documentation)\b",
+    re.I,
+)
+
+# Plain-text "Available skills:" / "Available tools:" trailing catalog blocks
+_CATALOG_PLAIN_RE = re.compile(
+    r"(?:^|\n)Available\s+(?:skills|tools|slash\s+commands)\s*:\s*\n(?:[ \t]*[-*]\s+.*\n?)+",
+    re.I,
+)
+
+# Top-level XML wrapper tags that often contain actual directives (unwrap into separate scorable sections)
+_RULE_XML_RE = re.compile(
+    r"<(?P<tag>rules|addendum|guidelines|instructions|policy|constraints|project_context|project_instructions)(?:\s[^>]*)?>([\s\S]*?)</(?P=tag)>",
+    re.I,
+)
+
+_RULE_HEAD_RE = re.compile(
+    r"^\s*(?:#{1,3}\s*.*?\b(policy|rules?|guidelines?|instructions?|mandatory|constraints?)\b|(?:rules|guidelines|instructions)\s*:)",
     re.I,
 )
 
@@ -90,35 +147,124 @@ def _estimate_chars(messages: Sequence[Mapping[str, Any]], tools: Sequence[Mappi
     return total
 
 
-def condense_system_prompt(sys_text: str, max_chars: int = MAX_CHARS) -> str:
-    if len(sys_text) <= max_chars:
-        return sys_text
+def _strip_catalogs(text: str) -> str:
+    # Remove nested/top-level XML catalog blocks cleanly (two passes handle nested <skills><available_skills>...)
+    cleaned = text
+    for _ in range(2):
+        prev = cleaned
+        cleaned = _CATALOG_XML_RE.sub("\n", cleaned)
+        if cleaned == prev:
+            break
+    cleaned = _CATALOG_PLAIN_RE.sub("\n", cleaned)
+    return cleaned.strip()
 
-    sections = re.split(r"\n(?=#{1,3}\s)", sys_text)
-    if len(sections) == 1:
-        sections = [p for p in sys_text.split("\n\n") if p.strip()]
+
+def _split_oversized(sec: str, max_chars: int) -> list[str]:
+    if len(sec) <= max_chars:
+        return [sec]
+    # Try splitting by blank lines first, then by lines if a single paragraph is huge
+    paras = [p.strip() for p in re.split(r"\n\s*\n", sec) if p.strip()]
+    if len(paras) > 1:
+        out = []
+        for p in paras:
+            if len(p) <= max_chars:
+                out.append(p)
+            else:
+                out.extend(_split_oversized(p, max_chars))
+        return out
+    # Single huge block: group lines up to max_chars
+    lines = sec.splitlines()
+    chunks, cur = [], []
+    cur_len = 0
+    for ln in lines:
+        add = len(ln) + (1 if cur else 0)
+        if cur and cur_len + add > max_chars:
+            chunks.append("\n".join(cur).strip())
+            cur, cur_len = [ln], len(ln)
+        elif len(ln) <= max_chars:
+            cur.append(ln)
+            cur_len += add
+    if cur:
+        chunks.append("\n".join(cur).strip())
+    return [c for c in chunks if c]
+
+
+def _extract_candidate_sections(cleaned: str, max_chars: int) -> list[tuple[str, float]]:
+    """Return [(section_text, structural_bonus)] in original order."""
+    raw_units: list[tuple[str, float]] = []
+
+    # 1. Split out XML directive sections (<rules>, <addendum>, <guidelines>, <project_instructions>, ...)
+    pos = 0
+    for m in _RULE_XML_RE.finditer(cleaned):
+        before = cleaned[pos:m.start()].strip()
+        if before:
+            raw_units.append((before, 0.0))
+        tag = m.group("tag").lower()
+        body = m.group(2).strip()
+        # Unwrap nested <project_instructions> inside <project_context>
+        if tag == "project_context" and _RULE_XML_RE.search(body):
+            for sub_text, sub_bonus in _extract_candidate_sections(body, max_chars):
+                raw_units.append((sub_text, max(sub_bonus, 6.0)))
+        elif body:
+            bonus = 12.0 if tag in ("rules", "addendum", "guidelines", "instructions", "policy", "constraints") else 6.0
+            raw_units.append((body, bonus))
+        pos = m.end()
+    tail = cleaned[pos:].strip()
+    if tail:
+        raw_units.append((tail, 0.0))
+
+    # 2. Further split each unit on markdown headings (# / ## / ###), dropping catalog sections
+    sections: list[tuple[str, float]] = []
+    for unit_text, base_bonus in raw_units:
+        md_parts = [p.strip() for p in re.split(r"\n(?=#{1,3}\s)", unit_text) if p.strip()]
+        for part in md_parts:
+            if _CATALOG_MD_HEAD_RE.match(part):
+                continue
+            head_bonus = 8.0 if _RULE_HEAD_RE.match(part) else 0.0
+            for piece in _split_oversized(part, max_chars):
+                sections.append((piece, base_bonus + head_bonus))
+    return sections
+
+
+def condense_system_prompt(sys_text: str, max_chars: int = MAX_CHARS) -> str:
+    cleaned = _strip_catalogs(sys_text)
+    if not cleaned:
+        return ""
+    if len(cleaned) <= max_chars:
+        # Unwrap harmless XML section tags when returning the whole cleaned prompt
+        compact = re.sub(
+            r"</?(?:rules|addendum|guidelines|instructions|policy|constraints|project_context|project_instructions)(?:\s[^>]*)?>",
+            "",
+            cleaned,
+            flags=re.I,
+        )
+        return re.sub(r"\n{3,}", "\n\n", compact).strip()
+
+    candidates = _extract_candidate_sections(cleaned, max_chars)
+    if not candidates:
+        return ""
 
     scored = []
-    for idx, sec in enumerate(sections):
+    for idx, (sec, struct_bonus) in enumerate(candidates):
         hits = len(IMPERATIVE_RE.findall(sec))
-        # Mild recency bonus for appended system-prompt sections
-        bonus = 3 if idx == len(sections) - 1 else 0
-        scored.append((hits + bonus, idx, sec.strip()))
+        # Density-based imperative score so compact rule blocks beat long prose dumps
+        density = (hits * 1000.0) / max(len(sec), 200)
+        total = density + struct_bonus
+        scored.append((total, idx, sec))
 
-    chosen = set()
+    chosen: set[int] = set()
     budget = max_chars
-    for score, idx, sec in sorted(scored, key=lambda x: (-x[0], -x[1])):
-        if score <= 0 and chosen:
+    for score, idx, sec in sorted(scored, key=lambda x: (-x[0], x[1])):
+        if score <= 0.0:
             continue
         if len(sec) + 2 <= budget:
             chosen.add(idx)
             budget -= len(sec) + 2
-        elif not chosen:
-            return sys_text[-max_chars:]
 
     if not chosen:
-        return sys_text[-max_chars:]
-    return "\n\n".join(sections[i].strip() for i in sorted(chosen))
+        return ""
+
+    return "\n\n".join(candidates[i][0] for i in sorted(chosen))
 
 
 def reinforce_messages(
@@ -145,9 +291,12 @@ def reinforce_messages(
         return messages
 
     snippet = condense_system_prompt(sys_text, MAX_CHARS)
+    if not snippet:
+        return messages
+
     reminder = (
-        "ACTIVE SYSTEM INSTRUCTIONS — follow these strictly on this turn "
-        "(prioritize these rules over habits from earlier turns):\n\n"
+        "ACTIVE SYSTEM RULES — continue following the applicable rules below on this turn "
+        "(prioritize these over habits from earlier turns):\n\n"
         f"{snippet}"
     )
 
