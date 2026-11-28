@@ -1,0 +1,28 @@
+# Machine-readable summary of this recipe (the blog's recipe cards and performance panels can be generated from it).
+model: thinkingmachines/Inkling-2-Small
+weights: aidendle94/Inkling-2-Small-DGX-Spark      # rank0/ .. rank3/, stock unmodified weights (about 93 GB a node)
+engine: sglang
+based_on: ../sglang                                # shared launcher, hooks and checks with SYSTEM_REINFORCE=user, KV_NVFP4=target,draft, PRESHARDED=1, CHUNK=8192
+image: aidendle94/sparkrun-sglang-inkling2-gb10:experimental-1.10
+status: experimental
+nodes: 4 x NVIDIA DGX Spark (GB10, 128 GB), RoCE fabric, TP4/EP4
+context_length: 524288
+kv_cache: nvfp4
+system_reinforce: user                             # patches/system_reinforce.py (gated transient system-prompt reinforcement; bit-for-bit no-op below 3,600 chars on turn 0)
+measured: 2026-11-27
+max_running_requests: 8
+numbers:
+  dsh_lite_70t_t61_70_batch_rate_pct: {stock: 0.0, system_reinforce_user: 60.0}
+  dsh_lite_70t_t41_70_batch_rate_pct: {stock: 0.0, system_reinforce_user: 66.7}
+  dsh_lite_70t_all_batch_rate_pct: {stock: 0.0, system_reinforce_user: 35.7}
+  dsh_lite_70t_mean_calls_t61_70: {stock: 1.00, system_reinforce_user: 2.20}
+  dsh_lite_70t_shell_lookup_violations_all: {stock: 67, system_reinforce_user: 27}
+  dsh_lite_70t_shell_lookup_violations_t31_70: {stock: 39, system_reinforce_user: 3}
+  dsh_lite_70t_max_context_tokens: {stock: 118858, system_reinforce_user: 248774}
+  coding_open_unit_tests: {stock: "24/24", system_reinforce_user: "24/24"}
+  coding_open_t16_35_batchable_pct: {stock: 75.0, system_reinforce_user: 83.3}
+  coding_open_mean_calls_t16_35: {stock: 3.00, system_reinforce_user: 4.17}
+  boot_to_healthy_s: {warm: 182}
+chunked_prefill_size: 8192
+features: [text, images, tools, thinking, reasoning_effort, dspark, confidence_gate, confidence_head, nvfp4_kv, nvfp4_draft_kv, presharded_weights, sharded_experts, packed_block_scales, prefill_glue, rdma_collectives, reasoning_cache, tool_choice_fix, system_reinforce, prometheus_metrics, quickstart]
+license: MIT

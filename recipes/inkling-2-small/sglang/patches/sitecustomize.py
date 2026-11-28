@@ -91,6 +91,9 @@ tool_parse_error (SPARK_TOOL_PARSE_ERROR=1, off by default): patches/tool_parse_
   the broken payload as assistant text; the payload is logged. Chat completions, Anthropic messages, Responses API.
 tool_choice_fix (SPARK_TOOL_CHOICE_FIX=parallel,none, off by default): patches/tool_choice_fix.py honours
   parallel_tool_calls false (first call kept) and an explicit tool_choice "none" (tool-invocation tokens biased -100).
+prefix_consensus (SPARK_PREFIX_CONSENSUS=1, off by default): patches/prefix_consensus.py makes the ranks vote on
+  every prefix-cache match of a prefill batch (one CPU all-reduce); when their caches differ every rank uses the
+  shortest match, so the prefill and its collectives stay the same size on every rank. Disagreements are logged.
 wmark_boost (SPARK_WMARK_BOOST=1, off by default): patches/wmark_boost.py gives the KV pool sizing the host's
   MemAvailable without the kernel's watermark boost (a reclaim target of a few minutes that hides up to 2.24 GB of
   page cache here at the second the pool is sized, on some boots and not on others).
@@ -1161,6 +1164,33 @@ if os.environ.get("SPARK_TOOL_CHOICE_FIX"):
     def tool_choice_fix_anthropic(mod):
         import tool_choice_fix
         tool_choice_fix.install_anthropic(mod)
+
+
+# SPARK_PREFIX_CONSENSUS=1 (unset = off): the ranks agree on each request's prefix-cache match, patches/prefix_consensus.py.
+if os.environ.get("SPARK_PREFIX_CONSENSUS"):
+    @_on_import("sglang.srt.managers.schedule_batch")
+    def prefix_consensus_req(mod):
+        import prefix_consensus
+        prefix_consensus.install_req(mod)
+
+    @_on_import("sglang.srt.managers.scheduler")
+    def prefix_consensus_scheduler(mod):
+        import prefix_consensus
+        prefix_consensus.install_scheduler(mod)
+
+
+# SPARK_SYSTEM_REINFORCE=user|system (unset = off): gated transient system-prompt reinforcement inside Inkling-2's
+# 1,024-token SWA window, patches/system_reinforce.py.
+if os.environ.get("SPARK_SYSTEM_REINFORCE"):
+    @_on_import("sglang.srt.parser.inkling_renderer")
+    def system_reinforce_renderer(mod):
+        import system_reinforce
+        system_reinforce.install_renderer(mod)
+
+    @_on_import("sglang.srt.entrypoints.openai.serving_inkling")
+    def system_reinforce_serving(mod):
+        import system_reinforce
+        system_reinforce.install_serving(mod)
 
 
 sys.meta_path.insert(0, _Finder())
